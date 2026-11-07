@@ -201,6 +201,76 @@ class ExecutionSafetyTests(unittest.TestCase):
                              positions=positions, trades=trades) as (ib, _):
                 (self.preflight if accepted else self.rejected)(ib, self.order_args(right="C"))
 
+    def test_cross_currency_obligations_share_one_cash_pool(self):
+        ib = MagicMock()
+        ib.accountValues.return_value = [SimpleNamespace(tag="TotalCashValue", currency="USD", value="10000"),
+                                         SimpleNamespace(tag="TotalCashValue", currency="BASE", value="10000")]
+        hkd = option("P")
+        hkd.currency, hkd.strike = "HKD", 40
+        jpy = option("P")
+        jpy.currency, jpy.strike = "JPY", 5000
+        ib.portfolio.return_value = [position(hkd, -1)]  # 4,000 HKD
+        ib.openTrades.return_value = [pending(jpy)]       # 500,000 JPY
+        with patch.object(cli, "_fx", side_effect=lambda _ib, _base, cur: {"HKD": 8, "JPY": 100}[cur]):
+            ok, _ = cli._coverage(ib, "HKD", 36000)
+            self.assertTrue(ok)  # (10,000 - 500 - 5,000) * 8 = 36,000
+            ok, _ = cli._coverage(ib, "HKD", 36000.01)
+            self.assertFalse(ok)
+
+    def test_base_aggregate_does_not_duplicate_detailed_cash(self):
+        ib = MagicMock()
+        ib.accountValues.return_value = [SimpleNamespace(tag="TotalCashValue", currency="USD", value="8000"),
+                                         SimpleNamespace(tag="TotalCashValue", currency="BASE", value="8000")]
+        ib.portfolio.return_value = []
+        ib.openTrades.return_value = []
+        with patch.object(cli, "_fx", return_value=8):
+            self.assertFalse(cli._coverage(ib, "HKD", 64000.01)[0])
+
+    def test_invalid_cash_and_missing_fx_do_not_inflate_collateral(self):
+        for cash in ("nan", "inf", "-1"):
+            with self.subTest(cash=cash), self.broker(cash=cash) as (ib, _):
+                self.rejected(ib, self.order_args())
+        ib = MagicMock()
+        ib.accountValues.return_value = [SimpleNamespace(tag="TotalCashValue", currency="USD", value="10000")]
+        ib.portfolio.return_value = []
+        ib.openTrades.return_value = []
+        with patch.object(cli, "_fx", return_value=None):
+            self.assertFalse(cli._coverage(ib, "HKD", 1)[0])
+
+    def test_multiple_accounts_or_mismatched_ownership_block_preflight(self):
+        with self.broker() as (ib, _):
+            ib.managedAccounts.return_value = ["DU1", "DU2"]
+            self.rejected(ib, self.order_args())
+        with self.broker() as (ib, _):
+            ib.managedAccounts.return_value = ["DU1"]
+            ib.portfolio.return_value[0].account = "DU2"
+            self.rejected(ib, self.order_args())
+
+    def test_known_complex_delivery_blocks_risk_increase(self):
+        contract = option()
+        contract.comboLegsDescrip = "cash and shares"
+        with self.broker(contract) as (ib, _):
+            self.rejected(ib, self.order_args())
+        contract.comboLegsDescrip = ""
+        with self.broker(contract) as (ib, _):
+            ib.reqContractDetails.return_value = [SimpleNamespace(contract=contract, underSecType="BAG", underConId=1)]
+            self.rejected(ib, self.order_args())
+
+    def test_covered_call_refreshes_after_stock_fill(self):
+        call = option("C")
+        with self.broker(call, shares=0) as (ib, stock):
+            filled = SimpleNamespace(order=SimpleNamespace(orderId=10),
+                                     orderStatus=SimpleNamespace(status="Filled", filled=100,
+                                                                 avgFillPrice=30))
+            ib.placeOrder.return_value = filled
+            with patch.object(cli, "_code", return_value="APPROVED"), \
+                 patch.object(cli, "_is_code_consumed", return_value=False), \
+                 patch.object(cli, "_consume_code"):
+                self.assertRaises(SystemExit, cli.cmd_combo, cli.DEFAULT_CFG,
+                                  self.combo_args(preset="covered-call", code="APPROVED"))
+            ib.placeOrder.assert_called_once()
+            self.assertIs(ib.placeOrder.call_args.args[0], stock)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -404,6 +404,38 @@ def _open_trades(ib):
         sys.exit(f"⛔ 无法确认活跃挂单：{type(exc).__name__}: {exc}")
 
 
+def _account_scope(ib):
+    """Stage A guard: never combine collateral from multiple accounts."""
+    try:
+        managed = ib.managedAccounts()
+    except Exception as exc:
+        sys.exit(f"⛔ 无法确认账户范围：{type(exc).__name__}: {exc}")
+    accounts = [a for a in managed if isinstance(a, str) and a.strip()] if isinstance(managed, (list, tuple)) else []
+    if len(set(accounts)) > 1:
+        sys.exit("⛔ 多账户会话需等待账户隔离实现，禁止交易预检或提交")
+    account = accounts[0] if accounts else ""
+    if account:
+        for p in _portfolio(ib):
+            owner = getattr(p, "account", "")
+            if owner and owner != account:
+                sys.exit("⛔ 持仓归属与当前账户不一致")
+        try:
+            values = ib.accountValues()
+            if values is None:
+                raise ValueError("account values unavailable")
+        except Exception as exc:
+            sys.exit(f"⛔ 无法确认账户资金归属：{type(exc).__name__}: {exc}")
+        for value in values:
+            owner = getattr(value, "account", "")
+            if owner and owner != account:
+                sys.exit("⛔ 资金归属与当前账户不一致")
+        for trade in _open_trades(ib):
+            owner = getattr(trade.order, "account", "")
+            if owner and owner != account:
+                sys.exit("⛔ 活跃挂单归属与当前账户不一致")
+    return account
+
+
 def _option_matches(contract, symbol, expiry, strike, right, currency, multiplier=None,
                     trading_class=None, con_id=None):
     """qualify 结果仍须匹配请求身份，不能按返回列表位置认领合约。"""
@@ -469,6 +501,32 @@ def _multiplier(ib, contract):
         pass
     sys.exit(f"⛔ 无法确认期权合约乘数（conId={getattr(contract, 'conId', '?')}），"
              "禁止按 100 股猜测担保，请核对合约详情。")
+
+
+def _delivery_guard(ib, contract, stock=None):
+    """Reject contradictory delivery evidence; IB's scalar multiplier is not a basket."""
+    legs = getattr(contract, "comboLegs", None)
+    desc = getattr(contract, "comboLegsDescrip", "")
+    if (isinstance(legs, (list, tuple)) and legs or isinstance(desc, str) and desc.strip()):
+        sys.exit("⛔ 合约含组合交割描述，无法按单一正股/现金义务担保")
+    try:
+        details = ib.reqContractDetails(contract)
+    except Exception as exc:
+        sys.exit(f"⛔ 无法核对期权合约详情：{type(exc).__name__}: {exc}")
+    for detail in details or []:
+        dc = getattr(detail, "contract", None)
+        if not dc or dc.conId != contract.conId:
+            continue
+        legs = getattr(dc, "comboLegs", None)
+        desc = getattr(dc, "comboLegsDescrip", "")
+        if (isinstance(legs, (list, tuple)) and legs or isinstance(desc, str) and desc.strip()):
+            sys.exit("⛔ 合约详情含复杂交割描述，停止风险增加订单")
+        under_type = getattr(detail, "underSecType", "")
+        under_id = getattr(detail, "underConId", 0)
+        if under_type and under_type != "STK":
+            sys.exit("⛔ 期权标的并非已确认正股，停止风险增加订单")
+        if stock is not None and under_id and stock.conId and under_id != stock.conId:
+            sys.exit("⛔ 期权 underlying conId 与用于覆盖的正股不符")
 
 
 def _stock(ib, symbol, currency, exchange=None):
@@ -762,6 +820,7 @@ def cmd_order(cfg, args):
     _live_guard(cfg, args, port)
     ib = connect(cfg, port, readonly=False, args=args)
     _sync_open_orders(ib)
+    account = _account_scope(ib)
 
     qty = _positive_number(args.qty, "委托数量", integer=True)
     if args.opt:
@@ -815,6 +874,7 @@ def cmd_order(cfg, args):
             sys.exit("⛔ 买回数量超过同一 conId 的未占用净空头；不支持开立期权多头")
 
     if args.opt and side == "SELL":
+        _delivery_guard(ib, contract)
         mult = _multiplier(ib, contract)
         qty_val = qty
         if args.right.upper() == "C":
@@ -851,6 +911,8 @@ def cmd_order(cfg, args):
         px = args.stop
     order.tif = args.tif
     order.outsideRth = bool(args.outside_rth)
+    if account:
+        order.account = account
 
     mode = "live" if is_live else "paper"
     payload = dict(mode=mode, port=port, contract=contract.conId, sec=contract.secType,
@@ -1138,7 +1200,7 @@ def _pending_cash_puts(ib, currency):
             getattr(o, "action", "").upper() == "SELL"):
             rem = _trade_remaining(t)
             mult = _multiplier(ib, c)
-            strike = float(getattr(c, "strike", 0.0) or 0.0)
+            strike = _positive_number(getattr(c, "strike", None), "存量 Put 行权价")
             total_cash += strike * mult * rem
     return total_cash
 
@@ -1156,7 +1218,7 @@ def _short_puts_collateral(ib, currency):
                 getattr(c, "right", "").upper() == "P" and
                 getattr(p, "position", 0) < 0):
             mult = _multiplier(ib, c)
-            strike = float(getattr(c, "strike", 0.0) or 0.0)
+            strike = _positive_number(getattr(c, "strike", None), "存量 Put 行权价")
             total_cash += abs(float(p.position)) * strike * mult
     return total_cash
 
@@ -1172,7 +1234,13 @@ def _funds(ib):
     """
     cash_map = {}
     avail_map = {}
-    for v in (ib.accountValues() or []):
+    try:
+        values = ib.accountValues()
+        if values is None:
+            raise ValueError("account values unavailable")
+    except Exception as exc:
+        sys.exit(f"⛔ 无法确认账户现金：{type(exc).__name__}: {exc}")
+    for v in values:
         cur = (getattr(v, "currency", "") or "").upper()
         if not cur:
             continue
@@ -1181,15 +1249,19 @@ def _funds(ib):
             try:
                 f = float(v.value)
             except (TypeError, ValueError):
-                continue
+                sys.exit(f"⛔ {cur} 现金余额无法解析")
+            if not math.isfinite(f) or f < 0:
+                sys.exit(f"⛔ {cur} 现金余额无效或为负，不能用融资抵押")
             if cur not in cash_map or f < cash_map[cur]:
                 cash_map[cur] = f
         elif tag in ("AvailableFunds", "FullAvailableFunds"):
             try:
                 f = float(v.value)
             except (TypeError, ValueError):
-                continue
+                continue  # not collateral; missing values cannot improve cash coverage
             # 同币种多标签时取较保守（较小）的一份，避免高估可用资金
+            if not math.isfinite(f):
+                sys.exit(f"⛔ {cur} 可用资金无效")
             if cur not in avail_map or f < avail_map[cur]:
                 avail_map[cur] = f
 
@@ -1263,9 +1335,24 @@ def _coverage(ib, currency, need, require_cash=True):
     cur_u = currency.upper()
 
     if require_cash:
-        pending_cur = _pending_cash_puts(ib, cur_u)
-        short_cur = _short_puts_collateral(ib, cur_u)
-        total_locked_cur = pending_cur + short_cur
+        _positive_number(need, "所需担保")
+        currencies = {cur_u}
+        for p in _portfolio(ib):
+            c = getattr(p, "contract", None)
+            if c and getattr(c, "secType", "") == "OPT" and getattr(c, "right", "").upper() == "P" and _finite_position(p) < 0:
+                if not getattr(c, "currency", ""):
+                    sys.exit("⛔ Put 持仓缺少币种")
+                currencies.add(c.currency.upper())
+        for t in _open_trades(ib):
+            if getattr(t.orderStatus, "status", "") in {"Cancelled", "ApiCancelled", "Inactive", "Filled"}:
+                continue
+            c, o = t.contract, t.order
+            if getattr(c, "secType", "") == "OPT" and getattr(c, "right", "").upper() == "P" and getattr(o, "action", "").upper() == "SELL":
+                if not getattr(c, "currency", ""):
+                    sys.exit("⛔ Put 挂单缺少币种")
+                currencies.add(c.currency.upper())
+        locked = {c: _pending_cash_puts(ib, c) + _short_puts_collateral(ib, c) for c in currencies}
+        total_locked_cur = locked[cur_u]
         direct = cash_map.get(cur_u)
         if direct is not None:
             cash = direct - total_locked_cur
@@ -1276,26 +1363,29 @@ def _coverage(ib, currency, need, require_cash=True):
             pend_txt = f"（已扣减挂单及存量占用 {fmt(total_locked_cur)} {currency}）" if total_locked_cur > 0 else ""
             return True, f"需要 {fmt(need)} {currency}，账户实际现金 {fmt(cash)} {currency}{pend_txt} ✅"
 
-        base_cash = cash_map.get("BASE")
-        if base_cash is None or cur_u == str(base).upper():
+        real_cash = {c: v for c, v in cash_map.items() if c != "BASE"}
+        # BASE is an aggregate view, not another spendable currency. Without a
+        # uniquely identified detailed cash pool, conversion would reuse funds.
+        if len(real_cash) != 1:
             return False, f"需要 {fmt(need)} {currency}，无法确认账户实际现金，安全起见拒绝放行 ❌"
-        rate = _fx(ib, base, cur_u)
-        if rate is None or rate <= 0:
-            return False, f"需要 {fmt(need)} {currency}，无法获取 {base}/{currency} 汇率，安全起见拒绝放行 ❌"
-
-        base_pending = _pending_cash_puts(ib, base)
-        base_short = _short_puts_collateral(ib, base)
-        base_locked = base_pending + base_short
-        cur_locked_in_base = total_locked_cur / rate
-        net_base = base_cash - base_locked - cur_locked_in_base
-        conv = net_base * rate
+        source, source_cash = next(iter(real_cash.items()))
+        source_cash = min(source_cash, cash_map.get("BASE", source_cash))
+        rates = {source: 1.0}
+        for c in currencies:
+            if c == source:
+                continue
+            rate = _fx(ib, source, c)
+            if rate is None or not math.isfinite(rate) or rate <= 0:
+                return False, f"需要 {fmt(need)} {currency}，无法获取 {source}/{c} 汇率，安全起见拒绝放行 ❌"
+            rates[c] = rate
+        net_base = source_cash - sum(amount / rates[c] for c, amount in locked.items())
+        conv = net_base * rates[cur_u]
         ok = conv >= need
         if not ok:
             return False, (f"需要 {fmt(need)} {currency}，账户实际现金 TotalCashValue 仅 {fmt(conv)} {currency}"
                            f"（AvailableFunds 融资额度不可用于现金担保）❌")
-        pend_txt = f"（已扣减挂单及存量占用 {fmt(base_locked)} {base} 及 {fmt(total_locked_cur)} {currency}）" if (base_locked > 0 or total_locked_cur > 0) else ""
-        return True, (f"需要 {fmt(need)} {currency}，账户实际现金 {fmt(net_base)} {base} ≈ {fmt(conv)} {currency}{pend_txt}"
-                      f"（汇率 {rate:.4f}） ✅")
+        return True, (f"需要 {fmt(need)} {currency}，账户实际现金 {fmt(net_base)} {source} ≈ {fmt(conv)} {currency}"
+                      f"（汇率 {rates[cur_u]:.4f}，已扣减挂单及存量占用 {fmt(locked.get(source, 0))} {source} 及 {fmt(total_locked_cur)} {currency}；全部币种 Put 义务） ✅")
 
     direct = avail_map.get(cur_u)
     if direct is not None:
@@ -1331,6 +1421,7 @@ def cmd_combo(cfg, args):
 
     ib = connect(cfg, port, readonly=False, args=args)
     _sync_open_orders(ib)
+    account = _account_scope(ib)
 
     opt, _exch = _opt(
         ib, sym, args.expiry, strike, right, args.currency,
@@ -1341,6 +1432,7 @@ def cmd_combo(cfg, args):
     if not opt:
         sys.exit(f"期权合约无法识别：{sym} {args.expiry} {strike:g}{right}（可用 --currency 指定币种）")
     mult = _multiplier(ib, opt)
+    _delivery_guard(ib, opt)
     need_shares = mult * qty
 
     # ---- 前提校验：这就是这个策略能不能成立的条件
@@ -1363,6 +1455,7 @@ def cmd_combo(cfg, args):
         stock_contract = _stock(ib, sym, args.currency)
         if not stock_contract:
             sys.exit(f"正股合约无法识别：{sym} {args.currency}")
+        _delivery_guard(ib, opt, stock_contract)
         if avail > 0:
             stock_qty = need_shares - avail
             stock_note = f"现有净可用 {avail:g} 股 → 差额补买 {stock_qty} 股（合计 {need_shares} 股覆盖 {qty} 张）"
@@ -1389,6 +1482,9 @@ def cmd_combo(cfg, args):
                      f"   {note}\n"
                      f"   现金担保卖 Put 的意义就是行权时买得起，备不足即等同裸卖，本工具不做。\n")
         stock_note = note
+
+    if stock_contract and (not float(stock_qty).is_integer() or stock_qty <= 0):
+        sys.exit("⛔ 补买正股差额为碎股；未确认券商支持，停止备兑策略")
 
     net = args.net
     otype = "LMT" if net not in (None, 0) else "MKT"
@@ -1433,6 +1529,8 @@ def cmd_combo(cfg, args):
         else:
             so = MarketOrder("BUY", stock_qty)
         so.tif = "DAY"
+        if account:
+            so.account = account
         ts = ib.placeOrder(stock_contract, so)
         _consume_code(code)
         for _ in range(10):
@@ -1452,9 +1550,21 @@ def cmd_combo(cfg, args):
             finish(ib)
             return 3
 
+        # The first leg's fill is not proof that the current portfolio still
+        # covers the call: another client may have sold shares meanwhile.
+        _sync_open_orders(ib)
+        refreshed_have = _shares(ib, sym, args.currency)
+        refreshed_busy = (_short_calls_shares(ib, sym, args.currency)
+                          + _pending_short_calls_shares(ib, sym, args.currency)
+                          + _pending_stock_sales(ib, sym, args.currency))
+        if refreshed_have < refreshed_busy + need_shares:
+            sys.exit("⛔ 正股成交后刷新发现 Call 覆盖不足；期权腿未提交，请人工核对正股持仓与挂单")
+
     # 2) 期权腿：卖出（收权利金）
     order = LimitOrder("SELL", qty, net) if otype == "LMT" else MarketOrder("SELL", qty)
     order.tif = "DAY"
+    if account:
+        order.account = account
     trade = ib.placeOrder(opt, order)
     _consume_code(code)
     order_id = trade.order.orderId
@@ -1580,6 +1690,7 @@ def _resolve_option(ib, symbol, expiry, strikes, target, right, currency, chain,
 def cmd_plan(cfg, args):
     if not CFG_PATH.exists():
         load_cfg(required=True)
+    args.qty = _positive_number(args.qty, "计划期权张数", integer=True)
     port, env = resolve_port(cfg, args)
     ib = connect(cfg, port, readonly=True, force_delayed=getattr(args, "delayed", False), args=args)
     try:
@@ -1828,6 +1939,8 @@ def cmd_run(cfg, args):
             or not isinstance(exchange, str) or not exchange.strip()):
         sys.exit("⛔ 计划缺少有效合约身份（conId / mult / tradingClass / exchange），请重新运行 plan 生成。")
 
+    qty = _positive_number(it.get("qty"), "计划期权张数", integer=True)
+    strike = _positive_number(it.get("strike"), "计划行权价")
     net = it.get("premium") if it.get("premium") else None
     if args.net is not None:
         net = args.net
@@ -1835,10 +1948,11 @@ def cmd_run(cfg, args):
         sys.exit(f"\n⛔ #{idx} 没有可用的参考权利金（该市场无行情），无法自动定价。\n"
                  f"   请手工指定：thetamill run --file {path} --i {idx} --net 5.00\n")
 
-    print(f"按计划 #{idx} 执行：{it['preset']} {it['symbol']} {it['expiry']} {it['strike']:g} × {it['qty']}")
+    _positive_number(net, "计划权利金价格")
+    print(f"按计划 #{idx} 执行：{it['preset']} {it['symbol']} {it['expiry']} {strike:g} × {qty}")
     ns = argparse.Namespace(
-        symbol=it["symbol"], preset=it["preset"], expiry=it["expiry"], k1=float(it["strike"]),
-        net=float(net), qty=int(it["qty"]), currency=it.get("currency") or cfg["default_currency"],
+        symbol=it["symbol"], preset=it["preset"], expiry=it["expiry"], k1=strike,
+        net=float(net), qty=qty, currency=it.get("currency") or cfg["default_currency"],
         con_id=con_id, multiplier=mult, trading_class=trading_class, exchange=exchange,
         stock_px=args.stock_px, code=args.code, live_ok=args.live_ok,
         paper=args.paper, port=args.port, delayed=args.delayed,
