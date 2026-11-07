@@ -639,50 +639,92 @@ def _shares(ib, symbol, currency):
 
 
 def _funds(ib):
-    """(可用资金, 基础币种) —— 可用资金已含现金与国债等担保资产"""
-    avail, base = 0.0, "USD"
+    """可用资金明细（含现金与国债等担保资产），按币种返回。
+
+    返回 (avail_map, base_currency)：
+    - avail_map: {币种: 可用资金}，另含账户汇总币种汇总行 "BASE"；
+    - base_currency: 账户基础币种（取 "BASE" 汇总行无法直接给出时用最大非 BASE 币种兜底）。
+    绝不把不同币种的原始数字直接比较 —— 那会把 100 JPY 当成 100 USD。
+    """
+    avail_map = {}
     for v in ib.accountValues():
-        if v.tag in ("AvailableFunds", "FullAvailableFunds") and v.currency != "BASE":
+        if v.tag in ("AvailableFunds", "FullAvailableFunds"):
             try:
                 f = float(v.value)
             except (TypeError, ValueError):
                 continue
-            if f > avail:
-                avail, base = f, v.currency
-    return avail, base
+            cur = (v.currency or "").upper()
+            if not cur:
+                continue
+            # 同币种多标签时取较保守（较小）的一份，避免高估可用资金
+            if cur not in avail_map or f < avail_map[cur]:
+                avail_map[cur] = f
+    real = {c: v for c, v in avail_map.items() if c != "BASE"}
+    if "BASE" in avail_map:
+        # "BASE" 是账户汇总行的币种标签，其 value 是数字（金额），不是币种代码。
+        # 真正的基础币种取币种字段里金额最大的那个（汇总行本身不携带币种代码）。
+        base = max(real, key=real.get) if real else "USD"
+    else:
+        base = max(real, key=real.get) if real else "USD"
+        avail_map["BASE"] = real.get(base, 0.0)
+    return avail_map, base
 
 
 def _fx(ib, base, cur):
-    """1 单位 base 折合多少 cur；取不到返回 None"""
+    """1 单位 base 折合多少 cur；取不到返回 None。
+
+    先试 base/cur 直盘；若 IB 不认该货币对，再试 cur/base 反向盘并把价格取倒数。
+    """
     if base == cur:
         return 1.0
-    c = Contract(secType="CASH", symbol=base, currency=cur, exchange="IDEALPRO")
-    try:
-        q = [x for x in ib.qualifyContracts(c) if x and x.conId]
-    except Exception:
-        q = []
-    if not q:
-        return None
-    try:
-        bars = ib.reqHistoricalData(q[0], "", "5 D", "1 day", "MIDPOINT", True)
-    except Exception:
-        bars = None
-    if bars:
-        return float(bars[-1].close)
-    px = _spot(ib, q[0])
-    return float(px) if px else None
+
+    def _quote(symbol, currency, invert):
+        c = Contract(secType="CASH", symbol=symbol, currency=currency, exchange="IDEALPRO")
+        try:
+            q = [x for x in ib.qualifyContracts(c) if x and x.conId]
+        except Exception:
+            return None
+        if not q:
+            return None
+        px = None
+        try:
+            bars = ib.reqHistoricalData(q[0], "", "5 D", "1 day", "MIDPOINT", True)
+        except Exception:
+            bars = None
+        if bars:
+            px = float(bars[-1].close)
+        else:
+            px = _spot(ib, q[0])
+        if not px or float(px) <= 0:
+            return None
+        return (1.0 / float(px)) if invert else float(px)
+
+    direct = _quote(base, cur, invert=False)
+    if direct:
+        return direct
+    return _quote(cur, base, invert=True)
 
 
 def _coverage(ib, currency, need):
-    """担保核对。need 为交易币种金额。
-    返回 (是否足额, 说明)；足额与否无法判定时第一项为 None。"""
-    cash, base = _funds(ib)
-    if base == currency:
-        ok = cash >= need
-        return ok, f"需要 {fmt(need)} {currency}，账户可用 {fmt(cash)} {base}" + (" ✅" if ok else " ❌")
+    """担保核对。need 为交易币种金额，返回 (是否足额, 说明)。
+
+    安全性：只要无法判定足额（汇率取不到、没有任何资金数据），一律返回 False，
+    绝不用 None 绕过闸门。"""
+    avail_map, base = _funds(ib)
+    # 1) 交易币种有直接的可用资金余额，直接比较，不做任何跨币种换算
+    direct = avail_map.get(currency.upper())
+    if direct is not None:
+        ok = direct >= need
+        return ok, (f"需要 {fmt(need)} {currency}，账户 {currency} 可用 {fmt(direct)}"
+                    + (" ✅" if ok else " ❌"))
+    # 2) 无直接余额：用账户基础币种资金经汇率换算
+    cash = avail_map.get("BASE")
+    if cash is None or currency.upper() == str(base).upper():
+        # 同币种却查不到余额，或完全没有资金数据 —— 无法确认足额，安全起见拒绝
+        return False, f"需要 {fmt(need)} {currency}，无法确认账户可用资金，安全起见拒绝放行 ❌"
     rate = _fx(ib, base, currency)
-    if not rate:
-        return None, f"需要 {fmt(need)} {currency}，账户可用 {fmt(cash)} {base}（汇率取不到，未校验）"
+    if rate is None or rate <= 0:
+        return False, f"需要 {fmt(need)} {currency}，无法获取 {base}/{currency} 汇率，安全起见拒绝放行 ❌"
     conv = cash * rate
     ok = conv >= need
     return ok, (f"需要 {fmt(need)} {currency}，账户可用 {fmt(cash)} {base} ≈ {fmt(conv)} {currency}"
@@ -712,17 +754,24 @@ def cmd_combo(cfg, args):
         if have >= need_shares:
             sys.exit(f"\n⛔ 你已持有 {have:g} 股 {sym}，足够覆盖 {qty} 张（每张需 {mult} 股）。\n"
                      f"   再买 {need_shares} 股只是加仓，不是备兑。请改用：--preset sell-call\n")
-        stock_qty = need_shares
         stock_contract = _stock(ib, sym, args.currency)
         if not stock_contract:
             sys.exit(f"正股合约无法识别：{sym} {args.currency}")
-        stock_note = f"现有 {have:g} 股 → 本单买入 {stock_qty} 股"
+        if have > 0:
+            stock_qty = need_shares - int(have)
+            stock_note = f"现有 {have:g} 股 → 差额补买 {stock_qty} 股（合计 {need_shares} 股覆盖 {qty} 张）"
+        else:
+            stock_qty = need_shares
+            stock_note = f"现有 0 股 → 本单买入 {stock_qty} 股"
     elif preset == "sell-call":
-        if have < need_shares:
-            sys.exit(f"\n⛔ 备兑卖 Call 的先决条件是持有正股：{qty} 张需 {need_shares} 股，你现有 {have:g} 股。\n"
-                     f"   没有股票的卖出 Call 是裸卖，理论上风险无限，本工具不做。\n"
-                     f"   想一次建仓到位：--preset covered-call\n")
-        stock_note = f"现有 {have:g} 股 ≥ 需要 {need_shares} 股 ✅"
+        # 已被其它空头 Call 占用的股票不能再用来覆盖本单，否则就是变相裸卖
+        busy = _short_calls(ib, sym, args.currency)
+        avail = max(0.0, have - busy * mult)
+        if avail < need_shares:
+            sys.exit(f"\n⛔ 备兑卖 Call 的先决条件是持有未被覆盖的正股：\n"
+                     f"   卖 {qty} 张需 {need_shares} 股，你总持有 {have:g} 股，已有 {busy} 张空头 Call 占用了 {busy * mult} 股，净可用仅 {avail:g} 股。\n"
+                     f"   没有股票覆盖的卖出 Call 是裸卖，理论上风险无限，本工具不做。\n")
+        stock_note = f"总持仓 {have:g} 股（已占用 {busy * mult} 股），净可用 {avail:g} 股 ≥ 需 {need_shares} 股 ✅"
     else:
         need_cash = strike * mult * qty
         ok, note = _coverage(ib, args.currency, need_cash)
@@ -903,10 +952,16 @@ def _resolve_option(ib, symbol, expiry, strikes, target, right, currency, chain,
         return None, None
     if right == "C":
         t = target if floor is None else max(target, floor)
-        order = sorted(ks, key=lambda k: (k < t - 1e-9, k))     # 先 ≥ 目标（由低到高）
+        # 先找 ≥ 目标（由低到高）：最贴近目标的虚值/平值档；
+        # 没有才回退到 < 目标，且必须从高到低（离目标最近），避免挑到深度实值档。
+        ge = [k for k in ks if k >= t - 1e-9]
+        lt = [k for k in ks if k < t - 1e-9]
+        cands = (sorted(ge) + sorted(lt, reverse=True))[:6]
     else:
-        order = sorted(ks, key=lambda k: (k > target + 1e-9, -k))  # 先 ≤ 目标（由高到低）
-    cands = order[:6]
+        # 先找 ≤ 目标（由高到低）；没有才回退到 > 目标，且必须从低到高（离目标最近）。
+        le = [k for k in ks if k <= target + 1e-9]
+        gt = [k for k in ks if k > target + 1e-9]
+        cands = (sorted(le, reverse=True) + sorted(gt))[:6]
     tries = []
     for k in cands:
         try:
@@ -1005,18 +1060,21 @@ def cmd_plan(cfg, args):
         qty = args.qty
         note = []
         if right == "C":
-            cover = int(have // mult) if mult else 0
+            busy = _short_calls(ib, sym, cur)
+            avail = max(0.0, have - busy * mult)
+            cover = int(avail // mult) if mult else 0
             if cover < qty:
                 qty = cover
-                note.append(f"股数只够 {cover} 张")
-            busy = _short_calls(ib, sym, cur)
-            if busy:
-                note.append(f"已有 {busy} 张空头 Call")
-            if busy >= cover >= 1:
-                note.append("当前持仓已被覆盖，本单会叠加敞口")
+                if busy:
+                    note.append(f"已有 {busy} 张空头 Call（净可用 {avail:g} 股只够 {cover} 张）")
+                else:
+                    note.append(f"股数只够 {cover} 张")
             if cost and strike < cost:
                 note.append(f"行权价低于成本 {cost:.2f}，被行权即锁定亏损")
-            collat, collat_txt = have * cost if cost else have * px, f"{have:g} 股"
+            # 年化分母只算本单实际卖出的张数对应的担保市值，
+            # 不能用用户总持仓（多出来的股票与本单收益无关，会稀释/夸大年化）。
+            collat = qty * mult * cost if cost else qty * mult * px
+            collat_txt = f"{qty * mult} 股"
         else:
             need_cash = strike * mult * qty
             ok, cov_note = _coverage(ib, cur, need_cash)

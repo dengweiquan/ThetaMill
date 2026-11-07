@@ -37,6 +37,9 @@ def validate(doc: dict) -> tuple[bool, list[str]]:
         problems.append("白名单为空")
     seen = set()
     for x in items:
+        if not isinstance(x, dict):
+            problems.append(f"白名单条目格式错误（不是字典）：{x}")
+            continue
         s = str(x.get("symbol", "?")).upper()
         if s in seen:
             problems.append(f"重复标的 {s}")
