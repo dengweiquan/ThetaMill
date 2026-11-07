@@ -48,6 +48,8 @@ logging.getLogger("ib_insync").setLevel(logging.CRITICAL)
 
 from ib_async import (IB, Stock, Option, Contract,  # noqa: E402
                       MarketOrder, LimitOrder, StopOrder)
+from .universe import (load_universe, universe_allowed, universe_gate,  # noqa: E402
+                       validate, meta)
 
 
 # ---------------------------------------------------------------- 配置 / 连接
@@ -934,6 +936,10 @@ def cmd_plan(cfg, args):
     port, env = resolve_port(cfg, args)
     ib = connect(cfg, port, readonly=True, force_delayed=getattr(args, "delayed", False))
 
+    # 可选外部准入白名单：只做减法，默认关闭
+    uni_doc = load_universe(args.universe) if getattr(args, "universe", None) else None
+    uni_map = universe_allowed(uni_doc) if uni_doc else {}
+
     # 标的按 (代码, 币种) 收集：显式指定的用 --currency，扫持仓的用持仓自身币种
     targets = []
     if args.symbols:
@@ -949,6 +955,20 @@ def cmd_plan(cfg, args):
                     targets.append(key)
     if not targets:
         sys.exit("未指定标的，且账户无正股持仓 —— 用 `plan AAPL` 或 `--symbols AAPL,MSFT`")
+
+    if uni_doc:
+        print(f"🔒 外部准入白名单：{len(uni_map)} 只标的 | 签字 {uni_doc['approved_by']}"
+              f" | 有效期至 {uni_doc['valid_until']}")
+        print("   本工具只做减法，不评估标的质地、不因白名单自动发单。")
+        before = len(targets)
+        targets = [t for t in targets if t[0] in uni_map]
+        if before > len(targets):
+            print(f"   已过滤 {before - len(targets)} 个不在白名单的标的")
+        if not targets:
+            print("   ⛔ 所有标的都不在白名单内，本计划不产生建议。")
+            finish(ib)
+            return 0
+        print()
 
     print(f"{env} | 端口 {port} | DTE {args.dte_min}~{args.dte_max}（目标 {args.target_dte}）"
           f" | 虚值目标 {args.otm:.0%} | 本计划只读，不下单")
@@ -1015,6 +1035,12 @@ def cmd_plan(cfg, args):
             ann = prem * mult * qty / collat * 365 / max(dte, 1)
         otm_pct = (strike - px) / px
 
+        if uni_doc:
+            ok, why = universe_gate(sym, preset, strike, uni_map)
+            if not ok:
+                print(f"  {sym:<8} ✗ 准入白名单拦截：{why}")
+                continue
+
         items.append(dict(
             i=len(items) + 1, preset=preset, symbol=sym, currency=cur, expiry=expiry, dte=dte,
             strike=strike, spot=round(px, 3), otm_pct=round(otm_pct, 4), qty=qty, mult=mult,
@@ -1038,6 +1064,10 @@ def cmd_plan(cfg, args):
         if it["note"]:
             print(f"     ⚠️ {it['note']}")
 
+    if uni_doc:
+        print(f"\n  🔒 以上建议已受准入白名单约束（签字 {uni_doc['approved_by']}，"
+              f"有效期至 {uni_doc['valid_until']}）；标的质地由上游评估，本工具不判断。")
+
     if any(not it["premium"] for it in items):
         print("\n  参考权利金为 - 的条目：该市场无实时/延迟行情（未订阅），需自行定价或加 --net 手工填价。")
 
@@ -1048,6 +1078,7 @@ def cmd_plan(cfg, args):
             "generated": datetime.now().isoformat(timespec="seconds"),
             "env": env, "port": port, "currencies": sorted({it["currency"] for it in items}),
             "window": dict(dte_min=args.dte_min, dte_max=args.dte_max, otm=args.otm),
+            "universe": meta(uni_doc) if uni_doc else None,
             "items": items,
         }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"\n  已写入计划文件：{out}")
@@ -1070,6 +1101,16 @@ def cmd_run(cfg, args):
     if not items:
         sys.exit("计划文件里没有可执行条目")
 
+    # 计划文件带白名单元信息时，先复验签字与有效期，防止过期计划被执行
+    uni = doc.get("universe")
+    uni_map = {}
+    if uni:
+        ok, problems = validate(uni)
+        if not ok:
+            sys.exit("⛔ 计划里的准入白名单已失效：\n  - " + "\n  - ".join(problems)
+                     + "\n   请用 plan --universe 重新生成计划。")
+        uni_map = universe_allowed(uni)
+
     idx = args.i
     if idx is None and len(items) == 1:
         idx = items[0]["i"]
@@ -1083,6 +1124,13 @@ def cmd_run(cfg, args):
     it = next((x for x in items if int(x.get("i", -1)) == int(idx)), None)
     if not it:
         sys.exit(f"计划里没有 #{idx} 这一条")
+
+    # 二次校验：手工改过计划文件（抬高行权价 / 换标的）也绕不过白名单
+    if uni:
+        ok, why = universe_gate(it["symbol"], it["preset"], float(it["strike"]), uni_map)
+        if not ok:
+            sys.exit(f"⛔ 计划条目已不符合准入白名单：{why}\n"
+                     f"   请用 plan --universe 重新生成，不要手工改动计划文件。")
 
     net = it.get("premium") if it.get("premium") else None
     if args.net is not None:
@@ -1203,6 +1251,7 @@ def main():
     pl.add_argument("--qty", type=int, default=1, help="计划张数（股数不足会自动下调）")
     pl.add_argument("--currency", default=cfg["default_currency"])
     pl.add_argument("--json", dest="json_out", help="把建议写成 JSON，供 run 使用")
+    pl.add_argument("--universe", help="可选外部准入白名单 JSON，只做减法过滤（默认关闭）")
 
     rn = sub.add_parser("run", help="执行 plan 生成的建议（仍走复核码）")
     rn.set_defaults(func=cmd_run)

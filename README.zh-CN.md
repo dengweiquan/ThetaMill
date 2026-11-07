@@ -99,6 +99,8 @@ thetamill --paper audit --today
 
 全局参数：`--paper`、`--port N`、`--delayed`，写在子命令前后都生效（`thetamill --paper account` 与 `thetamill account --paper` 等价）。
 
+**可选外部准入白名单**：`plan --universe <file.json>` 读取上游研究工具产出的人工签字白名单，只做减法——不在白名单的标的不出建议，现金担保卖 Put 的行权价不得超过 `max_entry`（愿意接货价）。默认关闭，不传时行为不变；本工具不评估标的质地、不因白名单自动发单。契约格式见 `thetamill/universe.py`，端到端验证见 `docs/VERIFICATION.zh-CN.md`。
+
 ---
 
 ## 安全模型

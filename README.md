@@ -99,6 +99,8 @@ thetamill --paper audit --today
 
 Global flags: `--paper`, `--port N`, `--delayed` — accepted before or after the subcommand (e.g. `thetamill account --paper`).
 
+Optional admission allowlist: `plan --universe <file.json>` reads a human-signed allowlist produced by an upstream research tool. It only subtracts — unlisted symbols produce no suggestion, and a cash-put strike may not exceed `max_entry` (the price you are willing to be assigned at). Disabled by default; the tool neither assesses company quality nor sends orders because of the allowlist. Contract: `thetamill/universe.py`; end-to-end verification: `docs/VERIFICATION.zh-CN.md`.
+
 ---
 
 ## Safety model
