@@ -98,6 +98,7 @@ thetamill --paper audit --today
 | `cancel` | 撤单 | — |
 
 全局参数：`--paper`、`--port N`、`--delayed`，写在子命令前后都生效（`thetamill --paper account` 与 `thetamill account --paper` 等价）。
+下单与组合单参数：`order` 与 `combo` 支持 `--multiplier`（指定合约乘数，如 10/100/500）与 `--trading-class`（指定交易类别，用于区分标准、迷你或调整合约）。
 
 **可选外部准入白名单**：`plan --universe <file.json>` 读取上游研究工具产出的人工签字白名单，只做减法——不在白名单的标的不出建议，现金担保卖 Put 的行权价不得超过 `max_entry`（愿意接货价）。默认关闭，不传时行为不变；本工具不评估标的质地、不因白名单自动发单。契约格式见 `thetamill/universe.py`，端到端验证见 `docs/VERIFICATION.zh-CN.md`。
 
@@ -111,11 +112,13 @@ thetamill --paper audit --today
 2. **`--live-ok`**——总开关打开后，漏了这个参数照样拒绝
 3. **复核码**——同一条命令跑一次只出码，带 `--code` 复跑才发；码里含账户环境，纸账户的码在实盘无效
 
-再加覆盖校验，让三种策略名副其实：
+再加覆盖校验与合约身份绑定，让三种策略名副其实：
 
-- `sell-call` 必须持有足够股数——**代码里没有裸卖 Call 的路径**
-- `cash-put` 必须备足现金/保证金（按汇率折算，例如用美元余额应对港币行权需求）
-- `covered-call` 已有足够股数时拒绝再买
+- `sell-call` 必须持有足够股数（严格按期权合约真实乘数计算）——**代码里没有裸卖 Call 的路径**
+- `cash-put` 必须备足真实硬现金（按 `行权价 × 合约乘数 × 张数` 精准计量并核减在途挂单与存量空头，杜绝静默默认 100 股导致的保证金穿透）
+- `covered-call` 已有足够股数时拒绝再买，缺少股数时仅差额补买
+- **合约身份闭环锁定**：`plan` 导出确切合约身份（`conId`、`mult`、`tradingClass`、`exchange`）；`run` 严格校验，杜绝执行混淆或使用旧版无身份元数据的计划文件。
+
 
 只读命令一律走 `readonly=True` 连接——IBKR 服务端会直接拒绝该会话发出的任何委托。
 

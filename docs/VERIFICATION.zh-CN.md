@@ -285,5 +285,32 @@ run         → 复核码 180EE04B → 提交 #104 PreSubmitted → 撤单归 0
   - 免配置 CLI 帮助与全局环境安全隔离。
 - 54 项测试耗时仅 0.025s，全离线无外部依赖，100% 通过。
 
+---
 
+## 十四、期权合约身份精确绑定与多乘数交易风控加固（Phase 2 实施与 76 项测试门禁）
 
+针对用户核心交易风控要求（「卖put合约有的100 有的200 有的500 这个一定不能错」），重点消除了非标乘数导致的资金穿透与同名期权合约身份歧义风险，将离线自动化测试套件扩充至 **76 项**并全部绿色通过：
+
+### 1. 合约乘数严格校验与阻断机制（Fail-Closed Multiplier Fidelity）
+- **严格正有限数校验**：实现 `_parse_multiplier(val)`，仅接受大于 0 的有限整数与浮点数（如 10, 12.5, 100, 500），严格阻断 `bool`、负数、零、`"nan"`、`"inf"` 及不可解析对象。
+- **废除静默 100 股回退**：重构 `_multiplier(ib, contract)`，彻底废除「无法确认时默认当作 100 股」的潜在高危逻辑。优先读取合约自身 multiplier，其次通过 `reqContractDetails` 匹配确切 `conId`；若仍无法确认，立即阻断并退出（`sys.exit`），严防港股 500 股大合约被低估导致 80% 现金担保穿透。
+- **存量与在途担保全量重核**：`_short_calls_shares`、`_pending_short_calls_shares`、`_short_puts_collateral` 与 `_pending_cash_puts` 均强制调用 `_multiplier` 逐一精确折算每张合约的实际担保义务，支持多标的、混合乘数账户的精确清算。
+
+### 2. 合约身份全维度精确匹配（Exact Contract Identity & Anti-Ambiguity）
+- **杜绝按返回索引盲认合约**：实现 `_option_matches(...)`，在 `qualifyContracts` 返回后逐项核对 `secType`, `symbol`, `lastTradeDateOrContractMonth`, `strike`, `right`, `currency`, `conId`, `multiplier`, `tradingClass`。若返回结果存在歧义或不匹配，坚决拒绝认领，防止标准合约与迷你/特殊调整合约混淆。
+- **交易所回退参数保真**：在 `_opt` 执行 `SEHK -> SMART` 交易所回退时，全程保留并向券商传递 `multiplier`、`tradingClass` 与 `conId`。
+- **行权价阶梯依次逐档解析**：重构 `_resolve_option`，弃用可能因中间合约不存在而引发索引错位的批量 qualify，改为按离目标价格最近且方向正确的行权价逐档解析，确保选取的行权价与合约身份完全咬合。
+
+### 3. 计划生成至执行端到端闭环锁定（Plan -> Run -> Order Identity Lock）
+- **计划元数据扩充**：`cmd_plan` 生成的 `plan.json` 导出确切合约身份 `conId`、`mult`、`tradingClass`、`exchange`。
+- **执行前强身份校验与防旧版本计划**：`cmd_run` 启动时强校验计划中的 `conId`, `mult`, `tradingClass`, `exchange`，缺少任一有效字段即安全阻断，提示用户重新执行 `plan` 生成最新计划（旧版未保存完整身份的计划文件无法继续执行）。
+- **复核码防篡改绑定**：`_code` 摘要载荷注入 `conId`、`multiplier`、`tradingClass`，确保从预检到提交真实执行的合约毫无偏差。
+- **CLI 显式参数扩展**：`cmd_order` 与 `cmd_combo` 新增 `--multiplier` 与 `--trading-class` 参数，支持人工显式指定特殊合约。
+- **Auto 预设自适应降级**：`cmd_plan` 在 `--preset auto` 下，根据真实合约乘数核算所需正股；当净可用股数不足 1 张 Call 或市场上该到期日无可用 Call 时，自动平滑转为现金担保 Put。
+
+### 4. 76 项离线单元测试矩阵全覆盖
+- 测试套件扩充：
+  - `tests/test_contract_identity.py`：新增 24 项测试，覆盖浮点与整数乘数解析、非法与非有限数拒绝、`conId` 精确对应、混合乘数保证金核算、歧义合约拒绝、计划与执行身份锁定等。
+  - `tests/test_cli_logic.py`：38 项测试，全面适配显式期权乘数与最新风控逻辑。
+  - `tests/test_universe.py`：14 项测试，保持准入白名单减法过滤器测试全绿。
+- 执行性能：76 项测试离线运行耗时仅 0.048s，100% 绿色通过。

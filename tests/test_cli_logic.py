@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from thetamill import cli
@@ -24,14 +25,21 @@ class MockAccountValue:
         self.currency = currency
 
 
+def qualified_option(symbol="AAPL", right="C", strike=200.0, currency="USD",
+                     multiplier="100", con_id=12345):
+    contract = cli.Option(symbol, "20261218", strike, right, "SMART", currency=currency,
+                          multiplier=multiplier, tradingClass=symbol)
+    contract.conId = con_id
+    return contract
+
+
 class MockPortfolioItem:
     def __init__(self, sec_type: str, symbol: str, currency: str, position: float,
                  average_cost: float = 0.0, right: str = ""):
-        self.contract = MagicMock()
-        self.contract.secType = sec_type
-        self.contract.symbol = symbol
-        self.contract.currency = currency
-        self.contract.right = right
+        if sec_type == "OPT":
+            self.contract = qualified_option(symbol=symbol, currency=currency, right=right)
+        else:
+            self.contract = cli.Stock(symbol, "SMART", currency)
         self.position = position
         self.averageCost = average_cost
 
@@ -95,94 +103,52 @@ class CodePayloadTests(unittest.TestCase):
 class ResolveOptionCandidateSortingTests(unittest.TestCase):
     """Test candidate selection sorting logic in _resolve_option."""
 
-    def test_call_candidate_sorting(self):
+    def assert_candidate_order(self, right, target, expected, floor=None):
         strikes = [80.0, 90.0, 100.0, 110.0, 120.0, 130.0]
-        target = 105.0
+        chain = SimpleNamespace(exchange="SMART", tradingClass="AAPL", multiplier="100")
+        for chosen_index, chosen_strike in enumerate(expected):
+            with self.subTest(chosen_strike=chosen_strike):
+                mock_ib = MagicMock()
+                qualified_contract = qualified_option(right=right, strike=chosen_strike)
+                tested_strikes = []
 
-        # For Call (right="C"):
-        # ge (>= 105): [110, 120, 130] in ascending order
-        # lt (< 105): [100, 90, 80] in descending order (closest to target first)
-        mock_ib = MagicMock()
-        mock_chain = MagicMock(exchange="SMART", tradingClass="AAPL")
+                def mock_qualify(contract):
+                    tested_strikes.append(contract.strike)
+                    return [qualified_contract] if contract.strike == chosen_strike else []
 
-        qualified_contract = MagicMock(conId=9999)
-        tested_strikes = []
+                mock_ib.qualifyContracts.side_effect = mock_qualify
+                opt, strike = cli._resolve_option(
+                    mock_ib, "AAPL", "20261218", strikes, target, right, "USD", chain,
+                    floor=floor,
+                )
+                self.assertEqual(tested_strikes, expected[:chosen_index + 1])
+                self.assertIs(opt, qualified_contract)
+                self.assertEqual(strike, chosen_strike)
 
-        def mock_qualify(*contracts):
-            for c in contracts:
-                tested_strikes.append(c.strike)
-            # Qualify the first candidate
-            return [qualified_contract]
-
-        mock_ib.qualifyContracts.side_effect = mock_qualify
-
-        opt, strike = cli._resolve_option(
-            mock_ib, "AAPL", "20261218", strikes, target, "C", "USD", mock_chain
-        )
-        self.assertEqual(tested_strikes, [110.0, 120.0, 130.0, 100.0, 90.0, 80.0])
-        self.assertEqual(opt, qualified_contract)
-        self.assertEqual(strike, 110.0)
+    def test_call_candidate_sorting(self):
+        # Calls try strikes >= target ascending, then lower strikes descending.
+        self.assert_candidate_order("C", 105.0, [110.0, 120.0, 130.0, 100.0, 90.0, 80.0])
 
     def test_call_candidate_sorting_with_floor(self):
-        strikes = [80.0, 90.0, 100.0, 110.0, 120.0, 130.0]
-        target = 100.0
-        floor = 115.0  # Floor elevates effective target to 115.0
-
-        mock_ib = MagicMock()
-        mock_chain = MagicMock(exchange="SMART", tradingClass="AAPL")
-        tested_strikes = []
-
-        def mock_qualify(*contracts):
-            for c in contracts:
-                tested_strikes.append(c.strike)
-            return [MagicMock(conId=1)]
-
-        mock_ib.qualifyContracts.side_effect = mock_qualify
-
-        cli._resolve_option(
-            mock_ib, "AAPL", "20261218", strikes, target, "C", "USD", mock_chain, floor=floor
-        )
-        # Effective target is 115.0
-        # ge (>= 115): [120, 130]
-        # lt (< 115): [110, 100, 90, 80]
-        self.assertEqual(tested_strikes, [120.0, 130.0, 110.0, 100.0, 90.0, 80.0])
+        # Floor elevates the effective target from 100 to 115.
+        self.assert_candidate_order("C", 100.0, [120.0, 130.0, 110.0, 100.0, 90.0, 80.0],
+                                    floor=115.0)
 
     def test_put_candidate_sorting(self):
-        strikes = [80.0, 90.0, 100.0, 110.0, 120.0, 130.0]
-        target = 105.0
-
-        # For Put (right="P"):
-        # le (<= 105): [100, 90, 80] in descending order (closest to target first)
-        # gt (> 105): [110, 120, 130] in ascending order (closest to target first)
-        mock_ib = MagicMock()
-        mock_chain = MagicMock(exchange="SMART", tradingClass="AAPL")
-        tested_strikes = []
-
-        def mock_qualify(*contracts):
-            for c in contracts:
-                tested_strikes.append(c.strike)
-            return [MagicMock(conId=8888)]
-
-        mock_ib.qualifyContracts.side_effect = mock_qualify
-
-        opt, strike = cli._resolve_option(
-            mock_ib, "AAPL", "20261218", strikes, target, "P", "USD", mock_chain
-        )
-        self.assertEqual(tested_strikes, [100.0, 90.0, 80.0, 110.0, 120.0, 130.0])
-        self.assertEqual(strike, 100.0)
+        # Puts try strikes <= target descending, then higher strikes ascending.
+        self.assert_candidate_order("P", 105.0, [100.0, 90.0, 80.0, 110.0, 120.0, 130.0])
 
     def test_resolve_option_fallback_when_qualification_fails(self):
         strikes = [100.0, 105.0]
         mock_ib = MagicMock()
-        mock_chain = MagicMock(exchange="SMART", tradingClass="AAPL")
+        chain = SimpleNamespace(exchange="SMART", tradingClass="AAPL", multiplier="100")
         mock_ib.qualifyContracts.return_value = []
 
-        with patch.object(cli, "_opt", return_value=(None, None)):
-            opt, strike = cli._resolve_option(
-                mock_ib, "AAPL", "20261218", strikes, 100.0, "C", "USD", mock_chain
-            )
-            self.assertIsNone(opt)
-            self.assertIsNone(strike)
+        opt, strike = cli._resolve_option(
+            mock_ib, "AAPL", "20261218", strikes, 100.0, "C", "USD", chain
+        )
+        self.assertIsNone(opt)
+        self.assertIsNone(strike)
 
 
 class PickExpiryTests(unittest.TestCase):
@@ -456,42 +422,6 @@ class CmdRunValidationTests(unittest.TestCase):
             Path(plan_path).unlink(missing_ok=True)
 
 
-class PlanPresetLogicTests(unittest.TestCase):
-    """Test preset selection logic under auto, sell-call, and cash-put."""
-
-    def test_preset_sell_call_and_cash_put_explicit(self):
-        # sell-call explicitly forces right='C', preset='sell-call'
-        args_sc = argparse.Namespace(preset="sell-call")
-        right_sc = "C" if getattr(args_sc, "preset", "auto") == "sell-call" else "P"
-        self.assertEqual(right_sc, "C")
-
-        # cash-put explicitly forces right='P', preset='cash-put'
-        args_cp = argparse.Namespace(preset="cash-put")
-        right_cp = "P" if getattr(args_cp, "preset", "auto") == "cash-put" else "C"
-        self.assertEqual(right_cp, "P")
-
-    def test_preset_auto_rules(self):
-        # 1. have >= 100 and avail >= 100 -> sell-call
-        have = 200.0
-        busy = 0
-        avail = max(0.0, have - busy * 100)
-        self.assertGreaterEqual(avail, 100)
-
-        # 2. have >= 100 but busy calls occupy all -> cash-put with note
-        have = 100.0
-        busy = 1
-        avail = max(0.0, have - busy * 100)
-        self.assertLess(avail, 100)
-
-        # 3. 0 < have < 100 -> cash-put with note (< 1 lot)
-        have = 50.0
-        self.assertTrue(0 < have < 100)
-
-        # 4. have == 0 -> cash-put without share note
-        have = 0.0
-        self.assertEqual(have, 0)
-
-
 class OptionExchangeFallbackTests(unittest.TestCase):
     """Test option exchange fallback logic in cmd_order."""
 
@@ -524,7 +454,7 @@ class OptionExchangeFallbackTests(unittest.TestCase):
 
         # Mock qualifyContracts behavior: fails on SEHK, succeeds on SMART
         mock_ib = MagicMock()
-        smart_qualified = MagicMock(conId=12345, secType="OPT")
+        smart_qualified = qualified_option(symbol="700", strike=400.0, currency="HKD")
 
         def mock_qualify(c):
             if c.exchange == "SEHK":
@@ -580,7 +510,7 @@ class TradingRiskControlsTests(unittest.TestCase):
         )
         cfg = dict(cli.DEFAULT_CFG)
         mock_ib = MagicMock()
-        mock_ib.qualifyContracts.return_value = [MagicMock(conId=12345, secType="OPT")]
+        mock_ib.qualifyContracts.return_value = [qualified_option()]
 
         with patch.object(cli, "connect", return_value=mock_ib), \
              patch.object(cli, "finish"), \
@@ -618,7 +548,7 @@ class TradingRiskControlsTests(unittest.TestCase):
         )
         cfg = dict(cli.DEFAULT_CFG)
         mock_ib = MagicMock()
-        mock_ib.qualifyContracts.return_value = [MagicMock(conId=12345, secType="OPT")]
+        mock_ib.qualifyContracts.return_value = [qualified_option(right="P")]
 
         with patch.object(cli, "connect", return_value=mock_ib), \
              patch.object(cli, "finish"), \
@@ -704,8 +634,10 @@ class TradingRiskControlsTests(unittest.TestCase):
         mock_trade.contract.symbol = "AAPL"
         mock_trade.contract.currency = "USD"
         mock_trade.contract.right = "C"
+        mock_trade.contract.multiplier = "100"
         mock_trade.order.action = "SELL"
         mock_ib.openTrades.return_value = [mock_trade]
+        mock_ib.portfolio.return_value = []
 
         pending = cli._pending_short_calls(mock_ib, "AAPL", "USD")
         self.assertEqual(pending, 1)
@@ -733,14 +665,12 @@ class TradingRiskControlsTests(unittest.TestCase):
             port=4002,
         )
         cfg = dict(cli.DEFAULT_CFG)
-        mock_ib.qualifyContracts.return_value = [MagicMock(conId=12345, secType="OPT")]
+        mock_ib.qualifyContracts.return_value = [qualified_option()]
 
         with patch.object(cli, "connect", return_value=mock_ib), \
              patch.object(cli, "finish"), \
              patch.object(cli, "CFG_PATH") as mock_cfg_path, \
              patch.object(cli, "_shares", return_value=100.0), \
-             patch.object(cli, "_short_calls", return_value=0), \
-             patch.object(cli, "_pending_short_calls", return_value=1), \
              patch("sys.stdout", new_callable=io.StringIO):
             mock_cfg_path.exists.return_value = True
             with self.assertRaises(SystemExit) as cm:
@@ -841,7 +771,7 @@ class TradingRiskControlsTests(unittest.TestCase):
 
     def test_short_stock_position_rejects_covered_call_and_sell_call(self):
         mock_ib = MagicMock()
-        mock_ib.qualifyContracts.return_value = [MagicMock(conId=12345, secType="OPT")]
+        mock_ib.qualifyContracts.return_value = [qualified_option()]
         cfg = dict(cli.DEFAULT_CFG)
 
         # 1. cmd_order with negative stock position
@@ -934,7 +864,7 @@ class TradingRiskControlsTests(unittest.TestCase):
 
     def test_undercollateralized_existing_calls_rejects_new_calls(self):
         mock_ib = MagicMock()
-        mock_ib.qualifyContracts.return_value = [MagicMock(conId=12345, secType="OPT")]
+        mock_ib.qualifyContracts.return_value = [qualified_option()]
         cfg = dict(cli.DEFAULT_CFG)
 
         # 100 shares held, but existing short calls already occupy 200 shares (deficit = 100)
@@ -1034,17 +964,8 @@ class TradingRiskControlsTests(unittest.TestCase):
             self.assertIn("✅", note_pass)
             self.assertIn("已扣减挂单及存量占用 0.00 USD 及 40,000.00 HKD", note_pass)
 
-    def test_contract_multiplier_custom_and_fallback(self):
-        # 1. _contract_multiplier parsing
-        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier=50)), 50.0)
-        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier=25.0)), 25.0)
-        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier="10")), 10.0)
-        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier="invalid")), 100.0)
-        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier=None)), 100.0)
-        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier=0)), 100.0)
-        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier=-10)), 100.0)
-
-        # 2. Portfolio short calls with custom multiplier (e.g., mini option with 25 shares/contract)
+    def test_custom_multipliers_preserve_call_share_reservations(self):
+        # Portfolio short calls with a mini option's 25 shares/contract.
         mock_ib = MagicMock()
         p1 = MagicMock()
         p1.contract.secType = "OPT"

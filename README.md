@@ -98,6 +98,7 @@ thetamill --paper audit --today
 | `cancel` | Cancel a working order | — |
 
 Global flags: `--paper`, `--port N`, `--delayed` — accepted before or after the subcommand (e.g. `thetamill account --paper`).
+Order flags: `order` and `combo` accept `--multiplier` (e.g. 10/100/500) and `--trading-class` (standard, mini, or adjusted contracts).
 
 Optional admission allowlist: `plan --universe <file.json>` reads a human-signed allowlist produced by an upstream research tool. It only subtracts — unlisted symbols produce no suggestion, and a cash-put strike may not exceed `max_entry` (the price you are willing to be assigned at). Disabled by default; the tool neither assesses company quality nor sends orders because of the allowlist. Contract: `thetamill/universe.py`; end-to-end verification: `docs/VERIFICATION.zh-CN.md`.
 
@@ -111,11 +112,13 @@ Three gates in series. An order cannot leave without passing all three:
 2. **`--live-ok`** — even with the switch on, a live order needs this flag.
 3. **Approval code** — running the same command once prints a short code and exits; the order is only sent when the command is re-run with `--code`. The code hashes the account environment, so a paper-account code is worthless on a live account.
 
-Plus coverage checks that make the three strategies mean what they say:
+Plus coverage checks and contract identity binding that make the three strategies mean what they say:
 
-- `sell-call` requires enough shares; there is no naked-call path in this codebase.
-- `cash-put` requires enough cash/margin (FX converted, e.g. HKD requirement against a USD balance).
-- `covered-call` refuses to buy more shares if you already hold enough.
+- `sell-call` requires enough shares based on each contract's actual multiplier; there is no naked-call path in this codebase.
+- `cash-put` requires enough actual cash (`strike × multiplier × qty`), deducting working orders and existing short puts to prevent under-collateralization.
+- `covered-call` refuses to buy more shares if you already hold enough, buying only the exact difference needed.
+- **Contract identity lock**: `plan` records exact contract metadata (`conId`, `mult`, `tradingClass`, `exchange`), which `run` strictly validates before requesting approval. Legacy or tampered plans lacking identity are rejected.
+
 
 Read-only commands use `readonly=True` connections — the IBKR server itself rejects any order on those sessions.
 

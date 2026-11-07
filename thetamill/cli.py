@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import socket
 import sys
@@ -67,7 +68,7 @@ except ImportError:
 
     class Option(Contract):  # type: ignore[no-redef]
         def __init__(self, symbol="", lastTradeDateOrContractMonth="", strike=0.0, right="",
-                     exchange="", multiplier="100", currency="", tradingClass=""):
+                     exchange="", multiplier="", currency="", tradingClass=""):
             super().__init__(secType="OPT", symbol=symbol, exchange=exchange, currency=currency)
             self.lastTradeDateOrContractMonth = lastTradeDateOrContractMonth
             self.strike = float(strike) if strike else 0.0
@@ -348,8 +349,43 @@ def _fallback_delayed(ib):
 XCHG_FALLBACK = {"HKD": "SEHK", "JPY": "TSE", "CNH": "SEHK", "CNY": "SEHKNTL"}
 
 
-def _opt(ib, symbol, expiry, strike, right, currency, exchange=None):
-    """取期权合约：已知本币交易所时优先（港股期权只能走 SEHK），再试 SMART"""
+def _parse_multiplier(value):
+    """仅接受有限正数；保留非整数乘数，不把未知值当成标准 100。"""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    try:
+        value = float(value)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return int(value) if value.is_integer() else value
+
+
+def _option_matches(contract, symbol, expiry, strike, right, currency, multiplier=None,
+                    trading_class=None, con_id=None):
+    """qualify 结果仍须匹配请求身份，不能按返回列表位置认领合约。"""
+    return (
+        getattr(contract, "secType", "") == "OPT"
+        and getattr(contract, "symbol", "").upper() == symbol.upper()
+        and getattr(contract, "lastTradeDateOrContractMonth", "") == expiry
+        and getattr(contract, "strike", None) == strike
+        and getattr(contract, "right", "").upper() == right.upper()
+        and getattr(contract, "currency", "").upper() == currency.upper()
+        and bool(getattr(contract, "conId", 0))
+        and (con_id is None or contract.conId == con_id)
+        and (not trading_class or getattr(contract, "tradingClass", "") == trading_class)
+        and (multiplier is None
+             or _parse_multiplier(getattr(contract, "multiplier", None)) == multiplier)
+    )
+
+
+def _opt(ib, symbol, expiry, strike, right, currency, exchange=None, multiplier=None,
+         trading_class=None, con_id=None):
+    """按完整身份解析期权，交易所回退不能丢掉乘数、交易类别或计划 conId。"""
+    mult = _parse_multiplier(multiplier)
+    if multiplier is not None and mult is None:
+        sys.exit("⛔ 期权乘数必须是有限正数")
     if exchange:
         cands = [exchange]
     else:
@@ -359,9 +395,15 @@ def _opt(ib, symbol, expiry, strike, right, currency, exchange=None):
         cands.append("SMART")
     for x in cands:
         try:
-            oc = Option(symbol.upper(), expiry, strike, right.upper(), x, currency=currency)
-            q = [c for c in ib.qualifyContracts(oc) if c and c.conId]
-            if q:
+            oc = Option(symbol.upper(), expiry, strike, right.upper(), x,
+                        currency=currency, multiplier=str(mult) if mult is not None else "",
+                        tradingClass=trading_class or "")
+            if con_id is not None:
+                oc.conId = int(con_id)
+            q = [c for c in ib.qualifyContracts(oc) if c and _option_matches(
+                c, symbol, expiry, strike, right, currency, mult, trading_class,
+                int(con_id) if con_id is not None else None)]
+            if len({c.conId for c in q}) == 1:
                 return q[0], x
         except Exception:
             continue
@@ -369,23 +411,22 @@ def _opt(ib, symbol, expiry, strike, right, currency, exchange=None):
 
 
 def _multiplier(ib, contract):
-    """合约乘数：股票期权通常 100，取不到就按 100 算"""
-    m = getattr(contract, "multiplier", None)
-    if isinstance(m, (int, float)) and m > 0:
-        return int(m)
-    if isinstance(m, str) and m.isdigit() and int(m) > 0:
-        return int(m)
+    """从合约或同一 conId 的详情确认乘数；未知时阻断担保计算。"""
+    mult = _parse_multiplier(getattr(contract, "multiplier", None))
+    if mult is not None:
+        return mult
     try:
-        d = ib.reqContractDetails(contract)
-        if d:
-            dm = getattr(d[0].contract, "multiplier", None)
-            if isinstance(dm, (int, float)) and dm > 0:
-                return int(dm)
-            if isinstance(dm, str) and dm.isdigit() and int(dm) > 0:
-                return int(dm)
+        con_id = getattr(contract, "conId", None)
+        details = ib.reqContractDetails(contract)
+        matching = [d.contract for d in details
+                    if con_id and d.contract.conId == con_id]
+        values = [_parse_multiplier(getattr(c, "multiplier", None)) for c in matching]
+        if values and None not in values and len(set(values)) == 1:
+            return values[0]
     except Exception:
         pass
-    return 100
+    sys.exit(f"⛔ 无法确认期权合约乘数（conId={getattr(contract, 'conId', '?')}），"
+             "禁止按 100 股猜测担保，请核对合约详情。")
 
 
 def _stock(ib, symbol, currency, exchange=None):
@@ -689,21 +730,13 @@ def cmd_order(cfg, args):
         for req in ("expiry", "strike", "right"):
             if not getattr(args, req):
                 sys.exit(f"期权单缺少 --{req}")
-        exchange = getattr(args, "exchange", None) or ("SEHK" if args.currency == "HKD" else "SMART")
-        contract = Option(args.symbol.upper(), args.expiry, args.strike, args.right.upper(),
-                          exchange, currency=args.currency)
+        contract, _exchange = _opt(
+            ib, args.symbol, args.expiry, args.strike, args.right, args.currency,
+            exchange=getattr(args, "exchange", None),
+            multiplier=getattr(args, "multiplier", None),
+            trading_class=getattr(args, "trading_class", None))
         label = f"{args.symbol.upper()} {args.expiry} {args.strike}{args.right.upper()}"
-        try:
-            q = ib.qualifyContracts(contract)
-        except Exception:
-            q = []
-        if (not q or not q[0].conId) and exchange == "SEHK":
-            try:
-                contract = Option(args.symbol.upper(), args.expiry, args.strike, args.right.upper(),
-                                  "SMART", currency=args.currency)
-                q = ib.qualifyContracts(contract)
-            except Exception:
-                q = []
+        q = [contract] if contract else []
     else:
         contract = _stock(ib, args.symbol, args.currency, getattr(args, "exchange", None))
         if not contract:
@@ -730,9 +763,6 @@ def cmd_order(cfg, args):
             if have < 0:
                 sys.exit(f"\n⛔ 账户持有 {have:g} 股 {args.symbol} 空头头寸（做空），禁止开具备兑 Call。\n")
             busy_shares = _short_calls_shares(ib, args.symbol, args.currency) + _pending_short_calls_shares(ib, args.symbol, args.currency)
-            busy_count = _short_calls(ib, args.symbol, args.currency) + _pending_short_calls(ib, args.symbol, args.currency)
-            if busy_count > 0 and busy_shares == 0:
-                busy_shares = busy_count * mult
             if have < busy_shares:
                 sys.exit(f"\n⛔ 现有正股 {have:g} 股不足以覆盖现有空头 Call（已占用 {busy_shares:g} 股，缺口 {busy_shares - have:g} 股）。禁止继续卖出 Call。\n")
             avail = have - busy_shares
@@ -878,21 +908,6 @@ def _shares(ib, symbol, currency):
     return 0.0
 
 
-def _contract_multiplier(c) -> float:
-    """提取合约乘数，默认 100.0"""
-    m = getattr(c, "multiplier", None)
-    if isinstance(m, (int, float)) and m > 0:
-        return float(m)
-    if isinstance(m, str):
-        try:
-            val = float(m)
-            if val > 0:
-                return val
-        except (ValueError, TypeError):
-            pass
-    return 100.0
-
-
 def _short_calls(ib, symbol, currency):
     """已有空头 Call 张数（避免重复覆盖同一批股票）"""
     n = 0
@@ -925,7 +940,7 @@ def _short_calls_shares(ib, symbol, currency):
                 str(getattr(c, "currency", "")).upper() == cur and
                 getattr(c, "right", "").upper() == "C" and
                 getattr(p, "position", 0) < 0):
-            mult = _contract_multiplier(c)
+            mult = _multiplier(ib, c)
             total_shares += abs(float(p.position)) * mult
     return total_shares
 
@@ -991,7 +1006,7 @@ def _pending_short_calls_shares(ib, symbol, currency):
             getattr(c, "right", "").upper() == "C" and
             getattr(o, "action", "").upper() == "SELL"):
             rem = _trade_remaining(t)
-            mult = _contract_multiplier(c)
+            mult = _multiplier(ib, c)
             total_shares += rem * mult
     return total_shares
 
@@ -1015,7 +1030,7 @@ def _pending_cash_puts(ib, currency):
             getattr(c, "right", "").upper() == "P" and
             getattr(o, "action", "").upper() == "SELL"):
             rem = _trade_remaining(t)
-            mult = _contract_multiplier(c)
+            mult = _multiplier(ib, c)
             strike = float(getattr(c, "strike", 0.0) or 0.0)
             total_cash += strike * mult * rem
     return total_cash
@@ -1033,7 +1048,7 @@ def _short_puts_collateral(ib, currency):
                 str(getattr(c, "currency", "")).upper() == cur_u and
                 getattr(c, "right", "").upper() == "P" and
                 getattr(p, "position", 0) < 0):
-            mult = _contract_multiplier(c)
+            mult = _multiplier(ib, c)
             strike = float(getattr(c, "strike", 0.0) or 0.0)
             total_cash += abs(float(p.position)) * strike * mult
     return total_cash
@@ -1209,7 +1224,12 @@ def cmd_combo(cfg, args):
     except Exception:
         pass
 
-    opt, _exch = _opt(ib, sym, args.expiry, strike, right, args.currency)
+    opt, _exch = _opt(
+        ib, sym, args.expiry, strike, right, args.currency,
+        exchange=getattr(args, "exchange", None),
+        multiplier=getattr(args, "multiplier", None),
+        trading_class=getattr(args, "trading_class", None),
+        con_id=getattr(args, "con_id", None))
     if not opt:
         sys.exit(f"期权合约无法识别：{sym} {args.expiry} {strike:g}{right}（可用 --currency 指定币种）")
     mult = _multiplier(ib, opt)
@@ -1234,7 +1254,7 @@ def cmd_combo(cfg, args):
         if not stock_contract:
             sys.exit(f"正股合约无法识别：{sym} {args.currency}")
         if avail > 0:
-            stock_qty = need_shares - int(avail)
+            stock_qty = need_shares - avail
             stock_note = f"现有净可用 {avail:g} 股 → 差额补买 {stock_qty} 股（合计 {need_shares} 股覆盖 {qty} 张）"
         else:
             stock_qty = need_shares
@@ -1266,7 +1286,8 @@ def cmd_combo(cfg, args):
     mode = "live" if is_live else "paper"
     payload = dict(mode=mode, port=port, kind="strat", preset=preset, symbol=sym,
                    conId=opt.conId, strike=strike, right=right, expiry=args.expiry,
-                   qty=qty, net=net, otype=otype, shares=stock_qty, stock_px=args.stock_px or 0)
+                   qty=qty, net=net, otype=otype, shares=stock_qty, stock_px=args.stock_px or 0,
+                   multiplier=mult, tradingClass=opt.tradingClass)
     code = _code(payload)
 
     print("─" * 68)
@@ -1435,28 +1456,14 @@ def _resolve_option(ib, symbol, expiry, strikes, target, right, currency, chain,
         le = [k for k in ks if k <= target + 1e-9]
         gt = [k for k in ks if k > target + 1e-9]
         cands = (sorted(le, reverse=True) + sorted(gt))[:6]
-    tries = []
+    # 每档单独解析；批量 qualify 会省略失败项，不能按返回位置配对行权价。
     for k in cands:
-        try:
-            tries.append(Option(symbol.upper(), expiry, k, right, chain.exchange,
-                                tradingClass=chain.tradingClass, currency=currency))
-        except Exception:
-            tries.append(None)
-    live = [(k, c) for k, c in zip(cands, tries) if c is not None]
-    if not live:
-        return None, None
-    try:
-        qual = ib.qualifyContracts(*[c for _, c in live])
-    except Exception:
-        qual = []
-    for (k, _c), q in zip(live, qual):
-        if q and getattr(q, "conId", None):
-            return q, k
-    # 交易所不匹配时按币种再兜一次
-    for k in cands:
-        opt, _x = _opt(ib, symbol, expiry, k, right, currency)
+        opt, _x = _opt(
+            ib, symbol, expiry, k, right, currency, exchange=chain.exchange,
+            multiplier=getattr(chain, "multiplier", None),
+            trading_class=chain.tradingClass)
         if opt:
-            return opt, k
+            return opt, float(opt.strike)
     return None, None
 
 
@@ -1528,33 +1535,29 @@ def cmd_plan(cfg, args):
         cost = _cost_basis(ib, sym, cur)
         note = []
         preset_choice = getattr(args, "preset", "auto")
-        if preset_choice == "sell-call":
-            right, preset = "C", "sell-call"
-        elif preset_choice == "cash-put":
-            right, preset = "P", "cash-put"
-        else:
-            if have >= 100:
-                busy_shares = _short_calls_shares(ib, sym, cur) + _pending_short_calls_shares(ib, sym, cur)
-                busy = _short_calls(ib, sym, cur) + _pending_short_calls(ib, sym, cur)
-                avail = max(0.0, have - busy_shares)
-                if avail >= 100:
-                    right, preset = "C", "sell-call"
-                else:
-                    right, preset = "P", "cash-put"
-                    note.append(f"现有 {have:g} 股已被 {busy} 张 Call 占满，自动转为现金担保卖 Put")
-            elif have > 0:
-                right, preset = "P", "cash-put"
-                note.append(f"持有 {have:g} 股不足 1 手（需 100 股），自动转为现金担保卖 Put")
-            else:
-                right, preset = "P", "cash-put"
-
+        # auto 先解析真实 Call，知道每张所需股数后才判断能否备兑。
+        right = "P" if preset_choice == "cash-put" or (preset_choice == "auto" and have <= 0) else "C"
+        preset = "cash-put" if right == "P" else "sell-call"
         target = px * (1 + args.otm) if right == "C" else px * (1 - args.otm)
         opt, strike = _resolve_option(ib, sym, expiry, ch.strikes, target, right, cur, ch,
                                       floor=cost if right == "C" else None)
+        mult = _multiplier(ib, opt) if opt else None
+        if preset_choice == "auto" and right == "C":
+            if not opt:
+                note.append("无可用 Call 合约，自动转为现金担保卖 Put")
+            else:
+                busy_shares = _short_calls_shares(ib, sym, cur) + _pending_short_calls_shares(ib, sym, cur)
+                avail = max(0.0, have - busy_shares)
+                if avail < mult:
+                    note.append(f"净可用 {avail:g} 股不足 1 张 Call（需 {mult:g} 股），自动转为现金担保卖 Put")
+            if not opt or avail < mult:
+                right, preset = "P", "cash-put"
+                opt, strike = _resolve_option(ib, sym, expiry, ch.strikes, px * (1 - args.otm),
+                                              right, cur, ch)
+                mult = _multiplier(ib, opt) if opt else None
         if not opt:
             print(f"  {sym:<8} ✗ {expiry} 无可用行权价（该月份阶梯可能不含目标价）")
             continue
-        mult = _multiplier(ib, opt)
         prem, src = _quote_premium(ib, opt)
 
         qty = args.qty
@@ -1602,6 +1605,7 @@ def cmd_plan(cfg, args):
         items.append(dict(
             i=len(items) + 1, preset=preset, symbol=sym, currency=cur, expiry=expiry, dte=dte,
             strike=strike, spot=round(px, 3), otm_pct=round(otm_pct, 4), qty=qty, mult=mult,
+            conId=opt.conId, tradingClass=opt.tradingClass, exchange=opt.exchange,
             premium=prem, premium_src=src, collateral=round(collat, 2),
             collateral_txt=collat_txt, ann_return=round(ann, 4) if ann else None,
             note="；".join(note),
@@ -1705,6 +1709,15 @@ def cmd_run(cfg, args):
             sys.exit(f"⛔ 计划条目已不符合准入白名单：{why}\n"
                      f"   请用 plan --universe 重新生成，不要手工改动计划文件。")
 
+    # 旧计划未保存完整合约身份，不能重新解析成另一种乘数的合约。
+    con_id = it.get("conId")
+    mult = _parse_multiplier(it.get("mult"))
+    trading_class, exchange = it.get("tradingClass"), it.get("exchange")
+    if (type(con_id) is not int or con_id <= 0 or mult is None
+            or not isinstance(trading_class, str) or not trading_class.strip()
+            or not isinstance(exchange, str) or not exchange.strip()):
+        sys.exit("⛔ 计划缺少有效合约身份（conId / mult / tradingClass / exchange），请重新运行 plan 生成。")
+
     net = it.get("premium") if it.get("premium") else None
     if args.net is not None:
         net = args.net
@@ -1716,6 +1729,7 @@ def cmd_run(cfg, args):
     ns = argparse.Namespace(
         symbol=it["symbol"], preset=it["preset"], expiry=it["expiry"], k1=float(it["strike"]),
         net=float(net), qty=int(it["qty"]), currency=it.get("currency") or cfg["default_currency"],
+        con_id=con_id, multiplier=mult, trading_class=trading_class, exchange=exchange,
         stock_px=args.stock_px, code=args.code, live_ok=args.live_ok,
         paper=args.paper, port=args.port, delayed=args.delayed,
     )
@@ -1796,6 +1810,8 @@ def main():
     o.add_argument("--tif", default="DAY"); o.add_argument("--outside-rth", action="store_true")
     o.add_argument("--currency", default=cfg["default_currency"])
     o.add_argument("--exchange", help="指定交易所，如 SEHK/SMART（默认自动判断）")
+    o.add_argument("--multiplier", help="期权乘数，如 10/100/500；用于区分同名合约")
+    o.add_argument("--trading-class", help="期权交易类别；用于区分标准、迷你或调整合约")
     o.add_argument("--code", default="", help="复核码，不填只做预检不提交")
     o.add_argument("--whatif", action="store_true", help="预估保证金与佣金（需有行情，可能较慢）")
     o.add_argument("--live-ok", action="store_true", help="实盘账户下单必须加此开关（防手滑）")
@@ -1810,6 +1826,9 @@ def main():
     cb.add_argument("--net", type=float, help="权利金（每股/每张，正数=收到）；不填为市价")
     cb.add_argument("--qty", type=int, default=1, help="张数（1 张 = 乘数股）")
     cb.add_argument("--currency", default=cfg["default_currency"])
+    cb.add_argument("--exchange", help="指定期权交易所，如 SEHK/SMART（默认自动判断）")
+    cb.add_argument("--multiplier", help="期权乘数，如 10/100/500；用于区分同名合约")
+    cb.add_argument("--trading-class", help="期权交易类别；用于区分标准、迷你或调整合约")
     cb.add_argument("--stock-px", type=float, help="covered-call 买正股的限价，不填用市价")
     cb.add_argument("--code", default="", help="复核码，不填只做预检")
     cb.add_argument("--live-ok", action="store_true", help="实盘必须加")
