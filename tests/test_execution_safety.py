@@ -271,6 +271,109 @@ class ExecutionSafetyTests(unittest.TestCase):
             ib.placeOrder.assert_called_once()
             self.assertIs(ib.placeOrder.call_args.args[0], stock)
 
+    def test_covered_call_second_leg_uses_refreshed_portfolio(self):
+        call = option("C")
+        with self.broker(call, shares=0) as (ib, stock):
+            stock_fill = SimpleNamespace(order=SimpleNamespace(orderId=10),
+                                         orderStatus=SimpleNamespace(status="Filled", filled=100,
+                                                                     avgFillPrice=30))
+            option_fill = SimpleNamespace(order=SimpleNamespace(orderId=11),
+                                          orderStatus=SimpleNamespace(status="Filled", filled=1,
+                                                                      avgFillPrice=1), log=[])
+
+            def submit(contract, order):
+                if contract.secType == "STK":
+                    ib.portfolio.return_value = [position(stock, 100)]
+                    return stock_fill
+                return option_fill
+
+            ib.placeOrder.side_effect = submit
+            with patch.object(cli, "_code", return_value="APPROVED"), \
+                 patch.object(cli, "_is_code_consumed", return_value=False), \
+                 patch.object(cli, "_consume_code"), \
+                 patch.object(cli, "_write_audit"):
+                self.assertEqual(cli.cmd_combo(cli.DEFAULT_CFG,
+                                               self.combo_args(preset="covered-call", code="APPROVED")), 0)
+            self.assertEqual(ib.placeOrder.call_count, 2)
+            self.assertEqual(ib.reqAllOpenOrders.call_count, 2)
+
+    def test_malformed_existing_obligation_blocks_preflight(self):
+        bad = option("C")
+        bad.currency = ""
+        with self.broker(positions=[position(bad, -1)]) as (ib, _):
+            self.rejected(ib, self.order_args())
+        with self.broker(trades=[pending(option(), remaining=float("nan"))]) as (ib, _):
+            self.rejected(ib, self.order_args(action="BUY"))
+
+    def test_source_currency_cash_deducts_foreign_put_liability(self):
+        foreign = option()
+        foreign.currency, foreign.strike = "HKD", 800
+        with self.broker(positions=[position(foreign, -1)], cash=10000) as (ib, _):
+            with patch.object(cli, "_fx", return_value=8):
+                self.rejected(ib, self.order_args())
+
+    def test_call_known_underlying_mismatch_blocks_both_entries(self):
+        for combo in (False, True):
+            with self.broker(option("C"), shares=100) as (ib, _):
+                ib.reqContractDetails.return_value = [SimpleNamespace(contract=option("C"),
+                                                                      underConId=2, underSecType="STK")]
+                self.rejected(ib, self.combo_args(preset="sell-call") if combo else self.order_args(right="C"), combo)
+
+    def test_stock_sell_must_match_qualified_con_id(self):
+        with self.broker(shares=100) as (ib, _):
+            qualified = Stock("AAPL", "SMART", "USD")
+            qualified.conId = 2
+            with patch.object(cli, "_stock", return_value=qualified):
+                self.rejected(ib, self.order_args(opt=False, qty=100))
+
+    def test_inconsistent_zero_remaining_cannot_erase_pending_order(self):
+        with self.broker(option("C"), shares=100) as (ib, stock):
+            ib.openTrades.return_value = [pending(stock, total=100, remaining=0, filled=0)]
+            self.rejected(ib, self.order_args(right="C"))
+
+    def test_covered_call_nan_fill_stops_before_option(self):
+        with self.broker(option("C"), shares=0) as (ib, stock):
+            fill = SimpleNamespace(order=SimpleNamespace(orderId=10),
+                                   orderStatus=SimpleNamespace(status="Filled", filled=float("nan"), avgFillPrice=30))
+            ib.placeOrder.return_value = fill
+            with patch.object(cli, "_code", return_value="APPROVED"), \
+                 patch.object(cli, "_is_code_consumed", return_value=False), \
+                 patch.object(cli, "_consume_code"):
+                with self.assertRaises(SystemExit):
+                    cli.cmd_combo(cli.DEFAULT_CFG, self.combo_args(preset="covered-call", code="APPROVED"))
+            ib.placeOrder.assert_called_once()
+
+    def test_stock_fill_followed_by_external_sale_cannot_cover_call(self):
+        with self.broker(option("C"), shares=0) as (ib, stock):
+            fill = SimpleNamespace(order=SimpleNamespace(orderId=10),
+                                   orderStatus=SimpleNamespace(status="Filled", filled=100, avgFillPrice=30))
+
+            def submit(contract, order):
+                ib.portfolio.return_value = [position(stock, 100)]
+                ib.openTrades.return_value = [pending(stock, total=100, remaining=100)]
+                return fill
+
+            ib.placeOrder.side_effect = submit
+            with patch.object(cli, "_code", return_value="APPROVED"), \
+                 patch.object(cli, "_is_code_consumed", return_value=False), \
+                 patch.object(cli, "_consume_code"):
+                with self.assertRaises(SystemExit):
+                    cli.cmd_combo(cli.DEFAULT_CFG, self.combo_args(preset="covered-call", code="APPROVED"))
+            ib.placeOrder.assert_called_once()
+
+    def test_held_put_nan_and_fractional_stock_shortage_rejected(self):
+        with self.broker(positions=[position(option(), float("nan"))]) as (ib, _):
+            self.rejected(ib, self.order_args())
+        with self.broker(option("C"), shares=99.5) as (ib, _):
+            self.rejected(ib, self.combo_args(preset="covered-call"), combo=True)
+
+    def test_same_symbol_distinct_stock_contracts_cannot_combine_cover(self):
+        with self.broker(option("C"), shares=100) as (ib, _):
+            other = Stock("AAPL", "SMART", "USD")
+            other.conId = 2
+            ib.portfolio.return_value.append(position(other, -100))
+            self.rejected(ib, self.order_args(right="C"))
+
 
 if __name__ == "__main__":
     unittest.main()

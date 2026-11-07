@@ -411,6 +411,8 @@ def _account_scope(ib):
     except Exception as exc:
         sys.exit(f"⛔ 无法确认账户范围：{type(exc).__name__}: {exc}")
     accounts = [a for a in managed if isinstance(a, str) and a.strip()] if isinstance(managed, (list, tuple)) else []
+    if isinstance(managed, (list, tuple)) and not accounts:
+        sys.exit("⛔ 无法确认登录账户")
     if len(set(accounts)) > 1:
         sys.exit("⛔ 多账户会话需等待账户隔离实现，禁止交易预检或提交")
     account = accounts[0] if accounts else ""
@@ -434,6 +436,40 @@ def _account_scope(ib):
             if owner and owner != account:
                 sys.exit("⛔ 活跃挂单归属与当前账户不一致")
     return account
+
+
+def _validate_obligations(ib):
+    """Malformed live obligations must never disappear from a matching sum."""
+    for item in _portfolio(ib):
+        c = getattr(item, "contract", None)
+        if c is None:
+            sys.exit("⛔ 持仓缺少合约")
+        quantity = _finite_position(item)
+        if getattr(c, "secType", "") == "OPT" and quantity < 0:
+            if (not getattr(c, "symbol", "") or not getattr(c, "currency", "")
+                    or getattr(c, "right", "").upper() not in {"C", "P"}
+                    or not getattr(c, "conId", 0) or not float(-quantity).is_integer()):
+                sys.exit("⛔ 空头期权持仓身份或数量不完整")
+            _multiplier(ib, c)
+            if c.right.upper() == "P":
+                _positive_number(getattr(c, "strike", None), "Put 行权价")
+    for trade in _open_trades(ib):
+        if getattr(trade.orderStatus, "status", "") in {"Cancelled", "ApiCancelled", "Inactive", "Filled"}:
+            continue
+        c, order = getattr(trade, "contract", None), getattr(trade, "order", None)
+        if c is None or order is None:
+            sys.exit("⛔ 活跃挂单缺少合约或订单")
+        sec, action = getattr(c, "secType", ""), getattr(order, "action", "").upper()
+        if sec in {"OPT", "STK"} and action in {"BUY", "SELL"}:
+            if not getattr(c, "symbol", "") or not getattr(c, "currency", ""):
+                sys.exit("⛔ 活跃挂单缺少标的或币种")
+            _trade_remaining(trade)
+        if sec == "OPT" and action == "SELL":
+            if getattr(c, "right", "").upper() not in {"C", "P"} or not getattr(c, "conId", 0):
+                sys.exit("⛔ 期权卖出挂单身份不完整")
+            _multiplier(ib, c)
+            if c.right.upper() == "P":
+                _positive_number(getattr(c, "strike", None), "Put 行权价")
 
 
 def _option_matches(contract, symbol, expiry, strike, right, currency, multiplier=None,
@@ -525,7 +561,14 @@ def _delivery_guard(ib, contract, stock=None):
         under_id = getattr(detail, "underConId", 0)
         if under_type and under_type != "STK":
             sys.exit("⛔ 期权标的并非已确认正股，停止风险增加订单")
-        if stock is not None and under_id and stock.conId and under_id != stock.conId:
+        covering_ids = {stock.conId} if stock is not None and stock.conId else set()
+        if getattr(contract, "right", "").upper() == "C":
+            for held in _portfolio(ib):
+                c = getattr(held, "contract", None)
+                if (c and c.secType == "STK" and c.symbol == contract.symbol
+                        and c.currency == contract.currency and _finite_position(held) > 0):
+                    covering_ids.add(c.conId)
+        if under_id and covering_ids and covering_ids != {under_id}:
             sys.exit("⛔ 期权 underlying conId 与用于覆盖的正股不符")
 
 
@@ -821,6 +864,7 @@ def cmd_order(cfg, args):
     ib = connect(cfg, port, readonly=False, args=args)
     _sync_open_orders(ib)
     account = _account_scope(ib)
+    _validate_obligations(ib)
 
     qty = _positive_number(args.qty, "委托数量", integer=True)
     if args.opt:
@@ -860,6 +904,12 @@ def cmd_order(cfg, args):
     is_live = _is_live_env(cfg, args, port)
 
     if not args.opt and side == "SELL":
+        for held in _portfolio(ib):
+            c = getattr(held, "contract", None)
+            if (c and c.secType == "STK" and c.symbol.upper() == args.symbol.upper()
+                    and c.currency == args.currency and _finite_position(held)
+                    and c.conId != contract.conId):
+                sys.exit("⛔ 待卖正股 conId 与用于覆盖的实际持仓不符")
         have = _shares(ib, args.symbol, args.currency)
         reserved = (_short_calls_shares(ib, args.symbol, args.currency)
                     + _pending_short_calls_shares(ib, args.symbol, args.currency)
@@ -1022,13 +1072,18 @@ PRESET_KEYS = ("covered-call", "sell-call", "cash-put")
 def _shares(ib, symbol, currency):
     """已有正股净持仓"""
     sym = symbol.upper()
+    quantities = []
+    con_ids = set()
     for p in _portfolio(ib):
         c = getattr(p, "contract", None)
         if not c:
             continue
         if getattr(c, "secType", "") == "STK" and getattr(c, "symbol", "").upper() == sym and getattr(c, "currency", "") == currency:
-            return _finite_position(p)
-    return 0.0
+            con_ids.add(getattr(c, "conId", 0))
+            quantities.append(_finite_position(p))
+    if len(con_ids) > 1:
+        sys.exit("⛔ 同代码同币种正股对应多个 conId，无法合并计算 Call 覆盖")
+    return sum(quantities)
 
 
 def _short_calls(ib, symbol, currency):
@@ -1074,7 +1129,12 @@ def _trade_remaining(trade) -> float:
         try:
             value = float(rem)
             if math.isfinite(value) and value >= 0:
-                return value
+                total = float(trade.order.totalQuantity)
+                filled = float(trade.orderStatus.filled)
+                if (all(math.isfinite(x) for x in (total, filled)) and total > 0
+                        and 0 <= filled <= total and value == total - filled):
+                    return value
+                sys.exit("⛔ 活跃挂单剩余量与总量/成交量不一致，不能按零计算")
         except (TypeError, ValueError, OverflowError):
             pass
         sys.exit("⛔ 活跃挂单剩余量无效，不能按零计算")
@@ -1355,7 +1415,15 @@ def _coverage(ib, currency, need, require_cash=True):
         total_locked_cur = locked[cur_u]
         direct = cash_map.get(cur_u)
         if direct is not None:
-            cash = direct - total_locked_cur
+            foreign_locked = 0.0
+            for obligation_currency, amount in locked.items():
+                if obligation_currency == cur_u or not amount:
+                    continue
+                rate = _fx(ib, cur_u, obligation_currency)
+                if rate is None or not math.isfinite(rate) or rate <= 0:
+                    return False, f"无法折算 {obligation_currency} 存量义务，安全起见拒绝放行 ❌"
+                foreign_locked += amount / rate
+            cash = direct - total_locked_cur - foreign_locked
             ok = cash >= need
             if not ok:
                 return False, (f"需要 {fmt(need)} {currency}，账户实际现金 TotalCashValue 仅 {fmt(cash)} {currency}"
@@ -1422,6 +1490,7 @@ def cmd_combo(cfg, args):
     ib = connect(cfg, port, readonly=False, args=args)
     _sync_open_orders(ib)
     account = _account_scope(ib)
+    _validate_obligations(ib)
 
     opt, _exch = _opt(
         ib, sym, args.expiry, strike, right, args.currency,
@@ -1541,7 +1610,10 @@ def cmd_combo(cfg, args):
               f"  成交 {fmt(ts.orderStatus.filled, 0)}/{stock_qty} 股"
               f"  均价 {fmt(ts.orderStatus.avgFillPrice, 3)}")
         done.append(("正股", ts.order.orderId, ts.orderStatus.status))
-        if ts.orderStatus.filled < stock_qty:
+        confirmed_fill = _positive_number(ts.orderStatus.filled, "正股已成交数量", integer=True) if ts.orderStatus.filled else 0
+        if confirmed_fill > stock_qty:
+            sys.exit("⛔ 正股成交量超过批准数量；期权腿未提交，请人工核对")
+        if confirmed_fill < stock_qty:
             print("\n  ⛔ 正股未全部成交，已跳过卖 Call —— 不卖没有股票覆盖的 Call。")
             print("     成交后改用：--preset sell-call")
             _write_audit(env, port, preset, dict(orderId=ts.order.orderId, status=ts.orderStatus.status,
@@ -1552,7 +1624,12 @@ def cmd_combo(cfg, args):
 
         # The first leg's fill is not proof that the current portfolio still
         # covers the call: another client may have sold shares meanwhile.
+        try:
+            ib.reqAccountUpdates(account)
+        except Exception as exc:
+            sys.exit(f"⛔ 正股成交后无法刷新账户持仓；期权腿未提交：{exc}")
         _sync_open_orders(ib)
+        _validate_obligations(ib)
         refreshed_have = _shares(ib, sym, args.currency)
         refreshed_busy = (_short_calls_shares(ib, sym, args.currency)
                           + _pending_short_calls_shares(ib, sym, args.currency)
@@ -1693,11 +1770,7 @@ def cmd_plan(cfg, args):
     args.qty = _positive_number(args.qty, "计划期权张数", integer=True)
     port, env = resolve_port(cfg, args)
     ib = connect(cfg, port, readonly=True, force_delayed=getattr(args, "delayed", False), args=args)
-    try:
-        ib.reqAllOpenOrders()
-        ib.sleep(0.5)
-    except Exception:
-        pass
+    _sync_open_orders(ib)
 
     # 可选外部准入白名单：只做减法，默认关闭
     uni_doc = load_universe(args.universe) if getattr(args, "universe", None) else None

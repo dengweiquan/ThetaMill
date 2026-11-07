@@ -325,6 +325,16 @@ class PlanRunIdentityTests(unittest.TestCase):
                     cli.cmd_run(cli.DEFAULT_CFG, self.run_args())
                 combo.assert_not_called()
 
+    def test_run_does_not_truncate_fractional_plan_quantity(self):
+        with self.environment():
+            self.plan()
+            doc = json.loads(self.plan_path.read_text())
+            doc["items"][0]["qty"] = 1.5
+            self.plan_path.write_text(json.dumps(doc))
+            with patch.object(cli, "cmd_combo") as combo, self.assertRaises(SystemExit):
+                cli.cmd_run(cli.DEFAULT_CFG, self.run_args())
+            combo.assert_not_called()
+
     def test_run_refuses_changed_con_id_multiplier_class_or_strike_before_approval(self):
         for changes in [{"conId": 999}, {"multiplier": "100"}, {"tradingClass": "AAPL7"},
                         {"strike": 120}]:

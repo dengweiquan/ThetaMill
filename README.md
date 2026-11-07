@@ -15,7 +15,7 @@ ThetaMill does exactly three things — **covered call**, **sell call** (against
 | A CLI with 12 subcommands over the IBKR TWS API | A trading bot that runs unattended |
 | A plan generator (`plan`) that only reads | A backtesting framework |
 | An execution layer with three stacked safety gates | A strategy zoo — spreads, straddles, iron condors are deliberately excluded |
-| An audit trail for every order actually sent | Investment advice |
+| A best-effort local order audit trail | Investment advice |
 
 Theta is the option Greek for value lost to the passage of time. *Mill* because this is slow, repetitive work: grind a little premium out each week, and the millstone wears — tail risk on short options is real, which is why coverage checks are not decoration.
 
@@ -30,7 +30,7 @@ Theta is the option Greek for value lost to the passage of time. *Mill* because 
   - `Socket Port`: `4001` for live, `4002` for paper
   - `Trusted IPs`: add `127.0.0.1`
   - `Read-Only API` ✘ — leave unchecked, or orders can never be sent
-- Market data subscriptions are **optional**. Without them you get delayed quotes, and the account/position/order paths still work correctly.
+- Market data availability depends on market, permissions, and session state. Quotes may be delayed or missing; account queries and successful order submission do not establish quote quality or fill availability.
 
 ---
 
@@ -93,14 +93,14 @@ thetamill --paper audit --today
 | `plan` | Today's recommendations (DTE window + OTM strike + cost-basis floor) | read-only |
 | `audit` | Order audit log | read-only |
 | `order` | Single-leg stock or option order | approval code |
-| `strat` | One of the three strategies as a package | approval code |
+| `strat` (`combo` alias) | One of the three strategies; covered-call legs execute sequentially | approval code |
 | `run` | Execute a plan item | approval code |
 | `cancel` | Cancel a working order | — |
 
 Global flags: `--paper`, `--port N`, `--delayed` — accepted before or after the subcommand (e.g. `thetamill account --paper`).
-Order flags: `order` and `combo` accept `--multiplier` (e.g. 10/100/500) and `--trading-class` (standard, mini, or adjusted contracts).
+Order flags: `order` and `strat` (`combo` is an alias of the same implementation) accept `--multiplier` (e.g. 100/200/500) and `--trading-class` to disambiguate contracts. A multiplier is not the full deliverable: adjusted contracts involving cash, baskets, or unconfirmed delivery terms are outside automatic support.
 
-Optional admission allowlist: `plan --universe <file.json>` reads a human-signed allowlist produced by an upstream research tool. It only subtracts — unlisted symbols produce no suggestion, and a cash-put strike may not exceed `max_entry` (the price you are willing to be assigned at). Disabled by default; the tool neither assesses company quality nor sends orders because of the allowlist. Contract: `thetamill/universe.py`; end-to-end verification: `docs/VERIFICATION.zh-CN.md`.
+Optional admission allowlist: `plan --universe <file.json>` reads a human-signed allowlist produced by an upstream research tool. It only subtracts — unlisted symbols produce no suggestion, and a cash-put strike may not exceed `max_entry` (the price you are willing to be assigned at). Disabled by default; the tool neither assesses company quality nor sends orders because of the allowlist. Contract: `thetamill/universe.py`; historical verification and evidence limits: `docs/VERIFICATION.zh-CN.md`.
 
 ---
 
@@ -114,21 +114,25 @@ Three gates in series. An order cannot leave without passing all three:
 
 Plus coverage checks and contract identity binding that make the three strategies mean what they say:
 
-- `sell-call` requires enough shares based on each contract's actual multiplier; there is no naked-call path in this codebase.
-- `cash-put` requires enough actual cash (`strike × multiplier × qty`), deducting working orders and existing short puts to prevent under-collateralization.
+- `sell-call` requires enough shares based on each contract's actual multiplier; uncovered Call sales are outside supported behavior; checks depend on confirmed broker state.
+- `cash-put` requires enough actual cash (`strike × multiplier × qty`), with working orders and existing short-put obligations included in the risk calculation.
 - `covered-call` refuses to buy more shares if you already hold enough, buying only the exact difference needed.
 - **Contract identity lock**: `plan` records exact contract metadata (`conId`, `mult`, `tradingClass`, `exchange`), which `run` strictly validates before requesting approval. Legacy or tampered plans lacking identity are rejected.
 
 
-Read-only commands use `readonly=True` connections — the IBKR server itself rejects any order on those sessions.
+Broker-connected read-only commands request `ib_async` connections with `readonly=True`; this client parameter is not a server-side order permission or ACL. These commands do not intentionally submit orders. Gateway/TWS Read-Only API configuration is a separate control.
+
+The local consumed-code record and JSONL audit are not an atomic submission ledger: concurrent processes and a crash around submission remain limitations. Account-scoped atomic reservation/reconciliation belongs to the later roadmap. Regenerate old plan files with `plan`; missing or incompatible contract identity must not be patched by hand.
+
+Verification is layered: offline Mock tests, offline real `ib_async` contract objects, Gateway read-only checks, paper submission/cancellation, and fills are distinct evidence. Historical 76-test results do not establish 100% coverage or acceptance of this revision. No new broker verification is implied by Stage A offline work; see [verification records](docs/VERIFICATION.zh-CN.md).
 
 ---
 
 ## Known limitations
 
 - **No unattended trading.** IBKR drops the gateway daily and requires 2FA. Log in manually each session.
-- **Market data is usually delayed.** Without a subscription, US stocks report `10167` and HK stocks `354`; the account, position and order paths are unaffected. Options may have no Greeks or no quote at all.
-- **Paper accounts rarely fill options** — matching needs a book, and unsubscribed options have no book. Paper is for verifying that orders submit and cancel, not for verifying fills.
+- **Market data may be delayed or absent.** Historical sessions reported `10167` for US stocks and `354` for HK stocks. Missing quotes/FX can prevent planning or risk checks; options may have no Greeks or quote.
+- **Submission is not a fill.** Historical paper tests observed submission/cancellation during market closure, not execution or new holdings. Fill behavior needs separate verification during market hours with suitable permissions and data.
 - **Monthly and weekly option ladders differ.** `reqSecDefOptParams` returns the union of strikes across all expirations; a given month may only carry a subset, so strikes are probed nearest-first (`_resolve_option`).
 - **IB uses `-1` for "no data"** on market data fields. Values ≤ 0 are rejected when reading spot prices.
 

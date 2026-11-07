@@ -630,6 +630,8 @@ class TradingRiskControlsTests(unittest.TestCase):
         mock_trade = MagicMock()
         mock_trade.orderStatus.status = "Submitted"
         mock_trade.orderStatus.remaining = 1.0
+        mock_trade.orderStatus.filled = 0.0
+        mock_trade.order.totalQuantity = 1.0
         mock_trade.contract.secType = "OPT"
         mock_trade.contract.symbol = "AAPL"
         mock_trade.contract.currency = "USD"
@@ -941,6 +943,8 @@ class TradingRiskControlsTests(unittest.TestCase):
         mock_trade = MagicMock()
         mock_trade.orderStatus.status = "Submitted"
         mock_trade.orderStatus.remaining = 1.0
+        mock_trade.orderStatus.filled = 0.0
+        mock_trade.order.totalQuantity = 1.0
         mock_trade.contract.secType = "OPT"
         mock_trade.contract.currency = "HKD"
         mock_trade.contract.right = "P"
@@ -983,6 +987,8 @@ class TradingRiskControlsTests(unittest.TestCase):
         t1 = MagicMock()
         t1.orderStatus.status = "Submitted"
         t1.orderStatus.remaining = 3.0
+        t1.orderStatus.filled = 0.0
+        t1.order.totalQuantity = 3.0
         t1.contract.secType = "OPT"
         t1.contract.symbol = "AAPL"
         t1.contract.currency = "USD"
