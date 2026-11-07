@@ -11,6 +11,7 @@ ThetaMill 只把这份文件当作「减法过滤器」：
 from __future__ import annotations
 
 import json
+import math
 import sys
 from datetime import date
 from pathlib import Path
@@ -30,8 +31,13 @@ def validate(doc: dict) -> tuple[bool, list[str]]:
     vu = doc.get("valid_until")
     if not vu:
         problems.append("缺少 valid_until")
-    elif str(vu) < date.today().isoformat():
-        problems.append(f"白名单已于 {vu} 过期，需重新签字")
+    else:
+        try:
+            vu_date = date.fromisoformat(str(vu))
+            if vu_date < date.today():
+                problems.append(f"白名单已于 {vu} 过期，需重新签字")
+        except ValueError:
+            problems.append(f"valid_until 日期格式无效：{vu}（须为 YYYY-MM-DD）")
     items = doc.get("items") or []
     if not items:
         problems.append("白名单为空")
@@ -47,8 +53,8 @@ def validate(doc: dict) -> tuple[bool, list[str]]:
         if x.get("tier") != "ELIGIBLE":
             problems.append(f"{s} 的 tier 不是 ELIGIBLE")
         me = x.get("max_entry")
-        if not isinstance(me, (int, float)) or me <= 0:
-            problems.append(f"{s} 缺少有效的 max_entry")
+        if not isinstance(me, (int, float)) or math.isnan(me) or math.isinf(me) or me <= 0:
+            problems.append(f"{s} 的 max_entry 无效（须为 > 0 的有限数值，不能为 NaN 或 Inf）")
         if x.get("demo"):
             problems.append(f"{s} 是演示数据，不应进入真实白名单")
     return (not problems), problems
@@ -79,7 +85,7 @@ def universe_gate(symbol: str, preset: str, strike: float, amap: dict) -> tuple[
         return False, f"{symbol} 不在准入白名单"
     if preset == "cash-put":
         me = a.get("max_entry")
-        if isinstance(me, (int, float)) and me > 0 and strike > me:
+        if isinstance(me, (int, float)) and not math.isnan(me) and not math.isinf(me) and me > 0 and strike > me:
             return False, f"行权价 {strike:g} 超过愿意接货价 {me:g}"
     return True, ""
 
