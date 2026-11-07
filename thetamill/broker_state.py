@@ -1,7 +1,7 @@
 """Account-scoped broker snapshots. Collection never submits or cancels orders."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
@@ -83,6 +83,42 @@ class WorkingOrder:
 
 
 @dataclass(frozen=True)
+class PriceQuote:
+    con_id: int
+    price: Decimal
+    as_of: datetime
+    source: str
+
+    def __post_init__(self):
+        if type(self.con_id) is not int or self.con_id <= 0:
+            raise SnapshotError("Price quote requires a positive conId")
+        object.__setattr__(self, "price", number(self.price, "quote price", positive=True))
+        _quote_metadata(self.as_of, self.source)
+
+
+@dataclass(frozen=True)
+class FxQuote:
+    currency: str
+    rate: Decimal
+    as_of: datetime
+    source: str
+
+    def __post_init__(self):
+        if not isinstance(self.currency, str) or not self.currency.strip():
+            raise SnapshotError("FX quote requires a currency")
+        object.__setattr__(self, "currency", self.currency.strip().upper())
+        object.__setattr__(self, "rate", number(self.rate, "quote FX", positive=True))
+        _quote_metadata(self.as_of, self.source)
+
+
+def _quote_metadata(as_of, source):
+    if not isinstance(as_of, datetime) or as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise SnapshotError("Quote requires an actual timezone-aware timestamp")
+    if not isinstance(source, str) or not source.strip():
+        raise SnapshotError("Quote requires a source")
+
+
+@dataclass(frozen=True)
 class Snapshot:
     account: str
     environment: str
@@ -94,13 +130,20 @@ class Snapshot:
     orders: tuple[WorkingOrder, ...]
     fx: Mapping[str, Decimal]
     issues: tuple[str, ...] = ()
+    price_quotes: Mapping[int, PriceQuote] = field(default_factory=dict)
+    fx_quotes: Mapping[str, FxQuote] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.environment not in {"paper", "live"} or not self.account:
             raise SnapshotError("Snapshot requires an account and environment")
         if self.captured_at.tzinfo is None:
             raise SnapshotError("Snapshot timestamp must include a timezone")
-        for field in ("cash", "fx"):
+        for name, expected in (("price_quotes", PriceQuote), ("fx_quotes", FxQuote)):
+            for key, quote in getattr(self, name).items():
+                if not isinstance(quote, expected) or key != (
+                        quote.con_id if name == "price_quotes" else quote.currency):
+                    raise SnapshotError("Quote mapping identity mismatch")
+        for field in ("cash", "fx", "price_quotes", "fx_quotes"):
             object.__setattr__(self, field, MappingProxyType(dict(getattr(self, field))))
         for field in ("positions", "orders", "issues"):
             object.__setattr__(self, field, tuple(getattr(self, field)))
