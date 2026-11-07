@@ -51,8 +51,28 @@ class ValidateTests(unittest.TestCase):
     def test_invalid_max_entry_is_rejected(self):
         doc = good_doc()
         doc["items"][0]["max_entry"] = 0
-        ok, _ = universe.validate(doc)
+        ok, problems = universe.validate(doc)
         self.assertFalse(ok)
+        self.assertTrue(any("max_entry 无效" in p for p in problems))
+
+    def test_nan_max_entry_is_rejected(self):
+        doc = good_doc()
+        doc["items"][0]["max_entry"] = float("nan")
+        ok, problems = universe.validate(doc)
+        self.assertFalse(ok)
+        self.assertTrue(any("NaN 或 Inf" in p for p in problems))
+
+    def test_inf_max_entry_is_rejected(self):
+        doc = good_doc()
+        doc["items"][0]["max_entry"] = float("inf")
+        ok, problems = universe.validate(doc)
+        self.assertFalse(ok)
+        self.assertTrue(any("NaN 或 Inf" in p for p in problems))
+
+    def test_invalid_valid_until_format_is_rejected(self):
+        ok, problems = universe.validate(good_doc(valid_until="invalid-date-format"))
+        self.assertFalse(ok)
+        self.assertTrue(any("格式无效" in p for p in problems))
 
 
 class GateTests(unittest.TestCase):

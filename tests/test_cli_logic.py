@@ -10,7 +10,7 @@ import io
 import json
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -239,8 +239,9 @@ class FundsParsingTests(unittest.TestCase):
             MockAccountValue("AvailableFunds", "1000.0", ""),
         ]
 
-        avail_map, base = cli._funds(mock_ib)
+        cash_map, avail_map, base = cli._funds(mock_ib)
 
+        self.assertEqual(cash_map["USD"], 20000.0)
         # Conservative min for USD: min(15000, 14500) = 14500
         self.assertEqual(avail_map["USD"], 14500.0)
         self.assertEqual(avail_map["HKD"], 80000.0)
@@ -255,6 +256,7 @@ class CoverageTests(unittest.TestCase):
     def test_coverage_sufficient_same_currency(self):
         mock_ib = MagicMock()
         mock_ib.accountValues.return_value = [
+            MockAccountValue("TotalCashValue", "15000.0", "USD"),
             MockAccountValue("AvailableFunds", "15000.0", "USD"),
         ]
         ok, note = cli._coverage(mock_ib, "USD", 10000.0)
@@ -265,6 +267,7 @@ class CoverageTests(unittest.TestCase):
     def test_coverage_insufficient_same_currency(self):
         mock_ib = MagicMock()
         mock_ib.accountValues.return_value = [
+            MockAccountValue("TotalCashValue", "8000.0", "USD"),
             MockAccountValue("AvailableFunds", "8000.0", "USD"),
         ]
         ok, note = cli._coverage(mock_ib, "USD", 10000.0)
@@ -274,6 +277,7 @@ class CoverageTests(unittest.TestCase):
     def test_coverage_insufficient_no_fx(self):
         mock_ib = MagicMock()
         mock_ib.accountValues.return_value = [
+            MockAccountValue("TotalCashValue", "5000.0", "USD"),
             MockAccountValue("AvailableFunds", "5000.0", "USD"),
         ]
         # Target currency is JPY (no direct balance), and _fx returns None
@@ -286,6 +290,7 @@ class CoverageTests(unittest.TestCase):
     def test_coverage_with_fx_conversion(self):
         mock_ib = MagicMock()
         mock_ib.accountValues.return_value = [
+            MockAccountValue("TotalCashValue", "10000.0", "USD"),
             MockAccountValue("AvailableFunds", "10000.0", "USD"),
         ]
         # Base is USD (10000), target currency HKD, need 70000, fx rate 7.8 -> 78000 >= 70000 -> True
@@ -547,6 +552,292 @@ class OptionExchangeFallbackTests(unittest.TestCase):
 
         self.assertTrue(q and q[0].conId)
         self.assertEqual(contract.exchange, "SMART")
+
+
+class TradingRiskControlsTests(unittest.TestCase):
+    """Test the 6 critical trading risk controls implemented in thetamill/cli.py."""
+
+    def test_cmd_order_blocks_naked_call(self):
+        args = argparse.Namespace(
+            symbol="AAPL",
+            opt=True,
+            action="SELL",
+            qty=1,
+            type="LMT",
+            limit=5.0,
+            expiry="20261218",
+            strike=200.0,
+            right="C",
+            currency="USD",
+            exchange="SMART",
+            tif="DAY",
+            outside_rth=False,
+            whatif=False,
+            code="",
+            live_ok=False,
+            paper=True,
+            port=4002,
+        )
+        cfg = dict(cli.DEFAULT_CFG)
+        mock_ib = MagicMock()
+        mock_ib.qualifyContracts.return_value = [MagicMock(conId=12345, secType="OPT")]
+
+        with patch.object(cli, "connect", return_value=mock_ib), \
+             patch.object(cli, "finish"), \
+             patch.object(cli, "CFG_PATH") as mock_cfg_path, \
+             patch.object(cli, "_shares", return_value=50.0), \
+             patch.object(cli, "_short_calls", return_value=0), \
+             patch.object(cli, "_pending_short_calls", return_value=0), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            mock_cfg_path.exists.return_value = True
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_order(cfg, args)
+            self.assertIn("备兑卖 Call 的先决条件是持有未被覆盖的正股", str(cm.exception))
+            self.assertIn("净可用仅 50 股", str(cm.exception))
+
+    def test_cmd_order_blocks_cash_insufficient_put(self):
+        args = argparse.Namespace(
+            symbol="AAPL",
+            opt=True,
+            action="SELL",
+            qty=1,
+            type="LMT",
+            limit=5.0,
+            expiry="20261218",
+            strike=200.0,
+            right="P",
+            currency="USD",
+            exchange="SMART",
+            tif="DAY",
+            outside_rth=False,
+            whatif=False,
+            code="",
+            live_ok=False,
+            paper=True,
+            port=4002,
+        )
+        cfg = dict(cli.DEFAULT_CFG)
+        mock_ib = MagicMock()
+        mock_ib.qualifyContracts.return_value = [MagicMock(conId=12345, secType="OPT")]
+
+        with patch.object(cli, "connect", return_value=mock_ib), \
+             patch.object(cli, "finish"), \
+             patch.object(cli, "CFG_PATH") as mock_cfg_path, \
+             patch.object(cli, "_coverage", return_value=(False, "需要 20,000.00 USD，账户实际现金 TotalCashValue 仅 5,000.00 USD")), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            mock_cfg_path.exists.return_value = True
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_order(cfg, args)
+            self.assertIn("现金担保不足", str(cm.exception))
+            self.assertIn("严禁裸卖或使用融资杠杆", str(cm.exception))
+
+    def test_code_replay_prevention(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            consumed_path = Path(tmp_dir) / "consumed_codes.json"
+            with patch.object(cli, "_consumed_codes_file", return_value=consumed_path):
+                test_code = "A1B2C3D4"
+                self.assertFalse(cli._is_code_consumed(test_code))
+                cli._consume_code(test_code)
+                self.assertTrue(cli._is_code_consumed(test_code))
+                self.assertFalse(cli._is_code_consumed("OTHERCODE"))
+
+                # In cmd_order, using an already consumed code should exit immediately
+                args = argparse.Namespace(
+                    symbol="AAPL",
+                    opt=False,
+                    action="BUY",
+                    qty=10,
+                    type="MKT",
+                    limit=None,
+                    currency="USD",
+                    exchange="SMART",
+                    tif="DAY",
+                    outside_rth=False,
+                    whatif=False,
+                    code=test_code,
+                    live_ok=False,
+                    paper=True,
+                    port=4002,
+                )
+                cfg = dict(cli.DEFAULT_CFG)
+                mock_ib = MagicMock()
+                mock_ib.qualifyContracts.return_value = [MagicMock(conId=12345, secType="STK")]
+
+                with patch.object(cli, "connect", return_value=mock_ib), \
+                     patch.object(cli, "finish"), \
+                     patch.object(cli, "CFG_PATH") as mock_cfg_path, \
+                     patch.object(cli, "_code", return_value=test_code), \
+                     patch("sys.stdout", new_callable=io.StringIO):
+                    mock_cfg_path.exists.return_value = True
+                    with self.assertRaises(SystemExit) as cm:
+                        cli.cmd_order(cfg, args)
+                    self.assertIn("已经被消费执行过，不可重复提交同一笔委托", str(cm.exception))
+
+    def test_port_7496_triggers_live_guard(self):
+        args = argparse.Namespace(paper=False, port=7496, live_ok=False)
+        cfg = {"live_enabled": False, "live_port": 4001, "paper_port": 4002}
+
+        # Port 7496 is detected as live environment
+        self.assertTrue(cli._is_live_env(cfg, args, 7496))
+
+        # live_enabled=False should block port 7496
+        with self.assertRaises(SystemExit) as cm:
+            cli._live_guard(cfg, args, 7496)
+        self.assertIn("实盘下单已被总开关锁定", str(cm.exception))
+
+        # live_enabled=True, but live_ok=False should block port 7496
+        cfg["live_enabled"] = True
+        with self.assertRaises(SystemExit) as cm:
+            cli._live_guard(cfg, args, 7496)
+        self.assertIn("这是实盘账户，委托需要显式加 --live-ok", str(cm.exception))
+
+        # With live_ok=True, it passes
+        args.live_ok = True
+        cli._live_guard(cfg, args, 7496)
+
+    def test_pending_short_calls_deducted_from_available_shares(self):
+        mock_ib = MagicMock()
+        mock_trade = MagicMock()
+        mock_trade.orderStatus.status = "Submitted"
+        mock_trade.orderStatus.remaining = 1.0
+        mock_trade.contract.secType = "OPT"
+        mock_trade.contract.symbol = "AAPL"
+        mock_trade.contract.currency = "USD"
+        mock_trade.contract.right = "C"
+        mock_trade.order.action = "SELL"
+        mock_ib.openTrades.return_value = [mock_trade]
+
+        pending = cli._pending_short_calls(mock_ib, "AAPL", "USD")
+        self.assertEqual(pending, 1)
+
+        # In cmd_order, verify available shares check:
+        # 100 shares held, 0 settled short calls, 1 pending short call -> avail = 100 - (0 + 1)*100 = 0
+        args = argparse.Namespace(
+            symbol="AAPL",
+            opt=True,
+            action="SELL",
+            qty=1,
+            type="LMT",
+            limit=5.0,
+            expiry="20261218",
+            strike=200.0,
+            right="C",
+            currency="USD",
+            exchange="SMART",
+            tif="DAY",
+            outside_rth=False,
+            whatif=False,
+            code="",
+            live_ok=False,
+            paper=True,
+            port=4002,
+        )
+        cfg = dict(cli.DEFAULT_CFG)
+        mock_ib.qualifyContracts.return_value = [MagicMock(conId=12345, secType="OPT")]
+
+        with patch.object(cli, "connect", return_value=mock_ib), \
+             patch.object(cli, "finish"), \
+             patch.object(cli, "CFG_PATH") as mock_cfg_path, \
+             patch.object(cli, "_shares", return_value=100.0), \
+             patch.object(cli, "_short_calls", return_value=0), \
+             patch.object(cli, "_pending_short_calls", return_value=1), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            mock_cfg_path.exists.return_value = True
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_order(cfg, args)
+            self.assertIn("净可用仅 0 股（总持仓 100，空头持仓占用 100 股）", str(cm.exception))
+
+    def test_cash_put_rejects_zero_cash_when_available_funds_positive(self):
+        mock_ib = MagicMock()
+        mock_ib.accountValues.return_value = [
+            MockAccountValue("TotalCashValue", "0.0", "USD"),
+            MockAccountValue("AvailableFunds", "50000.0", "USD"),
+        ]
+        ok, note = cli._coverage(mock_ib, "USD", 10000.0, require_cash=True)
+        self.assertFalse(ok)
+        self.assertIn("❌", note)
+        self.assertIn("账户实际现金 TotalCashValue 仅 0.00 USD", note)
+        self.assertIn("AvailableFunds 融资额度不可用于现金担保", note)
+
+    def test_cmd_run_rejects_expired_plan_and_cross_env(self):
+        # 1. Expired plan rejection
+        expired_plan = {
+            "generated": "2020-01-01T12:00:00",
+            "valid_until": "2020-01-02T12:00:00",
+            "is_live": False,
+            "items": [],
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json.dumps(expired_plan))
+            exp_path = f.name
+
+        try:
+            args = argparse.Namespace(
+                file=exp_path,
+                i=1,
+                net=None,
+                stock_px=None,
+                code="",
+                live_ok=False,
+                paper=True,
+                port=None,
+                delayed=False,
+            )
+            cfg = dict(cli.DEFAULT_CFG)
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_run(cfg, args)
+            self.assertIn("计划文件已过期", str(cm.exception))
+        finally:
+            Path(exp_path).unlink(missing_ok=True)
+
+        # 2. Cross-environment execution rejection (live plan executed on paper port)
+        future_until = (datetime.now() + timedelta(days=1)).isoformat()
+        cross_env_plan = {
+            "generated": datetime.now().isoformat(),
+            "valid_until": future_until,
+            "is_live": True,
+            "items": [],
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json.dumps(cross_env_plan))
+            cross_path = f.name
+
+        try:
+            args = argparse.Namespace(
+                file=cross_path,
+                i=1,
+                net=None,
+                stock_px=None,
+                code="",
+                live_ok=False,
+                paper=True,
+                port=4002,
+                delayed=False,
+            )
+            cfg = dict(cli.DEFAULT_CFG)
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_run(cfg, args)
+            self.assertIn("严禁跨环境执行", str(cm.exception))
+            self.assertIn("实盘", str(cm.exception))
+            self.assertIn("纸账户", str(cm.exception))
+        finally:
+            Path(cross_path).unlink(missing_ok=True)
+
+    def test_verify_account_env_blocks_live_account_in_paper_mode(self):
+        mock_ib = MagicMock()
+        mock_ib.managedAccounts.return_value = ["U9876543"]
+        args = argparse.Namespace(paper=True, port=4002)
+        cfg = dict(cli.DEFAULT_CFG)
+
+        with self.assertRaises(SystemExit) as cm:
+            cli._verify_account_env(mock_ib, cfg, args, 4002)
+        self.assertIn("检测到实盘账号 U9876543 正在非实盘模式下运行", str(cm.exception))
+
+        mock_ib.managedAccounts.return_value = ["DU1234567"]
+        cli._verify_account_env(mock_ib, cfg, args, 4002)
+
+        mock_ib.managedAccounts.return_value = ["U9876543"]
+        cli._verify_account_env(mock_ib, cfg, args, 4001)
 
 
 if __name__ == "__main__":

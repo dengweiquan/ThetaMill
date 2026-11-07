@@ -18,7 +18,7 @@ import logging
 import os
 import socket
 import sys
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 
@@ -114,6 +114,104 @@ DEFAULT_CFG = {
     "live_enabled": False,
 }
 
+LIVE_PORTS = {4001, 7496}
+PAPER_PORTS = {4002, 7497}
+
+
+def _is_live_env(cfg, args, port) -> bool:
+    """判断是否为实盘环境。
+    - 若 port 在 LIVE_PORTS 或等于 cfg 的 live_port -> True
+    - 若 port 在 PAPER_PORTS 或等于 cfg 的 paper_port -> False
+    - 其它自定义端口 -> 检查 --paper 开关（非 --paper 即默认实盘保护）
+    """
+    if port in LIVE_PORTS or (cfg and port == cfg.get("live_port")):
+        return True
+    if port in PAPER_PORTS or (cfg and port == cfg.get("paper_port")):
+        return False
+    return not getattr(args, "paper", False) if args is not None else True
+
+
+def _consumed_codes_file() -> Path:
+    return _data_dir() / "consumed_codes.json"
+
+
+def _is_code_consumed(code: str) -> bool:
+    if not code:
+        return False
+    p = _consumed_codes_file()
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list) and code in data:
+                return True
+            if isinstance(data, dict) and code in data:
+                return True
+        except Exception:
+            pass
+    if ORDER_LOG.exists():
+        try:
+            for line in ORDER_LOG.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    if rec.get("code") == code:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return False
+
+
+def _consume_code(code: str) -> None:
+    if not code:
+        return
+    p = _consumed_codes_file()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        codes = {}
+        if p.exists():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    codes = data
+                elif isinstance(data, list):
+                    codes = {c: "" for c in data}
+            except Exception:
+                codes = {}
+        codes[code] = datetime.now().isoformat(timespec="seconds")
+        p.write_text(json.dumps(codes, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"  ⚠️ 记录已消费复核码失败：{e}")
+
+
+def _verify_account_env(ib, cfg, args, port):
+    if not _is_live_env(cfg, args, port):
+        accs = []
+        try:
+            if hasattr(ib, "managedAccounts"):
+                ma = ib.managedAccounts() if callable(ib.managedAccounts) else ib.managedAccounts
+                if isinstance(ma, (list, tuple, set)):
+                    accs.extend(str(a).strip() for a in ma if a)
+                elif isinstance(ma, str):
+                    accs.extend(a.strip() for a in ma.split(",") if a.strip())
+        except Exception:
+            pass
+        if not accs:
+            try:
+                for v in (ib.accountValues() or []):
+                    acc = getattr(v, "account", "")
+                    if acc and acc not in accs:
+                        accs.append(acc)
+            except Exception:
+                pass
+        for acc in accs:
+            acc_u = acc.upper()
+            if acc_u.startswith("U") and not acc_u.startswith("DU"):
+                sys.exit(f"\n⛔ 检测到实盘账号 {acc} 正在非实盘模式下运行！实盘账号严禁在纸账户模式下操作。\n")
+
 
 # ---------------------------------------------------------------- 配置 / 连接
 def load_cfg(required=True):
@@ -165,7 +263,7 @@ def _dec(s):
     return s
 
 
-def connect(cfg, port, readonly=False, force_delayed=False):
+def connect(cfg, port, readonly=False, force_delayed=False, args=None):
     ib = IB()
     try:
         ib.connect(cfg["host"], port, clientId=cfg["client_id"],
@@ -173,6 +271,7 @@ def connect(cfg, port, readonly=False, force_delayed=False):
     except Exception as e:
         sys.exit(f"连接失败 {cfg['host']}:{port} — {type(e).__name__}: {e}\n"
                  f"→ 请确认 IB Gateway / TWS 已启动并登录，且已在 API 设置中勾选 Enable ActiveX and Socket Clients。")
+    _verify_account_env(ib, cfg, args, port)
     ib._diag = []
 
     def _on_err(reqId, code, msg, contract):
@@ -271,10 +370,19 @@ def _opt(ib, symbol, expiry, strike, right, currency, exchange=None):
 
 def _multiplier(ib, contract):
     """合约乘数：股票期权通常 100，取不到就按 100 算"""
+    m = getattr(contract, "multiplier", None)
+    if isinstance(m, (int, float)) and m > 0:
+        return int(m)
+    if isinstance(m, str) and m.isdigit() and int(m) > 0:
+        return int(m)
     try:
         d = ib.reqContractDetails(contract)
-        if d and d[0].contract.multiplier:
-            return int(float(d[0].contract.multiplier))
+        if d:
+            dm = getattr(d[0].contract, "multiplier", None)
+            if isinstance(dm, (int, float)) and dm > 0:
+                return int(dm)
+            if isinstance(dm, str) and dm.isdigit() and int(dm) > 0:
+                return int(dm)
     except Exception:
         pass
     return 100
@@ -552,7 +660,7 @@ def _code(payload):
 
 def _live_guard(cfg, args, port):
     """实盘双闸：总开关 + 显式 --live-ok（复核码为第三闸）"""
-    if port != cfg.get("live_port"):
+    if not _is_live_env(cfg, args, port):
         return
     if not cfg.get("live_enabled", False):
         sys.exit("\n⛔ 实盘下单已被总开关锁定：config.json → live_enabled = false\n"
@@ -607,6 +715,24 @@ def cmd_order(cfg, args):
     # 2) 委托
     side = args.action.upper()
     qty = args.qty
+    is_live = _is_live_env(cfg, args, port)
+
+    if args.opt and side == "SELL":
+        mult = _multiplier(ib, contract)
+        qty_val = int(qty) if float(qty).is_integer() else qty
+        if args.right.upper() == "C":
+            have = _shares(ib, args.symbol, args.currency)
+            busy = _short_calls(ib, args.symbol, args.currency) + _pending_short_calls(ib, args.symbol, args.currency)
+            avail = max(0.0, have - busy * mult)
+            need = qty_val * mult
+            if avail < need:
+                sys.exit(f"\n⛔ 备兑卖 Call 的先决条件是持有未被覆盖的正股：需 {need} 股，净可用仅 {avail:g} 股（总持仓 {have:g}，空头持仓占用 {busy * mult} 股）。本工具禁止裸卖 Call。\n")
+        elif args.right.upper() == "P":
+            need_cash = args.strike * mult * qty_val
+            ok, note = _coverage(ib, args.currency, need_cash, require_cash=True)
+            if not ok:
+                sys.exit(f"\n⛔ 现金担保不足：卖 {qty_val} 张 {args.strike:g} Put 须备足 {fmt(need_cash)} {args.currency}。\n   {note}\n   现金担保卖 Put 严禁裸卖或使用融资杠杆。\n")
+
     if args.type.upper() == "MKT":
         order = MarketOrder(side, qty)
         px = None
@@ -623,7 +749,6 @@ def cmd_order(cfg, args):
     order.tif = args.tif
     order.outsideRth = bool(args.outside_rth)
 
-    is_live = port == cfg.get("live_port")
     mode = "live" if is_live else "paper"
     payload = dict(mode=mode, port=port, contract=contract.conId, sec=contract.secType,
                    action=side, qty=qty, otype=args.type.upper(), px=px, tif=args.tif,
@@ -664,8 +789,12 @@ def cmd_order(cfg, args):
         finish(ib)
         return 2
 
+    if _is_code_consumed(code):
+        sys.exit(f"\n⛔ 复核码 {code} 已经被消费执行过，不可重复提交同一笔委托！如需重新下单，请重新生成复核码。\n")
+
     # 4) 真正下单
     trade = ib.placeOrder(contract, order)
+    _consume_code(code)
     order_id = trade.order.orderId
     print(f"已提交 #{order_id}，等待回执…")
     st, filled, avg = "UNKNOWN", 0.0, None
@@ -728,43 +857,152 @@ PRESET_KEYS = ("covered-call", "sell-call", "cash-put")
 def _shares(ib, symbol, currency):
     """已有正股净持仓"""
     sym = symbol.upper()
-    for p in ib.portfolio():
-        c = p.contract
-        if c.secType == "STK" and c.symbol.upper() == sym and c.currency == currency:
-            return float(p.position or 0)
+    for p in (ib.portfolio() or []):
+        c = getattr(p, "contract", None)
+        if not c:
+            continue
+        if getattr(c, "secType", "") == "STK" and getattr(c, "symbol", "").upper() == sym and getattr(c, "currency", "") == currency:
+            return float(getattr(p, "position", 0) or 0)
     return 0.0
 
 
-def _funds(ib):
-    """可用资金明细（含现金与国债等担保资产），按币种返回。
+def _short_calls(ib, symbol, currency):
+    """已有空头 Call 张数（避免重复覆盖同一批股票）"""
+    n = 0
+    sym = symbol.upper()
+    for p in (ib.portfolio() or []):
+        c = getattr(p, "contract", None)
+        if not c:
+            continue
+        if (getattr(c, "secType", "") == "OPT" and
+                getattr(c, "symbol", "").upper() == sym and
+                getattr(c, "currency", "") == currency and
+                getattr(c, "right", "") == "C" and
+                getattr(p, "position", 0) < 0):
+            n += int(-p.position)
+    return n
 
-    返回 (avail_map, base_currency)：
-    - avail_map: {币种: 可用资金}，另含账户汇总币种汇总行 "BASE"；
+
+def _trade_remaining(trade) -> float:
+    try:
+        rem = getattr(trade.orderStatus, "remaining", None)
+        if rem is not None and float(rem) >= 0:
+            return float(rem)
+    except Exception:
+        pass
+    try:
+        tot = float(trade.order.totalQuantity or 0)
+        filled = float(trade.orderStatus.filled or 0)
+        return max(0.0, tot - filled)
+    except Exception:
+        return 0.0
+
+
+def _pending_short_calls(ib, symbol, currency):
+    """未完全成交的空头 Call 挂单张数（按未成交张数 remaining 汇总）"""
+    trades = ib.openTrades() if callable(getattr(ib, "openTrades", None)) else []
+    inactive = {"Cancelled", "ApiCancelled", "Inactive", "Filled"}
+    total_remaining = 0.0
+    sym = symbol.upper()
+    cur = currency.upper()
+    for t in trades:
+        st = getattr(getattr(t, "orderStatus", None), "status", "")
+        if st in inactive:
+            continue
+        c = getattr(t, "contract", None)
+        o = getattr(t, "order", None)
+        if not c or not o:
+            continue
+        if (getattr(c, "secType", "") == "OPT" and
+            getattr(c, "symbol", "").upper() == sym and
+            getattr(c, "currency", "").upper() == cur and
+            getattr(c, "right", "").upper() == "C" and
+            getattr(o, "action", "").upper() == "SELL"):
+            rem = _trade_remaining(t)
+            total_remaining += rem
+    return int(total_remaining) if total_remaining.is_integer() else total_remaining
+
+
+def _pending_cash_puts(ib, currency):
+    """未完全成交的卖 Put 挂单所需现金担保合计"""
+    trades = ib.openTrades() if callable(getattr(ib, "openTrades", None)) else []
+    inactive = {"Cancelled", "ApiCancelled", "Inactive", "Filled"}
+    total_cash = 0.0
+    cur = currency.upper()
+    for t in trades:
+        st = getattr(getattr(t, "orderStatus", None), "status", "")
+        if st in inactive:
+            continue
+        c = getattr(t, "contract", None)
+        o = getattr(t, "order", None)
+        if not c or not o:
+            continue
+        if (getattr(c, "secType", "") == "OPT" and
+            getattr(c, "currency", "").upper() == cur and
+            getattr(c, "right", "").upper() == "P" and
+            getattr(o, "action", "").upper() == "SELL"):
+            rem = _trade_remaining(t)
+            try:
+                mult = float(getattr(c, "multiplier", 100) or 100)
+            except (TypeError, ValueError):
+                mult = 100.0
+            strike = float(getattr(c, "strike", 0.0) or 0.0)
+            total_cash += strike * mult * rem
+    return total_cash
+
+
+def _funds(ib):
+    """资金明细：按币种返回实际现金与可用资金。
+
+    返回 (cash_map, avail_map, base_currency)：
+    - cash_map: {币种: TotalCashValue 实际现金余额}
+    - avail_map: {币种: AvailableFunds 可用资金}
     - base_currency: 账户基础币种（取 "BASE" 汇总行无法直接给出时用最大非 BASE 币种兜底）。
     绝不把不同币种的原始数字直接比较 —— 那会把 100 JPY 当成 100 USD。
     """
+    cash_map = {}
     avail_map = {}
-    for v in ib.accountValues():
-        if v.tag in ("AvailableFunds", "FullAvailableFunds"):
+    for v in (ib.accountValues() or []):
+        cur = (getattr(v, "currency", "") or "").upper()
+        if not cur:
+            continue
+        tag = getattr(v, "tag", "")
+        if tag == "TotalCashValue":
             try:
                 f = float(v.value)
             except (TypeError, ValueError):
                 continue
-            cur = (v.currency or "").upper()
-            if not cur:
+            if cur not in cash_map or f < cash_map[cur]:
+                cash_map[cur] = f
+        elif tag in ("AvailableFunds", "FullAvailableFunds"):
+            try:
+                f = float(v.value)
+            except (TypeError, ValueError):
                 continue
             # 同币种多标签时取较保守（较小）的一份，避免高估可用资金
             if cur not in avail_map or f < avail_map[cur]:
                 avail_map[cur] = f
-    real = {c: v for c, v in avail_map.items() if c != "BASE"}
-    if "BASE" in avail_map:
-        # "BASE" 是账户汇总行的币种标签，其 value 是数字（金额），不是币种代码。
-        # 真正的基础币种取币种字段里金额最大的那个（汇总行本身不携带币种代码）。
-        base = max(real, key=real.get) if real else "USD"
+
+    real_avail = {c: v for c, v in avail_map.items() if c != "BASE"}
+    real_cash = {c: v for c, v in cash_map.items() if c != "BASE"}
+
+    if "BASE" in avail_map and real_avail:
+        base = max(real_avail, key=real_avail.get)
+    elif "BASE" in cash_map and real_cash:
+        base = max(real_cash, key=real_cash.get)
+    elif real_avail:
+        base = max(real_avail, key=real_avail.get)
+    elif real_cash:
+        base = max(real_cash, key=real_cash.get)
     else:
-        base = max(real, key=real.get) if real else "USD"
-        avail_map["BASE"] = real.get(base, 0.0)
-    return avail_map, base
+        base = "USD"
+
+    if "BASE" not in cash_map:
+        cash_map["BASE"] = real_cash.get(base, 0.0)
+    if "BASE" not in avail_map:
+        avail_map["BASE"] = real_avail.get(base, 0.0)
+
+    return cash_map, avail_map, base
 
 
 def _fx(ib, base, cur):
@@ -802,29 +1040,61 @@ def _fx(ib, base, cur):
     return _quote(cur, base, invert=True)
 
 
-def _coverage(ib, currency, need):
+def _coverage(ib, currency, need, require_cash=True):
     """担保核对。need 为交易币种金额，返回 (是否足额, 说明)。
 
+    require_cash=True（现金担保卖 Put）严格检查 TotalCashValue 实际现金，
+    扣减未成交卖 Put 挂单占用，严禁利用 AvailableFunds 融资额度或杠杆；
+    require_cash=False 允许利用可用资金（AvailableFunds）。
     安全性：只要无法判定足额（汇率取不到、没有任何资金数据），一律返回 False，
-    绝不用 None 绕过闸门。"""
-    avail_map, base = _funds(ib)
-    # 1) 交易币种有直接的可用资金余额，直接比较，不做任何跨币种换算
-    direct = avail_map.get(currency.upper())
+    绝不用 None 绕过闸门。
+    """
+    cash_map, avail_map, base = _funds(ib)
+    cur_u = currency.upper()
+
+    if require_cash:
+        pending = _pending_cash_puts(ib, cur_u)
+        direct = cash_map.get(cur_u)
+        if direct is not None:
+            cash = direct - pending
+            ok = cash >= need
+            if not ok:
+                return False, (f"需要 {fmt(need)} {currency}，账户实际现金 TotalCashValue 仅 {fmt(cash)} {currency}"
+                               f"（AvailableFunds 融资额度不可用于现金担保）❌")
+            pend_txt = f"（已扣减挂单占用 {fmt(pending)} {currency}）" if pending > 0 else ""
+            return True, f"需要 {fmt(need)} {currency}，账户实际现金 {fmt(cash)} {currency}{pend_txt} ✅"
+
+        base_cash = cash_map.get("BASE")
+        if base_cash is None or cur_u == str(base).upper():
+            return False, f"需要 {fmt(need)} {currency}，无法确认账户实际现金，安全起见拒绝放行 ❌"
+        base_pending = _pending_cash_puts(ib, base)
+        net_base = base_cash - base_pending
+        rate = _fx(ib, base, cur_u)
+        if rate is None or rate <= 0:
+            return False, f"需要 {fmt(need)} {currency}，无法获取 {base}/{currency} 汇率，安全起见拒绝放行 ❌"
+        conv = net_base * rate
+        ok = conv >= need
+        if not ok:
+            return False, (f"需要 {fmt(need)} {currency}，账户实际现金 TotalCashValue 仅 {fmt(conv)} {currency}"
+                           f"（AvailableFunds 融资额度不可用于现金担保）❌")
+        pend_txt = f"（已扣减挂单占用 {fmt(base_pending)} {base}）" if base_pending > 0 else ""
+        return True, (f"需要 {fmt(need)} {currency}，账户实际现金 {fmt(net_base)} {base} ≈ {fmt(conv)} {currency}{pend_txt}"
+                      f"（汇率 {rate:.4f}） ✅")
+
+    direct = avail_map.get(cur_u)
     if direct is not None:
         ok = direct >= need
         return ok, (f"需要 {fmt(need)} {currency}，账户 {currency} 可用 {fmt(direct)}"
                     + (" ✅" if ok else " ❌"))
-    # 2) 无直接余额：用账户基础币种资金经汇率换算
-    cash = avail_map.get("BASE")
-    if cash is None or currency.upper() == str(base).upper():
-        # 同币种却查不到余额，或完全没有资金数据 —— 无法确认足额，安全起见拒绝
+    avail = avail_map.get("BASE")
+    if avail is None or cur_u == str(base).upper():
         return False, f"需要 {fmt(need)} {currency}，无法确认账户可用资金，安全起见拒绝放行 ❌"
-    rate = _fx(ib, base, currency)
+    rate = _fx(ib, base, cur_u)
     if rate is None or rate <= 0:
         return False, f"需要 {fmt(need)} {currency}，无法获取 {base}/{currency} 汇率，安全起见拒绝放行 ❌"
-    conv = cash * rate
+    conv = avail * rate
     ok = conv >= need
-    return ok, (f"需要 {fmt(need)} {currency}，账户可用 {fmt(cash)} {base} ≈ {fmt(conv)} {currency}"
+    return ok, (f"需要 {fmt(need)} {currency}，账户可用 {fmt(avail)} {base} ≈ {fmt(conv)} {currency}"
                 f"（汇率 {rate:.4f}）" + (" ✅" if ok else " ❌"))
 
 
@@ -836,9 +1106,9 @@ def cmd_combo(cfg, args):
     sym, preset = args.symbol.upper(), args.preset
     right = "P" if preset == "cash-put" else "C"
     qty, strike = args.qty, args.k1
-    is_live = port == cfg.get("live_port")
+    is_live = _is_live_env(cfg, args, port)
 
-    ib = connect(cfg, port, readonly=False)
+    ib = connect(cfg, port, readonly=False, args=args)
 
     opt, _exch = _opt(ib, sym, args.expiry, strike, right, args.currency)
     if not opt:
@@ -850,30 +1120,32 @@ def cmd_combo(cfg, args):
     have = _shares(ib, sym, args.currency)
     stock_contract, stock_qty, stock_note = None, 0, ""
     if preset == "covered-call":
-        if have >= need_shares:
-            sys.exit(f"\n⛔ 你已持有 {have:g} 股 {sym}，足够覆盖 {qty} 张（每张需 {mult} 股）。\n"
+        busy = _short_calls(ib, sym, args.currency) + _pending_short_calls(ib, sym, args.currency)
+        avail = max(0.0, have - busy * mult)
+        if avail >= need_shares:
+            sys.exit(f"\n⛔ 你已持有 {have:g} 股 {sym}（已占用 {busy * mult} 股，净可用 {avail:g} 股），足够覆盖 {qty} 张（每张需 {mult} 股）。\n"
                      f"   再买 {need_shares} 股只是加仓，不是备兑。请改用：--preset sell-call\n")
         stock_contract = _stock(ib, sym, args.currency)
         if not stock_contract:
             sys.exit(f"正股合约无法识别：{sym} {args.currency}")
-        if have > 0:
-            stock_qty = need_shares - int(have)
-            stock_note = f"现有 {have:g} 股 → 差额补买 {stock_qty} 股（合计 {need_shares} 股覆盖 {qty} 张）"
+        if avail > 0:
+            stock_qty = need_shares - int(avail)
+            stock_note = f"现有净可用 {avail:g} 股 → 差额补买 {stock_qty} 股（合计 {need_shares} 股覆盖 {qty} 张）"
         else:
             stock_qty = need_shares
-            stock_note = f"现有 0 股 → 本单买入 {stock_qty} 股"
+            stock_note = f"现有净可用 0 股 → 本单买入 {stock_qty} 股"
     elif preset == "sell-call":
         # 已被其它空头 Call 占用的股票不能再用来覆盖本单，否则就是变相裸卖
-        busy = _short_calls(ib, sym, args.currency)
+        busy = _short_calls(ib, sym, args.currency) + _pending_short_calls(ib, sym, args.currency)
         avail = max(0.0, have - busy * mult)
         if avail < need_shares:
             sys.exit(f"\n⛔ 备兑卖 Call 的先决条件是持有未被覆盖的正股：\n"
-                     f"   卖 {qty} 张需 {need_shares} 股，你总持有 {have:g} 股，已有 {busy} 张空头 Call 占用了 {busy * mult} 股，净可用仅 {avail:g} 股。\n"
+                     f"   卖 {qty} 张需 {need_shares} 股，你总持有 {have:g} 股，已有 {busy} 张空头持仓及挂单占用了 {busy * mult} 股，净可用仅 {avail:g} 股。\n"
                      f"   没有股票覆盖的卖出 Call 是裸卖，理论上风险无限，本工具不做。\n")
         stock_note = f"总持仓 {have:g} 股（已占用 {busy * mult} 股），净可用 {avail:g} 股 ≥ 需 {need_shares} 股 ✅"
     else:
         need_cash = strike * mult * qty
-        ok, note = _coverage(ib, args.currency, need_cash)
+        ok, note = _coverage(ib, args.currency, need_cash, require_cash=True)
         if ok is False:
             sys.exit(f"\n⛔ 现金担保不足：卖 {qty} 张 {strike:g} Put 须备足 {fmt(need_cash)} {args.currency}。\n"
                      f"   {note}\n"
@@ -910,6 +1182,9 @@ def cmd_combo(cfg, args):
         finish(ib)
         return 2
 
+    if _is_code_consumed(code):
+        sys.exit(f"\n⛔ 复核码 {code} 已经被消费执行过，不可重复提交同一笔委托！如需重新下单，请重新生成复核码。\n")
+
     done = []
 
     # 1) 备兑的正股腿：先买股，没买齐就不卖 Call
@@ -920,6 +1195,7 @@ def cmd_combo(cfg, args):
             so = MarketOrder("BUY", stock_qty)
         so.tif = "DAY"
         ts = ib.placeOrder(stock_contract, so)
+        _consume_code(code)
         for _ in range(10):
             ib.sleep(1)
             if ts.orderStatus.status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
@@ -941,6 +1217,7 @@ def cmd_combo(cfg, args):
     order = LimitOrder("SELL", qty, net) if otype == "LMT" else MarketOrder("SELL", qty)
     order.tif = "DAY"
     trade = ib.placeOrder(opt, order)
+    _consume_code(code)
     order_id = trade.order.orderId
     print(f"  期权 #{order_id} 已提交，等待回执…")
     st, filled = "UNKNOWN", 0.0
@@ -1015,18 +1292,6 @@ def _cost_basis(ib, symbol, currency):
     return None
 
 
-def _short_calls(ib, symbol, currency):
-    """已有空头 Call 张数（避免重复覆盖同一批股票）"""
-    n = 0
-    sym = symbol.upper()
-    for p in ib.portfolio():
-        c = p.contract
-        if (c.secType == "OPT" and c.symbol.upper() == sym and c.currency == currency
-                and getattr(c, "right", "") == "C" and p.position < 0):
-            n += int(-p.position)
-    return n
-
-
 def _quote_premium(ib, opt):
     """卖方可得的参考权利金：优先买价（对手盘出价），退化到最新/昨收。返回 (价格, 来源)"""
     t = ib.reqTickers(opt)[0]
@@ -1091,7 +1356,7 @@ def cmd_plan(cfg, args):
     if not CFG_PATH.exists():
         load_cfg(required=True)
     port, env = resolve_port(cfg, args)
-    ib = connect(cfg, port, readonly=True, force_delayed=getattr(args, "delayed", False))
+    ib = connect(cfg, port, readonly=True, force_delayed=getattr(args, "delayed", False), args=args)
 
     # 可选外部准入白名单：只做减法，默认关闭
     uni_doc = load_universe(args.universe) if getattr(args, "universe", None) else None
@@ -1156,7 +1421,7 @@ def cmd_plan(cfg, args):
             right, preset = "P", "cash-put"
         else:
             if have >= 100:
-                busy = _short_calls(ib, sym, cur)
+                busy = _short_calls(ib, sym, cur) + _pending_short_calls(ib, sym, cur)
                 avail = max(0.0, have - busy * 100)
                 if avail >= 100:
                     right, preset = "C", "sell-call"
@@ -1180,13 +1445,13 @@ def cmd_plan(cfg, args):
 
         qty = args.qty
         if right == "C":
-            busy = _short_calls(ib, sym, cur)
+            busy = _short_calls(ib, sym, cur) + _pending_short_calls(ib, sym, cur)
             avail = max(0.0, have - busy * mult)
             cover = int(avail // mult) if mult else 0
             if cover < qty:
                 qty = cover
                 if busy:
-                    note.append(f"已有 {busy} 张空头 Call（净可用 {avail:g} 股只够 {cover} 张）")
+                    note.append(f"已有 {busy} 张空头 Call 及挂单（净可用 {avail:g} 股只够 {cover} 张）")
                 else:
                     note.append(f"股数只够 {cover} 张")
             if cost and strike < cost:
@@ -1197,7 +1462,7 @@ def cmd_plan(cfg, args):
             collat_txt = f"{qty * mult} 股"
         else:
             need_cash = strike * mult * qty
-            ok, cov_note = _coverage(ib, cur, need_cash)
+            ok, cov_note = _coverage(ib, cur, need_cash, require_cash=True)
             if ok is False:
                 note.append(cov_note)
             collat, collat_txt = need_cash, f"{fmt(need_cash)} {cur}"
@@ -1250,10 +1515,13 @@ def cmd_plan(cfg, args):
         print("\n  参考权利金为 - 的条目：该市场无实时/延迟行情（未订阅），需自行定价或加 --net 手工填价。")
 
     if args.json_out:
+        is_live = _is_live_env(cfg, args, port)
         out = Path(args.json_out).expanduser()
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({
             "generated": datetime.now().isoformat(timespec="seconds"),
+            "valid_until": (datetime.now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+            "is_live": is_live,
             "env": env, "port": port, "currencies": sorted({it["currency"] for it in items}),
             "window": dict(dte_min=args.dte_min, dte_max=args.dte_max, otm=args.otm),
             "universe": meta(uni_doc) if uni_doc else None,
@@ -1275,6 +1543,18 @@ def cmd_run(cfg, args):
         doc = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         sys.exit(f"计划文件不是合法 JSON：{e}")
+    port, env = resolve_port(cfg, args)
+    is_live = _is_live_env(cfg, args, port)
+
+    # 计划文件有效期校验（默认24小时有效）
+    vu = doc.get("valid_until")
+    if vu and str(vu) < datetime.now().isoformat():
+        sys.exit("⛔ 计划文件已过期，请重新运行 plan 生成最新计划。")
+
+    # 跨环境执行锁：实盘生成的计划不能在纸账户跑，反之亦然
+    if doc.get("is_live") is not None and doc["is_live"] != is_live:
+        sys.exit(f"⛔ 计划文件运行环境（{'实盘' if doc['is_live'] else '纸账户'}）与当前执行环境（{'实盘' if is_live else '纸账户'}）不一致，严禁跨环境执行！")
+
     items = doc.get("items") or []
     if not items:
         sys.exit("计划文件里没有可执行条目")
