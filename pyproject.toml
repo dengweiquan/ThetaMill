@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thetamill"
+version = "0.1.0"
+description = "Low-frequency option-selling toolkit for Interactive Brokers (covered call / cash-secured put)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Deng Wei Quan" }]
+keywords = ["ibkr", "interactive-brokers", "options", "covered-call", "cash-secured-put", "theta"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = ["ib_async>=2.0"]
+
+[project.urls]
+Homepage = "https://github.com/dengweiquan/ThetaMill"
+
+[project.scripts]
+thetamill = "thetamill.cli:main"
+
+[tool.setuptools]
+packages = ["thetamill"]

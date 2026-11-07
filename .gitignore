@@ -1,0 +1,27 @@
+# 本地配置与凭证
+config.json
+.env
+*.local.json
+
+# 运行时数据（审计日志含真实委托记录）
+logs/
+data/
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
