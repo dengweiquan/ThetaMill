@@ -839,6 +839,293 @@ class TradingRiskControlsTests(unittest.TestCase):
         mock_ib.managedAccounts.return_value = ["U9876543"]
         cli._verify_account_env(mock_ib, cfg, args, 4001)
 
+    def test_short_stock_position_rejects_covered_call_and_sell_call(self):
+        mock_ib = MagicMock()
+        mock_ib.qualifyContracts.return_value = [MagicMock(conId=12345, secType="OPT")]
+        cfg = dict(cli.DEFAULT_CFG)
+
+        # 1. cmd_order with negative stock position
+        order_args = argparse.Namespace(
+            symbol="AAPL",
+            opt=True,
+            action="SELL",
+            qty=1,
+            type="LMT",
+            limit=5.0,
+            expiry="20261218",
+            strike=200.0,
+            right="C",
+            currency="USD",
+            exchange="SMART",
+            tif="DAY",
+            outside_rth=False,
+            whatif=False,
+            code="",
+            live_ok=False,
+            paper=True,
+            port=4002,
+        )
+        with patch.object(cli, "connect", return_value=mock_ib), \
+             patch.object(cli, "finish"), \
+             patch.object(cli, "CFG_PATH") as mock_cfg_path, \
+             patch.object(cli, "_shares", return_value=-50.0), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            mock_cfg_path.exists.return_value = True
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_order(cfg, order_args)
+            self.assertIn("空头头寸（做空），禁止开具备兑 Call", str(cm.exception))
+
+        # 2. cmd_combo with covered-call on negative stock position
+        combo_args_cc = argparse.Namespace(
+            symbol="AAPL",
+            preset="covered-call",
+            expiry="20261218",
+            k1=200.0,
+            qty=1,
+            currency="USD",
+            paper=True,
+            port=4002,
+            type="LMT",
+            net=5.0,
+            stock_px=150.0,
+            code="",
+            live_ok=False,
+        )
+        opt_mock = MagicMock(conId=12345, secType="OPT", multiplier="100")
+        with patch.object(cli, "connect", return_value=mock_ib), \
+             patch.object(cli, "finish"), \
+             patch.object(cli, "CFG_PATH") as mock_cfg_path, \
+             patch.object(cli, "_opt", return_value=(opt_mock, "SMART")), \
+             patch.object(cli, "_multiplier", return_value=100), \
+             patch.object(cli, "_shares", return_value=-100.0), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            mock_cfg_path.exists.return_value = True
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_combo(cfg, combo_args_cc)
+            self.assertIn("空头头寸（做空），禁止开具备兑 Call", str(cm.exception))
+
+        # 3. cmd_combo with sell-call on negative stock position
+        combo_args_sc = argparse.Namespace(
+            symbol="AAPL",
+            preset="sell-call",
+            expiry="20261218",
+            k1=200.0,
+            qty=1,
+            currency="USD",
+            paper=True,
+            port=4002,
+            type="LMT",
+            net=5.0,
+            stock_px=None,
+            code="",
+            live_ok=False,
+        )
+        with patch.object(cli, "connect", return_value=mock_ib), \
+             patch.object(cli, "finish"), \
+             patch.object(cli, "CFG_PATH") as mock_cfg_path, \
+             patch.object(cli, "_opt", return_value=(opt_mock, "SMART")), \
+             patch.object(cli, "_multiplier", return_value=100), \
+             patch.object(cli, "_shares", return_value=-100.0), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            mock_cfg_path.exists.return_value = True
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_combo(cfg, combo_args_sc)
+            self.assertIn("空头头寸（做空），禁止卖出 Call", str(cm.exception))
+
+    def test_undercollateralized_existing_calls_rejects_new_calls(self):
+        mock_ib = MagicMock()
+        mock_ib.qualifyContracts.return_value = [MagicMock(conId=12345, secType="OPT")]
+        cfg = dict(cli.DEFAULT_CFG)
+
+        # 100 shares held, but existing short calls already occupy 200 shares (deficit = 100)
+        order_args = argparse.Namespace(
+            symbol="AAPL",
+            opt=True,
+            action="SELL",
+            qty=1,
+            type="LMT",
+            limit=5.0,
+            expiry="20261218",
+            strike=200.0,
+            right="C",
+            currency="USD",
+            exchange="SMART",
+            tif="DAY",
+            outside_rth=False,
+            whatif=False,
+            code="",
+            live_ok=False,
+            paper=True,
+            port=4002,
+        )
+        with patch.object(cli, "connect", return_value=mock_ib), \
+             patch.object(cli, "finish"), \
+             patch.object(cli, "CFG_PATH") as mock_cfg_path, \
+             patch.object(cli, "_shares", return_value=100.0), \
+             patch.object(cli, "_short_calls_shares", return_value=200.0), \
+             patch.object(cli, "_pending_short_calls_shares", return_value=0.0), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            mock_cfg_path.exists.return_value = True
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_order(cfg, order_args)
+            self.assertIn("不足以覆盖现有空头 Call（已占用 200 股，缺口 100 股）", str(cm.exception))
+
+    def test_settled_short_puts_collateral_deducted_in_coverage(self):
+        mock_ib = MagicMock()
+        mock_ib.accountValues.return_value = [
+            MockAccountValue("TotalCashValue", "50000.0", "USD"),
+        ]
+        # Settled short put in portfolio: 1 contract @ strike 400, multiplier 100 -> 40,000 USD collateral
+        mock_portfolio_item = MagicMock()
+        mock_portfolio_item.contract.secType = "OPT"
+        mock_portfolio_item.contract.currency = "USD"
+        mock_portfolio_item.contract.right = "P"
+        mock_portfolio_item.contract.strike = 400.0
+        mock_portfolio_item.contract.multiplier = "100"
+        mock_portfolio_item.position = -1.0
+        mock_ib.portfolio.return_value = [mock_portfolio_item]
+        mock_ib.openTrades.return_value = []
+
+        # Total cash = 50,000; locked = 40,000; available cash = 10,000
+        collateral = cli._short_puts_collateral(mock_ib, "USD")
+        self.assertEqual(collateral, 40000.0)
+
+        ok, note = cli._coverage(mock_ib, "USD", 20000.0, require_cash=True)
+        self.assertFalse(ok)
+        self.assertIn("❌", note)
+        self.assertIn("10,000.00 USD", note)
+
+        ok_pass, note_pass = cli._coverage(mock_ib, "USD", 10000.0, require_cash=True)
+        self.assertTrue(ok_pass)
+        self.assertIn("✅", note_pass)
+        self.assertIn("已扣减挂单及存量占用 40,000.00 USD", note_pass)
+
+    def test_cross_currency_coverage_deducts_target_currency_pending_and_settled_puts(self):
+        mock_ib = MagicMock()
+        # Base currency USD has 10,000 cash; no HKD cash
+        mock_ib.accountValues.return_value = [
+            MockAccountValue("TotalCashValue", "10000.0", "BASE"),
+            MockAccountValue("TotalCashValue", "10000.0", "USD"),
+        ]
+        # Pending HKD put requires 40,000 HKD collateral
+        mock_trade = MagicMock()
+        mock_trade.orderStatus.status = "Submitted"
+        mock_trade.orderStatus.remaining = 1.0
+        mock_trade.contract.secType = "OPT"
+        mock_trade.contract.currency = "HKD"
+        mock_trade.contract.right = "P"
+        mock_trade.contract.strike = 400.0
+        mock_trade.contract.multiplier = "100"
+        mock_trade.order.action = "SELL"
+        mock_ib.openTrades.return_value = [mock_trade]
+        mock_ib.portfolio.return_value = []
+
+        # FX rate: 1 USD = 8.0 HKD -> 40,000 HKD locked = 5,000 USD locked
+        # Remaining net base cash = 10,000 - 5,000 = 5,000 USD (= 40,000 HKD)
+        with patch.object(cli, "_fx", return_value=8.0):
+            # Asking for 50,000 HKD (> 40,000 HKD available) -> Fail
+            ok, note = cli._coverage(mock_ib, "HKD", 50000.0, require_cash=True)
+            self.assertFalse(ok)
+            self.assertIn("❌", note)
+
+            # Asking for 30,000 HKD (<= 40,000 HKD available) -> Pass
+            ok_pass, note_pass = cli._coverage(mock_ib, "HKD", 30000.0, require_cash=True)
+            self.assertTrue(ok_pass)
+            self.assertIn("✅", note_pass)
+            self.assertIn("已扣减挂单及存量占用 0.00 USD 及 40,000.00 HKD", note_pass)
+
+    def test_contract_multiplier_custom_and_fallback(self):
+        # 1. _contract_multiplier parsing
+        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier=50)), 50.0)
+        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier=25.0)), 25.0)
+        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier="10")), 10.0)
+        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier="invalid")), 100.0)
+        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier=None)), 100.0)
+        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier=0)), 100.0)
+        self.assertEqual(cli._contract_multiplier(MagicMock(multiplier=-10)), 100.0)
+
+        # 2. Portfolio short calls with custom multiplier (e.g., mini option with 25 shares/contract)
+        mock_ib = MagicMock()
+        p1 = MagicMock()
+        p1.contract.secType = "OPT"
+        p1.contract.symbol = "AAPL"
+        p1.contract.currency = "USD"
+        p1.contract.right = "C"
+        p1.contract.multiplier = "25"
+        p1.position = -2.0
+        mock_ib.portfolio.return_value = [p1]
+
+        shares = cli._short_calls_shares(mock_ib, "AAPL", "USD")
+        self.assertEqual(shares, 50.0)  # 2 * 25
+
+        # 3. Open trade with custom multiplier (e.g., 50 shares/contract)
+        t1 = MagicMock()
+        t1.orderStatus.status = "Submitted"
+        t1.orderStatus.remaining = 3.0
+        t1.contract.secType = "OPT"
+        t1.contract.symbol = "AAPL"
+        t1.contract.currency = "USD"
+        t1.contract.right = "C"
+        t1.contract.multiplier = 50
+        t1.order.action = "SELL"
+        mock_ib.openTrades.return_value = [t1]
+
+        pending_shares = cli._pending_short_calls_shares(mock_ib, "AAPL", "USD")
+        self.assertEqual(pending_shares, 150.0)  # 3 * 50
+
+    def test_cmd_order_and_cancel_forward_args_to_connect(self):
+        cfg = dict(cli.DEFAULT_CFG)
+        mock_ib = MagicMock()
+
+        # cmd_order forwards args
+        order_args = argparse.Namespace(
+            symbol="AAPL",
+            opt=False,
+            action="BUY",
+            qty=10,
+            type="MKT",
+            limit=None,
+            currency="USD",
+            exchange="SMART",
+            tif="DAY",
+            outside_rth=False,
+            whatif=False,
+            code="12345678",
+            live_ok=False,
+            paper=True,
+            port=4002,
+        )
+        mock_stock = MagicMock(conId=111, secType="STK")
+        mock_ib.qualifyContracts.return_value = [mock_stock]
+
+        with patch.object(cli, "connect", return_value=mock_ib) as mock_connect, \
+             patch.object(cli, "finish"), \
+             patch.object(cli, "CFG_PATH") as mock_cfg_path, \
+             patch.object(cli, "_is_code_consumed", return_value=False), \
+             patch.object(cli, "_code", return_value="12345678"), \
+             patch.object(cli, "_consume_code"), \
+             patch.object(cli, "_write_audit"), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            mock_cfg_path.exists.return_value = True
+            cli.cmd_order(cfg, order_args)
+            mock_connect.assert_called_once_with(cfg, 4002, readonly=False, args=order_args)
+
+        # cmd_cancel forwards args
+        cancel_args = argparse.Namespace(
+            order_id=999,
+            paper=True,
+            port=4002,
+        )
+        with patch.object(cli, "connect", return_value=mock_ib) as mock_connect, \
+             patch.object(cli, "finish"), \
+             patch.object(cli, "CFG_PATH") as mock_cfg_path, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            mock_cfg_path.exists.return_value = True
+            mock_ib.reqAllOpenOrders.return_value = []
+            with self.assertRaises(SystemExit):
+                cli.cmd_cancel(cfg, cancel_args)
+            mock_connect.assert_called_once_with(cfg, 4002, readonly=False, args=cancel_args)
+
 
 if __name__ == "__main__":
     unittest.main()
