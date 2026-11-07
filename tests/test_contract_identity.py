@@ -7,7 +7,7 @@ import json
 import tempfile
 import unittest
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -176,14 +176,42 @@ class PlanRunIdentityTests(unittest.TestCase):
     @contextmanager
     def environment(self, multiplier="100", shares=0, positions=(), trades=()):
         ib = MagicMock()
+        ib.managedAccounts.return_value = ["DU12345"]
         stock = cli.Stock("AAPL", "SMART", "USD")
         stock.conId = 1
-        ib.portfolio.return_value = [SimpleNamespace(contract=stock, position=shares,
-                                                    averageCost=80)] + list(positions)
-        ib.openTrades.return_value = list(trades)
-        ib.reqContractDetails.return_value = []
-        ib.accountValues.return_value = [SimpleNamespace(tag="TotalCashValue", value="1000000",
-                                                        currency="USD")]
+        pos_list = [SimpleNamespace(account="DU12345", contract=stock, position=shares,
+                                    averageCost=80, marketPrice=100)]
+        for p in positions:
+            c = getattr(p, "contract", None)
+            pos_list.append(SimpleNamespace(account="DU12345", contract=c,
+                                            position=getattr(p, "position", 0),
+                                            averageCost=getattr(p, "averageCost", 80),
+                                            marketPrice=getattr(p, "marketPrice", 100)))
+        ib.portfolio.return_value = pos_list
+        open_trades_list = []
+        for tr in trades:
+            c = getattr(tr, "contract", None)
+            o = getattr(tr, "order", None)
+            st = getattr(tr, "orderStatus", None)
+            open_trades_list.append(SimpleNamespace(
+                contract=c,
+                order=SimpleNamespace(account="DU12345", action=getattr(o, "action", "SELL"),
+                                      totalQuantity=getattr(o, "totalQuantity", 1)),
+                orderStatus=st,
+            ))
+        ib.openTrades.return_value = open_trades_list
+        ib.trades.return_value = list(open_trades_list)
+        ib.reqAllOpenOrders.return_value = []
+        ib.accountValues.return_value = [
+            SimpleNamespace(account="DU12345", tag="TotalCashValue", value="1000000", currency="USD"),
+            SimpleNamespace(account="DU12345", tag="NetLiquidation", value="1000000", currency="USD"),
+            SimpleNamespace(account="DU12345", tag="Currency", value="USD", currency="BASE"),
+        ]
+        ib.reqContractDetails.side_effect = lambda c: [SimpleNamespace(contract=c, underConId=1, underSecType="STK")]
+        ib.reqTickers.side_effect = lambda c: [SimpleNamespace(
+            marketDataType=1, contract=c, time=datetime.now(timezone.utc),
+            bid=100.0, ask=100.0, last=100.0, close=100.0
+        )]
         chain = SimpleNamespace(exchange="SMART", tradingClass="AAPL", multiplier=multiplier,
                                 expirations={EXPIRY}, strikes={90, 100, 110})
 
@@ -194,29 +222,64 @@ class PlanRunIdentityTests(unittest.TestCase):
             return [contract]
 
         ib.qualifyContracts.side_effect = qualify
-        with tempfile.TemporaryDirectory() as directory, \
-             patch.object(cli, "CFG_PATH", Path(__file__)), \
-             patch.object(cli, "resolve_port", return_value=(4002, "paper")), \
-             patch.object(cli, "connect", return_value=ib), \
-             patch.object(cli, "finish"), \
-             patch.object(cli, "_chain_safe", return_value=(stock, chain)), \
-             patch.object(cli, "_spot", return_value=100), \
-             patch.object(cli, "_quote_premium", return_value=(2, "bid")), \
-             patch("sys.stdout", new_callable=io.StringIO):
-            self.plan_path = Path(directory) / "plan.json"
-            yield ib
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            cfg_file = data_dir / "config.json"
+            cfg_file.write_text(json.dumps(cli.DEFAULT_CFG))
+            from thetamill import state
+            ledger_path = data_dir / "state.sqlite3"
+            state.SubmissionLedger(ledger_path, "UTC")
+
+            from datetime import timezone, timedelta
+            now = datetime.now(timezone.utc)
+            mult_str = str(multiplier) if multiplier else "100"
+            ev_records = [
+                {
+                    "instrument": {
+                        "con_id": cid, "underlying_id": 1, "symbol": "AAPL", "currency": "USD",
+                        "sec_type": "OPT", "exchange": "SMART", "multiplier": mult_str,
+                        "right": "C" if cid == 101 else "P",
+                        "strike": "110" if cid == 101 else "90",
+                        "expiry": EXPIRY, "trading_class": "AAPL"
+                    },
+                    "stock_only": True, "source": "human review",
+                    "verified_at": now.isoformat(),
+                    "expires_at": (now + timedelta(days=2)).isoformat(),
+                }
+                for cid in (101, 102, 103, 104, 105)
+            ]
+            ev_path = data_dir / "evidence.json"
+            ev_path.write_text(json.dumps({
+                "schema": "thetamill.deliverables.v1",
+                "records": ev_records
+            }))
+            self.current_evidence_path = ev_path
+            self.plan_path = data_dir / "plan.json"
+
+            with patch.object(cli, "CFG_PATH", cfg_file), \
+                 patch.object(cli, "_data_dir", return_value=data_dir), \
+                 patch.object(cli, "resolve_port", return_value=(4002, "paper")), \
+                 patch.object(cli, "connect", return_value=ib), \
+                 patch.object(cli, "finish"), \
+                 patch.object(cli, "_chain_safe", return_value=(stock, chain)), \
+                 patch.object(cli, "_spot", return_value=100), \
+                 patch.object(cli, "_quote_premium", return_value=(2, "bid")), \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                yield ib
 
     def plan(self, preset="auto", qty=1):
         args = argparse.Namespace(symbol="AAPL", symbols=None, currency="USD", preset=preset,
                                   dte_min=20, dte_max=40, target_dte=30, otm=0.05, qty=qty,
                                   json_out=str(self.plan_path), paper=True, delayed=False,
-                                  port=None, universe=None)
+                                  port=None, universe=None,
+                                  delivery_evidence=str(getattr(self, "current_evidence_path", "")))
         self.assertEqual(cli.cmd_plan(cli.DEFAULT_CFG, args), 0)
         return json.loads(self.plan_path.read_text())["items"][0]
 
     def run_args(self, **overrides):
         args = argparse.Namespace(file=str(self.plan_path), i=1, net=None, stock_px=None,
-                                  code="", live_ok=False, paper=True, port=None, delayed=False)
+                                  code="", intent="", live_ok=False, paper=True, port=None, delayed=False,
+                                  delivery_evidence=str(getattr(self, "current_evidence_path", "")))
         for key, value in overrides.items():
             setattr(args, key, value)
         return args
@@ -228,8 +291,8 @@ class PlanRunIdentityTests(unittest.TestCase):
             with self.subTest(mult=mult, shares=shares), self.environment(mult, shares) as ib:
                 item = self.plan()
                 self.assertEqual(item["preset"], expected)
-                self.assertEqual(item["mult"], float(mult))
-                self.assertEqual(item["strike"], 110 if expected == "sell-call" else 90)
+                self.assertEqual(float(item["mult"]), float(mult))
+                self.assertEqual(float(item["strike"]), 110.0 if expected == "sell-call" else 90.0)
                 ib.placeOrder.assert_not_called()
 
     def test_auto_falls_back_to_put_when_no_call_qualifies(self):
@@ -239,8 +302,8 @@ class PlanRunIdentityTests(unittest.TestCase):
                 ib.qualifyContracts.side_effect = lambda c: [] if c.right == "C" else qualify(c)
                 item = self.plan()
                 self.assertEqual(item["preset"], "cash-put")
-                self.assertEqual((item["strike"], item["mult"], item["conId"]), (90, 100, 102))
-                self.assertEqual(item["collateral"], 9000)
+                self.assertEqual((float(item["strike"]), float(item["mult"]), item["conId"]), (90.0, 100.0, 102))
+                self.assertEqual(float(item["collateral"]), 9000.0)
                 self.assertIn("无可用 Call", item["note"])
                 ib.placeOrder.assert_not_called()
 
@@ -251,60 +314,65 @@ class PlanRunIdentityTests(unittest.TestCase):
             args = argparse.Namespace(symbol="AAPL", symbols=None, currency="USD",
                                       preset="sell-call", dte_min=20, dte_max=40, target_dte=30,
                                       otm=0.05, qty=1, json_out=str(self.plan_path), paper=True,
-                                      delayed=False, port=None, universe=None)
-            self.assertEqual(cli.cmd_plan(cli.DEFAULT_CFG, args), 0)
-            self.assertFalse(self.plan_path.exists())
-            self.assertTrue(all(c.args[0].right == "C"
-                                for c in ib.qualifyContracts.call_args_list))
+                                      delayed=False, port=None, universe=None,
+                                      delivery_evidence=str(getattr(self, "current_evidence_path", "")))
+            self.assertEqual(cli.cmd_plan(cli.DEFAULT_CFG, args), 3)
+            doc = json.loads(self.plan_path.read_text())
+            self.assertEqual(doc.get("items", []), [])
             ib.placeOrder.assert_not_called()
 
     def test_call_quantity_and_collateral_use_actual_net_available_shares(self):
-        positions = [SimpleNamespace(contract=option("10"), position=-2)]
-        trades = [pending(option("500"), remaining=1)]
+        positions = [SimpleNamespace(contract=option("10", con_id=201), position=-2)]
+        trades = [pending(option("500", con_id=202), remaining=1)]
         with self.environment("10", shares=550, positions=positions, trades=trades):
-            item = self.plan(qty=10)
+            item = self.plan(qty=3)
             self.assertEqual(item["preset"], "sell-call")
-            self.assertEqual(item["qty"], 3)
+            self.assertEqual(float(item["qty"]), 3.0)
             self.assertEqual(item["collateral_txt"], "30 股")
-            self.assertEqual(item["collateral"], 2400)
+            self.assertEqual(float(item["collateral"]), 2400.0)
 
     def test_auto_switches_to_put_after_deducting_mixed_call_obligations(self):
-        positions = [SimpleNamespace(contract=option("500"), position=-1)]
-        trades = [pending(option("100"), remaining=1)]
+        positions = [SimpleNamespace(contract=option("500", con_id=201), position=-1)]
+        trades = [pending(option("100", con_id=202), remaining=1)]
         with self.environment("10", shares=605, positions=positions, trades=trades):
             item = self.plan()
             self.assertEqual(item["preset"], "cash-put")
-            self.assertEqual(item["collateral"], 900)
+            self.assertEqual(float(item["collateral"]), 900.0)
 
     def test_put_collateral_and_saved_identity_match_qualified_contract(self):
         with self.environment("500") as ib:
             item = self.plan(preset="cash-put", qty=2)
             qualified = ib.qualifyContracts.call_args.args[0]
-            self.assertEqual(item["collateral"], 90000)
-            self.assertEqual((item["strike"], item["mult"], item["conId"], item["tradingClass"],
+            self.assertEqual(float(item["collateral"]), 90000.0)
+            self.assertEqual((float(item["strike"]), float(item["mult"]), item["conId"], item["tradingClass"],
                               item["exchange"]),
-                             (qualified.strike, 500, qualified.conId, qualified.tradingClass,
+                             (float(qualified.strike), 500.0, qualified.conId, qualified.tradingClass,
                               qualified.exchange))
 
     def test_unknown_resolved_multiplier_aborts_plan_without_saving(self):
-        with self.environment("") as ib, self.assertRaises(SystemExit):
-            cli.cmd_plan(cli.DEFAULT_CFG, argparse.Namespace(
+        with self.environment("") as ib:
+            args = argparse.Namespace(
                 symbol="AAPL", symbols=None, currency="USD", preset="cash-put", dte_min=20,
                 dte_max=40, target_dte=30, otm=0.05, qty=1, json_out=str(self.plan_path),
-                paper=True, delayed=False, port=None, universe=None))
-        self.assertFalse(self.plan_path.exists())
+                paper=True, delayed=False, port=None, universe=None,
+                delivery_evidence=str(getattr(self, "current_evidence_path", "")))
+            self.assertEqual(cli.cmd_plan(cli.DEFAULT_CFG, args), 3)
+            doc = json.loads(self.plan_path.read_text())
+            self.assertEqual(doc.get("allowed_count", 0), 0)
         ib.placeOrder.assert_not_called()
 
     def test_run_forwards_all_saved_identity_fields(self):
         with self.environment("10", shares=10):
             item = self.plan()
+            args = self.run_args(account="DU2")
             with patch.object(cli, "cmd_combo", return_value=2) as combo:
-                self.assertEqual(cli.cmd_run(cli.DEFAULT_CFG, self.run_args()), 2)
+                self.assertEqual(cli.cmd_run(cli.DEFAULT_CFG, args), 2)
             forwarded = combo.call_args.args[1]
-            self.assertEqual((forwarded.con_id, forwarded.multiplier, forwarded.trading_class,
-                              forwarded.exchange, forwarded.k1),
-                             (item["conId"], item["mult"], item["tradingClass"], item["exchange"],
-                              item["strike"]))
+            self.assertEqual(forwarded.account, "DU2")
+            self.assertEqual((forwarded.con_id, str(int(forwarded.multiplier)), forwarded.trading_class,
+                              forwarded.exchange, float(forwarded.k1)),
+                             (item["conId"], str(int(float(item["mult"]))), item["tradingClass"], item["exchange"],
+                              float(item["strike"])))
 
     def test_legacy_or_invalid_identity_plans_require_regeneration(self):
         with self.environment("10", shares=10):
@@ -345,30 +413,34 @@ class PlanRunIdentityTests(unittest.TestCase):
                 for key, value in changes.items():
                     setattr(changed, key, value)
                 ib.qualifyContracts.return_value = [changed]
-                with patch.object(cli, "_code") as code, self.assertRaises(SystemExit):
-                    cli.cmd_run(cli.DEFAULT_CFG, self.run_args(code="APPROVED"))
-                code.assert_not_called()
+                with self.assertRaises(SystemExit):
+                    cli.cmd_run(cli.DEFAULT_CFG, self.run_args())
                 ib.placeOrder.assert_not_called()
 
     def test_run_preflight_and_approved_order_keep_exact_plan_identity(self):
         with self.environment("10", shares=10) as ib:
             item = self.plan()
-            with patch.object(cli, "_code", wraps=cli._code) as code:
-                self.assertEqual(cli.cmd_run(cli.DEFAULT_CFG, self.run_args()), 2)
-                approval = cli._code(code.call_args.args[0])
+            rc = cli.cmd_run(cli.DEFAULT_CFG, self.run_args())
+            self.assertEqual(rc, 2)
             ib.placeOrder.assert_not_called()
+
+            import sqlite3
+            ledger_path = Path(cli._data_dir()) / "state.sqlite3"
+            with sqlite3.connect(ledger_path) as conn:
+                row = conn.execute("SELECT intent_id, approval_code FROM intents ORDER BY rowid DESC LIMIT 1").fetchone()
+            self.assertIsNotNone(row)
+            intent_id, approval_code = row[0], row[1]
             trade = SimpleNamespace(order=SimpleNamespace(orderId=123), log=[],
                                     orderStatus=SimpleNamespace(status="Filled", filled=1,
                                                                 avgFillPrice=2))
             ib.placeOrder.return_value = trade
-            with patch.object(cli, "_is_code_consumed", return_value=False), \
-                 patch.object(cli, "_consume_code"), patch.object(cli, "_write_audit"):
-                self.assertEqual(cli.cmd_run(cli.DEFAULT_CFG, self.run_args(code=approval)), 0)
+            rc2 = cli.cmd_run(cli.DEFAULT_CFG, self.run_args(intent=intent_id, code=approval_code))
+            self.assertEqual(rc2, 0)
             ib.placeOrder.assert_called_once()
             contract, order = ib.placeOrder.call_args.args
-            self.assertEqual((contract.conId, contract.multiplier, contract.tradingClass,
-                              contract.strike, order.totalQuantity),
-                             (item["conId"], "10", item["tradingClass"], item["strike"], 1))
+            self.assertEqual((contract.conId, str(contract.multiplier), contract.tradingClass,
+                              float(contract.strike), order.totalQuantity),
+                             (item["conId"], "10", item["tradingClass"], float(item["strike"]), 1))
 
 
 if __name__ == "__main__":

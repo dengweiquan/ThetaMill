@@ -49,6 +49,106 @@ def broker():
     return ib
 
 
+class QuoteMetadataTests(unittest.TestCase):
+    def test_metadata_is_explicit_validated_and_immutable(self):
+        from dataclasses import replace
+        from thetamill.broker_state import PriceQuote, FxQuote
+        now = datetime.now(timezone.utc)
+        snap = collect_snapshot(broker(), account=None, environment="paper")
+        self.assertEqual(dict(snap.price_quotes), {})
+        self.assertEqual(dict(snap.fx_quotes), {})
+        quote = PriceQuote(10, Decimal(100), now, "IB bid/ask")
+        fx = FxQuote("HKD", Decimal("0.128"), now, "IB bid/ask")
+        updated = replace(snap, price_quotes={10: quote}, fx_quotes={"HKD": fx})
+        with self.assertRaises(TypeError):
+            updated.price_quotes[10] = quote
+        with self.assertRaises(SnapshotError):
+            replace(snap, price_quotes={11: quote})
+        for price, stamp, source in ((True, now, "IB"), (Decimal("NaN"), now, "IB"),
+                                     (1, datetime(2026, 11, 7), "IB"), (1, now, "")):
+            with self.assertRaises(SnapshotError):
+                PriceQuote(10, price, stamp, source)
+
+    def test_cli_snapshot_uses_only_timestamped_fx_and_stock(self):
+        from argparse import Namespace
+        from unittest.mock import patch
+        from thetamill import cli
+        ib = broker()
+        ib.portfolio.return_value = [NS(contract=stock(), position=100, marketPrice=9,
+                                        averageCost=8, account="DU1")]
+        ib.accountValues.return_value.append(value("TotalCashValue", "HKD", 780))
+        now = datetime.now(timezone.utc)
+
+        def qualify(contract):
+            contract.conId = 99
+            return [contract]
+
+        def ticks(contract):
+            bid, ask = (Decimal("0.127"), Decimal("0.129")) if contract.conId == 99 else (99, 101)
+            return [NS(contract=contract, time=now, bid=bid, ask=ask, marketDataType=1)]
+
+        ib.qualifyContracts.side_effect = qualify
+        ib.reqTickers.side_effect = ticks
+        with patch.object(cli, "_fx") as historical:
+            snap = cli._risk_snapshot(ib, {}, Namespace(account=None), "paper")
+            historical.assert_not_called()
+        self.assertEqual(snap.fx["HKD"], Decimal("0.128"))
+        self.assertEqual(snap.fx_quotes["HKD"].as_of, now)
+        self.assertEqual(snap.positions[0].price, Decimal(100))
+        self.assertEqual(snap.price_quotes[10].price, Decimal(100))
+        ib.reqTickers.side_effect = RuntimeError("no quote")
+        snap = cli._risk_snapshot(ib, {}, Namespace(account=None), "paper")
+        self.assertNotIn("HKD", snap.fx)
+        self.assertIsNone(snap.positions[0].price)
+        self.assertEqual(dict(snap.price_quotes), {})
+
+    def test_new_order_currency_requests_fresh_fx_without_existing_balance(self):
+        from argparse import Namespace
+        from unittest.mock import patch
+        from thetamill import cli
+        ib = broker()
+        now = datetime.now(timezone.utc)
+
+        def qualify(contract):
+            contract.conId = 99
+            return [contract]
+
+        ib.qualifyContracts.side_effect = qualify
+        ib.reqTickers.side_effect = lambda c: [NS(contract=c, time=now,
+                                                bid=Decimal("0.127"), ask=Decimal("0.129"),
+                                                marketDataType=1)]
+        with patch.object(cli, "_fx") as historical:
+            snap = cli._risk_snapshot(ib, {}, Namespace(account=None), "paper",
+                                      required_currencies=("HKD",))
+        self.assertNotIn("HKD", snap.cash)
+        self.assertEqual(snap.fx["HKD"], Decimal("0.128"))
+        self.assertEqual(snap.fx_quotes["HKD"].as_of, now)
+        historical.assert_not_called()
+        ib.placeOrder.assert_not_called()
+        ib.cancelOrder.assert_not_called()
+
+    def test_tick_freshness_is_not_snapshot_time(self):
+        from datetime import timedelta
+        from thetamill import cli
+        c = stock()
+        now = datetime.now(timezone.utc)
+        for age, bid, ask, valid in ((0, 99, 101, True), (300, 99, 101, False),
+                                     (-300, 99, 101, False), (0, 101, 99, False),
+                                     (0, float("nan"), 101, False), (0, True, 101, False)):
+            ib = MagicMock()
+            ib.reqTickers.return_value = [NS(contract=c, time=now-timedelta(seconds=age),
+                                              bid=bid, ask=ask, marketDataType=1)]
+            result = cli._timestamped_mid(ib, c)
+            self.assertEqual(result is not None, valid)
+            if valid:
+                self.assertEqual(result[0], Decimal(100))
+                self.assertEqual(result[1], now)
+        ib.reqTickers.return_value = [NS(contract=c, time=now, bid=99, ask=101, marketDataType=3)]
+        self.assertIsNone(cli._timestamped_mid(ib, c))
+        ib.reqTickers.return_value = [NS(contract=c, time=None, bid=99, ask=101)]
+        self.assertIsNone(cli._timestamped_mid(ib, c))
+
+
 class BrokerStateTests(unittest.TestCase):
     def collect(self, ib, **kwargs):
         return collect_snapshot(ib, account=None, environment="paper", **kwargs)

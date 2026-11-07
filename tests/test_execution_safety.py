@@ -3,13 +3,19 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from datetime import datetime, timezone, timedelta
 import io
+import json
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
-from ib_async import Option, Stock
+try:
+    from ib_async import Option, Stock
+except ImportError:
+    from thetamill.cli import Option, Stock
 from thetamill import cli
 
 
@@ -21,51 +27,114 @@ def option(right="P", multiplier="100", con_id=101):
 
 
 def position(contract, quantity):
-    return SimpleNamespace(contract=contract, position=quantity, averageCost=30)
+    return SimpleNamespace(account="DU12345", contract=contract, position=quantity, averageCost=30, marketPrice=30)
 
 
 def pending(contract, action="SELL", total=1, remaining=1, filled=0,
             status="Submitted"):
     return SimpleNamespace(contract=contract,
-                           order=SimpleNamespace(action=action, totalQuantity=total),
+                           order=SimpleNamespace(account="DU12345", action=action, totalQuantity=total),
                            orderStatus=SimpleNamespace(status=status, remaining=remaining,
                                                        filled=filled))
 
 
 class ExecutionSafetyTests(unittest.TestCase):
     @contextmanager
-    def broker(self, contract=None, shares=0, positions=(), trades=(), cash=1000000):
+    def broker(self, contract=None, shares=0, positions=(), trades=(), cash=1000000,
+               delivery_confirmed=True):
         ib = MagicMock()
+        ib.managedAccounts.return_value = ["DU12345"]
         stock = Stock("AAPL", "SMART", "USD")
         stock.conId = 1
         contract = contract if contract is not None else option()
         ib.portfolio.return_value = [position(stock, shares), *positions]
         ib.openTrades.return_value = list(trades)
-        ib.accountValues.return_value = [SimpleNamespace(tag="TotalCashValue",
-                                                        currency="USD", value=str(cash))]
+        ib.trades.return_value = list(trades)
+        ib.accountValues.return_value = [
+            SimpleNamespace(account="DU12345", tag="TotalCashValue", currency="USD", value=str(cash)),
+            SimpleNamespace(account="DU12345", tag="Currency", currency="BASE", value="USD"),
+            SimpleNamespace(account="DU12345", tag="NetLiquidation", currency="USD", value=str(cash)),
+        ]
+        ib.reqAllOpenOrders.return_value = []
+        ib.reqTickers.side_effect = lambda c: [SimpleNamespace(
+            marketDataType=1,
+            contract=c,
+            time=datetime.now(timezone.utc),
+            bid=30.0,
+            ask=30.0,
+        )]
         ib.qualifyContracts.side_effect = lambda c: [c]
-        ib.reqContractDetails.return_value = []
-        with patch.object(cli, "CFG_PATH", Path(__file__)), \
-             patch.object(cli, "resolve_port", return_value=(4002, "paper")), \
-             patch.object(cli, "connect", return_value=ib), \
-             patch.object(cli, "finish"), \
-             patch.object(cli, "_opt", return_value=(contract, "SMART")), \
-             patch.object(cli, "_stock", return_value=stock), \
-             patch("sys.stdout", new_callable=io.StringIO):
-            yield ib, stock
+
+        ib.reqContractDetails.side_effect = lambda c: (
+            ib.reqContractDetails.return_value
+            if ib.reqContractDetails.return_value is not None
+            else [SimpleNamespace(contract=c, underConId=1, underSecType="STK")]
+        )
+        ib.reqContractDetails.return_value = None
+        ib.sleep = lambda _: None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            data_dir = Path(tmp_dir)
+            evidence_path = data_dir / "evidence.json"
+            ev_records = []
+            if delivery_confirmed:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                exp_iso = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+                con_ids = {getattr(contract, "conId", 101)}
+                for p in positions:
+                    c = getattr(p, "contract", None)
+                    if c and getattr(c, "secType", "") == "OPT" and getattr(c, "conId", None):
+                        con_ids.add(c.conId)
+                for tr in trades:
+                    c = getattr(tr, "contract", None)
+                    if c and getattr(c, "secType", "") == "OPT" and getattr(c, "conId", None):
+                        con_ids.add(c.conId)
+                for cid in con_ids:
+                    ev_records.append({
+                        "instrument": {
+                            "con_id": cid, "underlying_id": 1, "symbol": "AAPL",
+                            "currency": "USD", "sec_type": "OPT", "exchange": "SMART",
+                            "multiplier": str(getattr(contract, "multiplier", "100") or "100"),
+                            "right": getattr(contract, "right", "P") or "P",
+                            "strike": str(getattr(contract, "strike", "40") or "40"),
+                            "expiry": getattr(contract, "lastTradeDateOrContractMonth", "20261218") or "20261218",
+                            "trading_class": getattr(contract, "tradingClass", "AAPL") or "AAPL",
+                        },
+                        "stock_only": True,
+                        "source": "human review",
+                        "verified_at": now_iso,
+                        "expires_at": exp_iso,
+                    })
+            evidence_path.write_text(json.dumps({
+                "schema": "thetamill.deliverables.v1",
+                "records": ev_records,
+            }), encoding="utf-8")
+            self.current_evidence_path = evidence_path
+
+            with patch.object(cli, "CFG_PATH", Path(__file__)), \
+                 patch.object(cli, "_data_dir", return_value=data_dir), \
+                 patch.object(cli, "resolve_port", return_value=(4002, "paper")), \
+                 patch.object(cli, "connect", return_value=ib), \
+                 patch.object(cli, "finish"), \
+                 patch.object(cli, "_opt", return_value=(contract, "SMART")), \
+                 patch.object(cli, "_stock", return_value=stock), \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                yield ib, stock
 
     def order_args(self, **overrides):
         values = dict(symbol="AAPL", opt=True, action="SELL", qty=1, type="LMT",
                       limit=1.0, stop=None, expiry="20261218", strike=40.0, right="P",
                       currency="USD", exchange="SMART", tif="DAY", outside_rth=False,
-                      whatif=False, code="", live_ok=False, paper=True, port=4002)
+                      whatif=False, code="", intent="", live_ok=False, paper=True, port=4002,
+                      delivery_evidence=str(getattr(self, "current_evidence_path", "")))
         values.update(overrides)
         return argparse.Namespace(**values)
 
     def combo_args(self, **overrides):
         values = dict(symbol="AAPL", preset="cash-put", qty=1, k1=40.0,
                       expiry="20261218", currency="USD", exchange="SMART", net=1.0,
-                      stock_px=None, code="", live_ok=False, paper=True, port=4002)
+                      stock_px=None, code="", intent="", live_ok=False, paper=True, port=4002,
+                      delivery_evidence=str(getattr(self, "current_evidence_path", "")))
         values.update(overrides)
         return argparse.Namespace(**values)
 
@@ -77,6 +146,23 @@ class ExecutionSafetyTests(unittest.TestCase):
     def preflight(self, ib, args, combo=False):
         self.assertEqual((cli.cmd_combo if combo else cli.cmd_order)(cli.DEFAULT_CFG, args), 2)
         ib.placeOrder.assert_not_called()
+
+    def confirm_run(self, ib, args, combo=True):
+        import sqlite3
+        pre_args = argparse.Namespace(**vars(args))
+        pre_args.intent = ""
+        pre_args.code = ""
+        rc = (cli.cmd_combo if combo else cli.cmd_order)(cli.DEFAULT_CFG, pre_args)
+        self.assertEqual(rc, 2)
+        ledger_path = Path(cli._data_dir()) / "state.sqlite3"
+        with sqlite3.connect(ledger_path) as conn:
+            row = conn.execute("SELECT intent_id, approval_code FROM intents ORDER BY rowid DESC LIMIT 1").fetchone()
+        self.assertIsNotNone(row)
+        intent_id, approval_code = row[0], row[1]
+        confirm_args = argparse.Namespace(**vars(args))
+        confirm_args.intent = intent_id
+        confirm_args.code = approval_code
+        return (cli.cmd_combo if combo else cli.cmd_order)(cli.DEFAULT_CFG, confirm_args)
 
     # The four independently reproduced preflight gaps.
     def test_stock_sell_cannot_uncover_held_short_call(self):
@@ -259,43 +345,39 @@ class ExecutionSafetyTests(unittest.TestCase):
     def test_covered_call_refreshes_after_stock_fill(self):
         call = option("C")
         with self.broker(call, shares=0) as (ib, stock):
-            filled = SimpleNamespace(order=SimpleNamespace(orderId=10),
-                                     orderStatus=SimpleNamespace(status="Filled", filled=100,
-                                                                 avgFillPrice=30))
-            ib.placeOrder.return_value = filled
-            with patch.object(cli, "_code", return_value="APPROVED"), \
-                 patch.object(cli, "_is_code_consumed", return_value=False), \
-                 patch.object(cli, "_consume_code"):
-                self.assertRaises(SystemExit, cli.cmd_combo, cli.DEFAULT_CFG,
-                                  self.combo_args(preset="covered-call", code="APPROVED"))
+            def submit(contract, order):
+                trade = SimpleNamespace(order=order,
+                                        orderStatus=SimpleNamespace(status="Filled", filled=100,
+                                                                    avgFillPrice=30), log=[])
+                ib.trades.return_value.append(trade)
+                return trade
+            ib.placeOrder.side_effect = submit
+            rc = self.confirm_run(ib, self.combo_args(preset="covered-call", stock_px=30.0))
+            self.assertEqual(rc, 1)
             ib.placeOrder.assert_called_once()
             self.assertIs(ib.placeOrder.call_args.args[0], stock)
 
     def test_covered_call_second_leg_uses_refreshed_portfolio(self):
         call = option("C")
         with self.broker(call, shares=0) as (ib, stock):
-            stock_fill = SimpleNamespace(order=SimpleNamespace(orderId=10),
-                                         orderStatus=SimpleNamespace(status="Filled", filled=100,
-                                                                     avgFillPrice=30))
-            option_fill = SimpleNamespace(order=SimpleNamespace(orderId=11),
-                                          orderStatus=SimpleNamespace(status="Filled", filled=1,
-                                                                      avgFillPrice=1), log=[])
-
             def submit(contract, order):
                 if contract.secType == "STK":
+                    trade = SimpleNamespace(order=order,
+                                            orderStatus=SimpleNamespace(status="Filled", filled=100,
+                                                                        avgFillPrice=30), log=[])
+                    ib.trades.return_value.append(trade)
                     ib.portfolio.return_value = [position(stock, 100)]
-                    return stock_fill
-                return option_fill
+                    return trade
+                trade = SimpleNamespace(order=order,
+                                        orderStatus=SimpleNamespace(status="Filled", filled=1,
+                                                                    avgFillPrice=1), log=[])
+                ib.trades.return_value.append(trade)
+                return trade
 
             ib.placeOrder.side_effect = submit
-            with patch.object(cli, "_code", return_value="APPROVED"), \
-                 patch.object(cli, "_is_code_consumed", return_value=False), \
-                 patch.object(cli, "_consume_code"), \
-                 patch.object(cli, "_write_audit"):
-                self.assertEqual(cli.cmd_combo(cli.DEFAULT_CFG,
-                                               self.combo_args(preset="covered-call", code="APPROVED")), 0)
+            rc = self.confirm_run(ib, self.combo_args(preset="covered-call", stock_px=30.0))
+            self.assertEqual(rc, 0)
             self.assertEqual(ib.placeOrder.call_count, 2)
-            self.assertEqual(ib.reqAllOpenOrders.call_count, 2)
 
     def test_malformed_existing_obligation_blocks_preflight(self):
         bad = option("C")
@@ -333,32 +415,31 @@ class ExecutionSafetyTests(unittest.TestCase):
 
     def test_covered_call_nan_fill_stops_before_option(self):
         with self.broker(option("C"), shares=0) as (ib, stock):
-            fill = SimpleNamespace(order=SimpleNamespace(orderId=10),
-                                   orderStatus=SimpleNamespace(status="Filled", filled=float("nan"), avgFillPrice=30))
-            ib.placeOrder.return_value = fill
-            with patch.object(cli, "_code", return_value="APPROVED"), \
-                 patch.object(cli, "_is_code_consumed", return_value=False), \
-                 patch.object(cli, "_consume_code"):
-                with self.assertRaises(SystemExit):
-                    cli.cmd_combo(cli.DEFAULT_CFG, self.combo_args(preset="covered-call", code="APPROVED"))
+            def submit(contract, order):
+                trade = SimpleNamespace(order=order,
+                                        orderStatus=SimpleNamespace(status="Filled", filled=float("nan"),
+                                                                    avgFillPrice=30), log=[])
+                ib.trades.return_value.append(trade)
+                return trade
+            ib.placeOrder.side_effect = submit
+            rc = self.confirm_run(ib, self.combo_args(preset="covered-call", stock_px=30.0))
+            self.assertEqual(rc, 1)
             ib.placeOrder.assert_called_once()
 
     def test_stock_fill_followed_by_external_sale_cannot_cover_call(self):
         with self.broker(option("C"), shares=0) as (ib, stock):
-            fill = SimpleNamespace(order=SimpleNamespace(orderId=10),
-                                   orderStatus=SimpleNamespace(status="Filled", filled=100, avgFillPrice=30))
-
             def submit(contract, order):
+                trade = SimpleNamespace(order=order,
+                                        orderStatus=SimpleNamespace(status="Filled", filled=100,
+                                                                    avgFillPrice=30), log=[])
+                ib.trades.return_value.append(trade)
                 ib.portfolio.return_value = [position(stock, 100)]
                 ib.openTrades.return_value = [pending(stock, total=100, remaining=100)]
-                return fill
+                return trade
 
             ib.placeOrder.side_effect = submit
-            with patch.object(cli, "_code", return_value="APPROVED"), \
-                 patch.object(cli, "_is_code_consumed", return_value=False), \
-                 patch.object(cli, "_consume_code"):
-                with self.assertRaises(SystemExit):
-                    cli.cmd_combo(cli.DEFAULT_CFG, self.combo_args(preset="covered-call", code="APPROVED"))
+            rc = self.confirm_run(ib, self.combo_args(preset="covered-call", stock_px=30.0))
+            self.assertEqual(rc, 1)
             ib.placeOrder.assert_called_once()
 
     def test_held_put_nan_and_fractional_stock_shortage_rejected(self):

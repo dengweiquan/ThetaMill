@@ -1,0 +1,47 @@
+name: Offline safety gates
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.13']
+    env:
+      THETAMILL_DATA: ${{ runner.temp }}/thetamill-test-data
+      THETAMILL_CONFIG: ${{ runner.temp }}/no-broker-config.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          python -m pip install dist/*.whl
+      - name: Source regression tests (offline)
+        run: python -m unittest discover -s tests -v
+      - name: Whitespace and conflict markers
+        run: |
+          git diff --check
+          if grep -rnE '^(<<<<<<< |=======|>>>>>>> )' thetamill tests; then
+            exit 1
+          fi
+      - name: Installed-wheel tests and CLI help without configuration
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -I -c 'import thetamill; from pathlib import Path; p=Path(thetamill.__file__).resolve(); print(p); assert "site-packages" in str(p)'
+          python -I -m unittest discover -s "$GITHUB_WORKSPACE/tests" -v
+          thetamill --help
+          python -I -m thetamill --help
+          for cmd in status account positions orders quote chain order strat combo plan run report reconcile roll-plan audit cancel; do
+            thetamill "$cmd" --help
+          done

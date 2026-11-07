@@ -487,6 +487,12 @@ class OptionExchangeFallbackTests(unittest.TestCase):
 class TradingRiskControlsTests(unittest.TestCase):
     """Test the 6 critical trading risk controls implemented in thetamill/cli.py."""
 
+    def setUp(self):
+        super().setUp()
+        self._patch_acct = patch.object(cli, "_selected_account", return_value="DU12345")
+        self._patch_acct.start()
+        self.addCleanup(self._patch_acct.stop)
+
     def test_cmd_order_blocks_naked_call(self):
         args = argparse.Namespace(
             symbol="AAPL",
@@ -571,14 +577,14 @@ class TradingRiskControlsTests(unittest.TestCase):
                 self.assertTrue(cli._is_code_consumed(test_code))
                 self.assertFalse(cli._is_code_consumed("OTHERCODE"))
 
-                # In cmd_order, using an already consumed code should exit immediately
+                # In cmd_order, legacy --code alone is rejected without intent
                 args = argparse.Namespace(
                     symbol="AAPL",
                     opt=False,
                     action="BUY",
                     qty=10,
-                    type="MKT",
-                    limit=None,
+                    type="LMT",
+                    limit=150.0,
                     currency="USD",
                     exchange="SMART",
                     tif="DAY",
@@ -596,12 +602,11 @@ class TradingRiskControlsTests(unittest.TestCase):
                 with patch.object(cli, "connect", return_value=mock_ib), \
                      patch.object(cli, "finish"), \
                      patch.object(cli, "CFG_PATH") as mock_cfg_path, \
-                     patch.object(cli, "_code", return_value=test_code), \
                      patch("sys.stdout", new_callable=io.StringIO):
                     mock_cfg_path.exists.return_value = True
                     with self.assertRaises(SystemExit) as cm:
                         cli.cmd_order(cfg, args)
-                    self.assertIn("已经被消费执行过，不可重复提交同一笔委托", str(cm.exception))
+                    self.assertIn("explicit --intent is required", str(cm.exception))
 
     def test_port_7496_triggers_live_guard(self):
         args = argparse.Namespace(paper=False, port=7496, live_ok=False)
@@ -638,6 +643,7 @@ class TradingRiskControlsTests(unittest.TestCase):
         mock_trade.contract.right = "C"
         mock_trade.contract.multiplier = "100"
         mock_trade.order.action = "SELL"
+        mock_trade.order.account = "DU12345"
         mock_ib.openTrades.return_value = [mock_trade]
         mock_ib.portfolio.return_value = []
 
@@ -951,6 +957,7 @@ class TradingRiskControlsTests(unittest.TestCase):
         mock_trade.contract.strike = 400.0
         mock_trade.contract.multiplier = "100"
         mock_trade.order.action = "SELL"
+        mock_trade.order.account = "DU12345"
         mock_ib.openTrades.return_value = [mock_trade]
         mock_ib.portfolio.return_value = []
 
@@ -1010,14 +1017,15 @@ class TradingRiskControlsTests(unittest.TestCase):
             opt=False,
             action="BUY",
             qty=10,
-            type="MKT",
-            limit=None,
+            type="LMT",
+            limit=150.0,
             currency="USD",
             exchange="SMART",
             tif="DAY",
             outside_rth=False,
             whatif=False,
-            code="12345678",
+            code="",
+            intent="",
             live_ok=False,
             paper=True,
             port=4002,
@@ -1025,17 +1033,16 @@ class TradingRiskControlsTests(unittest.TestCase):
         mock_stock = MagicMock(conId=111, secType="STK")
         mock_ib.qualifyContracts.return_value = [mock_stock]
 
+        from thetamill import submission_cli
         with patch.object(cli, "connect", return_value=mock_ib) as mock_connect, \
              patch.object(cli, "finish"), \
              patch.object(cli, "CFG_PATH") as mock_cfg_path, \
-             patch.object(cli, "_is_code_consumed", return_value=False), \
-             patch.object(cli, "_code", return_value="12345678"), \
-             patch.object(cli, "_consume_code"), \
-             patch.object(cli, "_write_audit"), \
+             patch.object(submission_cli, "execute_prepared", return_value=MagicMock(rc=2, lines=lambda: [])) as mock_exec, \
              patch("sys.stdout", new_callable=io.StringIO):
             mock_cfg_path.exists.return_value = True
             cli.cmd_order(cfg, order_args)
             mock_connect.assert_called_once_with(cfg, 4002, readonly=False, args=order_args)
+            mock_exec.assert_called_once()
 
         # cmd_cancel forwards args
         cancel_args = argparse.Namespace(

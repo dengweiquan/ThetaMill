@@ -19,6 +19,7 @@ import math
 import os
 import socket
 import sys
+from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -272,18 +273,26 @@ def connect(cfg, port, readonly=False, force_delayed=False, args=None):
     except Exception as e:
         sys.exit(f"连接失败 {cfg['host']}:{port} — {type(e).__name__}: {e}\n"
                  f"→ 请确认 IB Gateway / TWS 已启动并登录，且已在 API 设置中勾选 Enable ActiveX and Socket Clients。")
-    _verify_account_env(ib, cfg, args, port)
-    ib._diag = []
+    try:
+        _verify_account_env(ib, cfg, args, port)
+        ib._diag = []
 
-    def _on_err(reqId, code, msg, contract):
-        if code in ROUTINE_CODES:
-            return
-        ib._diag.append((code, _dec(msg)))
+        def _on_err(reqId, code, msg, contract):
+            if code in ROUTINE_CODES:
+                return
+            ib._diag.append((code, _dec(msg)))
 
-    ib.errorEvent += _on_err
-    mdt = 3 if (force_delayed or cfg.get("market_data_type") != "live") else 1
-    ib.reqMarketDataType(mdt)
-    return ib
+        ib.errorEvent += _on_err
+        mdt = 3 if (force_delayed or cfg.get("market_data_type") != "live") else 1
+        ib.reqMarketDataType(mdt)
+        return ib
+    except (Exception, SystemExit):
+        # The caller cannot clean up an object connect() has not returned yet.
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        raise
 
 
 def finish(ib):
@@ -404,7 +413,7 @@ def _open_trades(ib):
         sys.exit(f"⛔ 无法确认活跃挂单：{type(exc).__name__}: {exc}")
 
 
-def _account_scope(ib):
+def _account_scope(ib, account=None):
     """Stage A guard: never combine collateral from multiple accounts."""
     try:
         managed = ib.managedAccounts()
@@ -413,9 +422,10 @@ def _account_scope(ib):
     accounts = [a for a in managed if isinstance(a, str) and a.strip()] if isinstance(managed, (list, tuple)) else []
     if isinstance(managed, (list, tuple)) and not accounts:
         sys.exit("⛔ 无法确认登录账户")
-    if len(set(accounts)) > 1:
-        sys.exit("⛔ 多账户会话需等待账户隔离实现，禁止交易预检或提交")
-    account = accounts[0] if accounts else ""
+    if not account:
+        if len(set(accounts)) > 1:
+            sys.exit("⛔ 多账户会话需等待账户隔离实现，禁止交易预检或提交")
+        account = accounts[0] if accounts else ""
     if account:
         for p in _portfolio(ib):
             owner = getattr(p, "account", "")
@@ -617,16 +627,18 @@ def cmd_status(cfg, args):
             print(f"  ✅ {p} {label} — 已连接")
             alive.append(p)
             try:
-                s = ib.accountSummary()
+                account = _selected_account(ib, cfg, args)
+                s = ib.accountSummary(account)
                 for k in ("NetLiquidation", "AvailableFunds", "BuyingPower"):
                     for row in s:
-                        if row.tag == k:
+                        if row.account == account and row.tag == k:
                             print(f"       {k}: {fmt(row.value)} {row.currency}")
-            except Exception as e:
-                print(f"       账户读取失败: {e}")
-            finish(ib)
+            except (Exception, SystemExit):
+                print("       账户读取失败；多账户请用 --account 明确选择。")
         except Exception:
             print(f"  ❌ {p} {label} — 未监听")
+        finally:
+            finish(ib)
     if not alive:
         print("\n结论：本机没有可用的 IBKR 网关。请先安装并登录 IB Gateway。")
     return 0
@@ -636,44 +648,50 @@ def cmd_account(cfg, args):
     if not CFG_PATH.exists():
         load_cfg(required=True)
     port, env = resolve_port(cfg, args)
-    ib = connect(cfg, port, readonly=True)
-    print(f"环境：{env}  端口：{port}")
-    rows = ib.accountSummary()
-    keep = {
-        "AccountType": "账户类型", "NetLiquidation": "净清算值", "TotalCashValue": "现金",
-        "AvailableFunds": "可用资金", "BuyingPower": "购买力", "ExcessLiquidity": "超额流动性",
-        "MaintMarginReq": "维持保证金", "InitMarginReq": "初始保证金", "GrossPositionValue": "持仓市值",
-        "UnrealizedPnL": "浮动盈亏", "RealizedPnL": "已实现盈亏",
-    }
-    for r in rows:
-        if r.tag in keep:
-            print(f"  {keep[r.tag]:<8} {fmt(r.value)} {r.currency}")
-    finish(ib)
-    return 0
+    ib = connect(cfg, port, readonly=True, args=args)
+    try:
+        account = _selected_account(ib, cfg, args)
+        print(f"环境：{env}  端口：{port}  账户：{account}")
+        rows = [r for r in ib.accountSummary(account) if getattr(r, "account", None) == account]
+        keep = {
+            "AccountType": "账户类型", "NetLiquidation": "净清算值", "TotalCashValue": "现金",
+            "AvailableFunds": "可用资金", "BuyingPower": "购买力", "ExcessLiquidity": "超额流动性",
+            "MaintMarginReq": "维持保证金", "InitMarginReq": "初始保证金", "GrossPositionValue": "持仓市值",
+            "UnrealizedPnL": "浮动盈亏", "RealizedPnL": "已实现盈亏",
+        }
+        for r in rows:
+            if r.tag in keep:
+                print(f"  {keep[r.tag]:<8} {fmt(r.value)} {r.currency}")
+        return 0
+    finally:
+        finish(ib)
 
 
 def cmd_positions(cfg, args):
     if not CFG_PATH.exists():
         load_cfg(required=True)
     port, env = resolve_port(cfg, args)
-    ib = connect(cfg, port, readonly=True)
-    ib.sleep(2)
-    print(f"环境：{env}  端口：{port}")
-    pf = ib.portfolio()
-    if not pf:
-        print("  当前无持仓")
-    else:
-        print(f"  {'标的':<26}{'数量':>10}{'均价':>12}{'现价':>11}{'市值':>14}{'浮盈':>12}")
-        tot = 0.0
-        for p in pf:
-            c = p.contract
-            name = c.localSymbol if c.secType == "OPT" else c.symbol
-            print(f"  {name:<26}{fmt(p.position, 0):>10}{fmt(p.averageCost, 3):>12}"
-                  f"{fmt(p.marketPrice, 3):>11}{fmt(p.marketValue):>14}{fmt(p.unrealizedPNL):>12}")
-            tot += float(p.unrealizedPNL or 0)
-        print(f"  {'合计浮盈':<26}{'':>10}{'':>12}{'':>11}{'':>14}{fmt(tot):>12}")
-    finish(ib)
-    return 0
+    ib = connect(cfg, port, readonly=True, args=args)
+    try:
+        account = _selected_account(ib, cfg, args)
+        ib.reqAccountUpdates(account)
+        print(f"环境：{env}  端口：{port}  账户：{account}")
+        pf = ib.portfolio(account)
+        if not pf:
+            print("  当前无持仓")
+        else:
+            print(f"  {'标的':<26}{'数量':>10}{'均价':>12}{'现价':>11}{'市值':>14}{'浮盈':>12}")
+            tot = 0.0
+            for p in pf:
+                c = p.contract
+                name = c.localSymbol if c.secType == "OPT" else c.symbol
+                print(f"  {name:<26}{fmt(p.position, 0):>10}{fmt(p.averageCost, 3):>12}"
+                      f"{fmt(p.marketPrice, 3):>11}{fmt(p.marketValue):>14}{fmt(p.unrealizedPNL):>12}")
+                tot += float(p.unrealizedPNL or 0)
+            print(f"  {'合计浮盈':<26}{'':>10}{'':>12}{'':>11}{'':>14}{fmt(tot):>12}")
+        return 0
+    finally:
+        finish(ib)
 
 
 def cmd_quote(cfg, args):
@@ -798,26 +816,33 @@ def cmd_orders(cfg, args):
     if not CFG_PATH.exists():
         load_cfg(required=True)
     port, env = resolve_port(cfg, args)
-    ib = connect(cfg, port, readonly=True)
-    ib.sleep(1.5)
-    trades = ib.reqAllOpenOrders() or []
-    trades = [t for t in trades if t.orderStatus.status not in ("Filled", "Cancelled", "ApiCancelled", "Inactive")]
-    print(f"{env} | 未成交挂单 {len(trades)} 笔")
-    for t in trades:
-        c, o = t.contract, t.order
-        if c.secType == "BAG":
-            name = f"{c.symbol} 组合×{len(c.comboLegs or [])}腿"
-            px = f"{fmt(o.lmtPrice, 3)}(净)"
-        elif c.secType == "OPT":
-            name = " ".join(c.localSymbol.split())
-            px = fmt(o.lmtPrice, 3)
-        else:
-            name = c.symbol
-            px = fmt(o.lmtPrice, 3)
-        print(f"  #{o.orderId:<8}{name:<22}{o.action:<5}{fmt(o.totalQuantity,0):>6} "
-              f"{o.orderType:<6}{px:>12}  {t.orderStatus.status}")
-    finish(ib)
-    return 0
+    ib = connect(cfg, port, readonly=True, args=args)
+    try:
+        account = _selected_account(ib, cfg, args)
+        trades = ib.reqAllOpenOrders()
+        if not isinstance(trades, (list, tuple)):
+            sys.exit("无法确认挂单列表")
+        if any(not getattr(t.order, "account", "") for t in trades):
+            sys.exit("挂单账户范围未知")
+        trades = [t for t in trades if t.order.account == account
+                  and t.orderStatus.status not in ("Filled", "Cancelled", "ApiCancelled", "Inactive")]
+        print(f"{env} | 未成交挂单 {len(trades)} 笔")
+        for t in trades:
+            c, o = t.contract, t.order
+            if c.secType == "BAG":
+                name = f"{c.symbol} 组合×{len(c.comboLegs or [])}腿"
+                px = f"{fmt(o.lmtPrice, 3)}(净)"
+            elif c.secType == "OPT":
+                name = " ".join(c.localSymbol.split())
+                px = fmt(o.lmtPrice, 3)
+            else:
+                name = c.symbol
+                px = fmt(o.lmtPrice, 3)
+            print(f"  #{o.orderId:<8}{name:<22}{o.action:<5}{fmt(o.totalQuantity,0):>6} "
+                  f"{o.orderType:<6}{px:>12}  {t.orderStatus.status}")
+        return 0
+    finally:
+        finish(ib)
 
 
 def cmd_cancel(cfg, args):
@@ -825,16 +850,27 @@ def cmd_cancel(cfg, args):
         load_cfg(required=True)
     port, env = resolve_port(cfg, args)
     ib = connect(cfg, port, readonly=False, args=args)
-    ib.sleep(1.5)
-    hit = [t for t in (ib.reqAllOpenOrders() or []) if t.order.orderId == args.order_id]
-    if not hit:
-        sys.exit(f"未找到 #{args.order_id} 的挂单")
-    t = hit[0]
-    ib.cancelOrder(t.order)
-    ib.sleep(1.5)
-    print(f"已请求撤单 #{args.order_id} → 状态 {t.orderStatus.status}")
-    finish(ib)
-    return 0
+    try:
+        account = _selected_account(ib, cfg, args)
+        trades = ib.reqAllOpenOrders()
+        if not isinstance(trades, (list, tuple)):
+            sys.exit("无法同步撤单目标")
+        hit = [t for t in trades if t.order.orderId == args.order_id
+               and getattr(t.order, "account", None) == account]
+        if len(hit) != 1:
+            sys.exit(f"未找到唯一属于所选账户的 #{args.order_id} 挂单")
+        t = hit[0]
+        owner_client = getattr(t.order, "clientId", None)
+        current_client = getattr(ib.client, "clientId", None)
+        if (type(owner_client) is not int or type(current_client) is not int
+                or owner_client != current_client):
+            sys.exit("拒绝撤销其他客户端或归属未知的订单；请在原客户端/TWS 核对处理。")
+        ib.cancelOrder(t.order)
+        ib.sleep(1.5)
+        print(f"已请求撤单 #{args.order_id} → 状态 {t.orderStatus.status}")
+        return 0
+    finally:
+        finish(ib)
 
 
 # ---------------------------------------------------------------- 下单
@@ -861,190 +897,171 @@ def cmd_order(cfg, args):
         load_cfg(required=True)
     port, env = resolve_port(cfg, args)
     _live_guard(cfg, args, port)
+
+    # Pre-network guard for intent/code pair
+    intent_id = str(getattr(args, "intent", "") or "").strip()
+    code = str(getattr(args, "code", "") or "").strip()
+    if code and not intent_id:
+        sys.exit("⛔ --code alone is not a confirmation; an explicit --intent is required (no legacy _code path)")
+    if intent_id and not code:
+        sys.exit("⛔ --intent alone is not a confirmation; an explicit --code is required")
+
     ib = connect(cfg, port, readonly=False, args=args)
-    _sync_open_orders(ib)
-    account = _account_scope(ib)
-    _validate_obligations(ib)
+    try:
+        account = _selected_account(ib, cfg, args)
+        _account_scope(ib, account)
+        _sync_open_orders(ib)
+        _validate_obligations(ib)
 
-    qty = _positive_number(args.qty, "委托数量", integer=True)
-    if args.opt:
-        args.strike = _positive_number(args.strike, "行权价")
-    if args.type.upper() == "LMT":
-        args.limit = _positive_number(args.limit, "限价")
-    elif args.type.upper() == "STP":
-        args.stop = _positive_number(args.stop, "止损价")
+        qty = _positive_number(args.qty, "委托数量", integer=True)
+        if args.opt:
+            args.strike = _positive_number(args.strike, "行权价")
+        if args.type.upper() == "LMT":
+            args.limit = _positive_number(args.limit, "限价")
+        elif args.type.upper() == "STP":
+            args.stop = _positive_number(args.stop, "止损价")
 
-    # 1) 合约
-    if args.opt:
-        for req in ("expiry", "strike", "right"):
-            if not getattr(args, req):
-                sys.exit(f"期权单缺少 --{req}")
-        contract, _exchange = _opt(
-            ib, args.symbol, args.expiry, args.strike, args.right, args.currency,
-            exchange=getattr(args, "exchange", None),
-            multiplier=getattr(args, "multiplier", None),
-            trading_class=getattr(args, "trading_class", None))
-        label = f"{args.symbol.upper()} {args.expiry} {args.strike}{args.right.upper()}"
-        q = [contract] if contract else []
-    else:
-        contract = _stock(ib, args.symbol, args.currency, getattr(args, "exchange", None))
-        if not contract:
-            sys.exit(f"合约无法识别：{args.symbol} {args.currency}（可用 --exchange SEHK 手动指定）")
-        label = f"{contract.symbol} 正股"
-        try:
-            q = ib.qualifyContracts(contract)
-        except Exception:
-            q = []
-    if not q or not q[0].conId:
-        sys.exit(f"合约无法识别：{label}")
-    contract = q[0]
+        # 1) 合约
+        if args.opt:
+            for req in ("expiry", "strike", "right"):
+                if not getattr(args, req):
+                    sys.exit(f"期权单缺少 --{req}")
+            contract, _exchange = _opt(
+                ib, args.symbol, args.expiry, args.strike, args.right, args.currency,
+                exchange=getattr(args, "exchange", None),
+                multiplier=getattr(args, "multiplier", None),
+                trading_class=getattr(args, "trading_class", None),
+                con_id=getattr(args, "con_id", None))
+            label = f"{args.symbol.upper()} {args.expiry} {args.strike}{args.right.upper()}"
+            q = [contract] if contract else []
+        else:
+            contract = _stock(ib, args.symbol, args.currency, getattr(args, "exchange", None))
+            if not contract:
+                sys.exit(f"合约无法识别：{args.symbol} {args.currency}（可用 --exchange SEHK 手动指定）")
+            label = f"{contract.symbol} 正股"
+            try:
+                q = ib.qualifyContracts(contract)
+            except Exception:
+                q = []
+        if not q or not q[0].conId:
+            sys.exit(f"合约无法识别：{label}")
+        contract = q[0]
 
-    # 2) 委托
-    side = args.action.upper()
-    is_live = _is_live_env(cfg, args, port)
+        # 2) 委托
+        side = args.action.upper()
+        is_live = _is_live_env(cfg, args, port)
 
-    if not args.opt and side == "SELL":
-        for held in _portfolio(ib):
-            c = getattr(held, "contract", None)
-            if (c and c.secType == "STK" and c.symbol.upper() == args.symbol.upper()
-                    and c.currency == args.currency and _finite_position(held)
-                    and c.conId != contract.conId):
-                sys.exit("⛔ 待卖正股 conId 与用于覆盖的实际持仓不符")
-        have = _shares(ib, args.symbol, args.currency)
-        reserved = (_short_calls_shares(ib, args.symbol, args.currency)
-                    + _pending_short_calls_shares(ib, args.symbol, args.currency)
-                    + _pending_stock_sales(ib, args.symbol, args.currency))
-        if have - reserved < qty:
-            sys.exit("⛔ 卖股将使现有或在途空头 Call 失去覆盖，或超过未被挂单占用的持股")
-
-    if args.opt and side == "BUY":
-        short = _short_options_by_id(ib, contract.conId)
-        pending = _pending_option_buys_by_id(ib, contract.conId)
-        if qty > short - pending:
-            sys.exit("⛔ 买回数量超过同一 conId 的未占用净空头；不支持开立期权多头")
-
-    if args.opt and side == "SELL":
-        _delivery_guard(ib, contract)
-        mult = _multiplier(ib, contract)
-        qty_val = qty
-        if args.right.upper() == "C":
+        if not args.opt and side == "SELL":
+            for held in _portfolio(ib):
+                c = getattr(held, "contract", None)
+                if (c and c.secType == "STK" and c.symbol.upper() == args.symbol.upper()
+                        and c.currency == args.currency and _finite_position(held)
+                        and c.conId != contract.conId):
+                    sys.exit("⛔ 待卖正股 conId 与用于覆盖的实际持仓不符")
             have = _shares(ib, args.symbol, args.currency)
-            if have < 0:
-                sys.exit(f"\n⛔ 账户持有 {have:g} 股 {args.symbol} 空头头寸（做空），禁止开具备兑 Call。\n")
-            busy_shares = (_short_calls_shares(ib, args.symbol, args.currency)
-                           + _pending_short_calls_shares(ib, args.symbol, args.currency)
-                           + _pending_stock_sales(ib, args.symbol, args.currency))
-            if have < busy_shares:
-                sys.exit(f"\n⛔ 现有正股 {have:g} 股不足以覆盖现有空头 Call（已占用 {busy_shares:g} 股，缺口 {busy_shares - have:g} 股）。禁止继续卖出 Call。\n")
-            avail = have - busy_shares
-            need = qty_val * mult
-            if avail < need:
-                sys.exit(f"\n⛔ 备兑卖 Call 的先决条件是持有未被覆盖的正股：需 {need} 股，净可用仅 {avail:g} 股（总持仓 {have:g}，空头持仓占用 {busy_shares:g} 股）。本工具禁止裸卖 Call。\n")
-        elif args.right.upper() == "P":
-            need_cash = args.strike * mult * qty_val
-            ok, note = _coverage(ib, args.currency, need_cash, require_cash=True)
-            if not ok:
-                sys.exit(f"\n⛔ 现金担保不足：卖 {qty_val} 张 {args.strike:g} Put 须备足 {fmt(need_cash)} {args.currency}。\n   {note}\n   现金担保卖 Put 严禁裸卖或使用融资杠杆。\n")
+            reserved = (_short_calls_shares(ib, args.symbol, args.currency)
+                        + _pending_short_calls_shares(ib, args.symbol, args.currency)
+                        + _pending_stock_sales(ib, args.symbol, args.currency))
+            if have - reserved < qty:
+                sys.exit("⛔ 卖股将使现有或在途空头 Call 失去覆盖，或超过未被挂单占用的持股")
 
-    if args.type.upper() == "MKT":
-        order = MarketOrder(side, qty)
-        px = None
-    elif args.type.upper() == "LMT":
-        if not args.limit:
-            sys.exit("限价单需要 --limit")
-        order = LimitOrder(side, qty, args.limit)
-        px = args.limit
-    else:
-        if not args.stop:
-            sys.exit("止损单需要 --stop")
-        order = StopOrder(side, qty, args.stop)
-        px = args.stop
-    order.tif = args.tif
-    order.outsideRth = bool(args.outside_rth)
-    if account:
-        order.account = account
+        if args.opt and side == "BUY":
+            short = _short_options_by_id(ib, contract.conId)
+            pending = _pending_option_buys_by_id(ib, contract.conId)
+            if qty > short - pending:
+                sys.exit("⛔ 买回数量超过同一 conId 的未占用净空头；不支持开立期权多头")
 
-    mode = "live" if is_live else "paper"
-    payload = dict(mode=mode, port=port, contract=contract.conId, sec=contract.secType,
-                   action=side, qty=qty, otype=args.type.upper(), px=px, tif=args.tif,
-                   outside_rth=bool(args.outside_rth))
-    code = _code(payload)
+        if args.opt and side == "SELL":
+            _delivery_guard(ib, contract)
+            mult = _multiplier(ib, contract)
+            contract.multiplier = str(mult)
+            qty_val = qty
+            if args.right.upper() == "C":
+                have = _shares(ib, args.symbol, args.currency)
+                if have < 0:
+                    sys.exit(f"\n⛔ 账户持有 {have:g} 股 {args.symbol} 空头头寸（做空），禁止开具备兑 Call。\n")
+                busy_shares = (_short_calls_shares(ib, args.symbol, args.currency)
+                               + _pending_short_calls_shares(ib, args.symbol, args.currency)
+                               + _pending_stock_sales(ib, args.symbol, args.currency))
+                if have < busy_shares:
+                    sys.exit(f"\n⛔ 现有正股 {have:g} 股不足以覆盖现有空头 Call（已占用 {busy_shares:g} 股，缺口 {busy_shares - have:g} 股）。禁止继续卖出 Call。\n")
+                avail = have - busy_shares
+                need = qty_val * mult
+                if avail < need:
+                    sys.exit(f"\n⛔ 备兑卖 Call 的先决条件是持有未被覆盖的正股：需 {need} 股，净可用仅 {avail:g} 股（总持仓 {have:g}，空头持仓占用 {busy_shares:g} 股）。本工具禁止裸卖 Call。\n")
+            elif args.right.upper() == "P":
+                need_cash = args.strike * mult * qty_val
+                ok, note = _coverage(ib, args.currency, need_cash, require_cash=True)
+                if not ok:
+                    sys.exit(f"\n⛔ 现金担保不足：卖 {qty_val} 张 {args.strike:g} Put 须备足 {fmt(need_cash)} {args.currency}。\n   {note}\n   现金担保卖 Put 严禁裸卖或使用融资杠杆。\n")
+        elif args.opt:
+            mult = _multiplier(ib, contract)
+            contract.multiplier = str(mult)
 
-    # 3) 预估保证金与费用（需有行情，默认关闭，用 --whatif 开启）
-    est = ""
-    if args.whatif:
+        if not args.opt and side == "BUY":
+            if args.type.upper() != "LMT" or not args.limit:
+                sys.exit("⛔ 正股买入需要限价单 --type LMT 及 --limit（禁止无上限市价买入）")
+
+        if args.type.upper() == "MKT":
+            order = MarketOrder(side, qty)
+            px = None
+        elif args.type.upper() == "LMT":
+            if not args.limit:
+                sys.exit("限价单需要 --limit")
+            order = LimitOrder(side, qty, args.limit)
+            px = args.limit
+        else:
+            if not args.stop:
+                sys.exit("止损单需要 --stop")
+            order = StopOrder(side, qty, args.stop)
+            px = args.stop
+        order.tif = args.tif
+        order.outsideRth = bool(args.outside_rth)
+        if account:
+            order.account = account
+
+        # 3) 预估保证金与费用（需有行情，默认关闭，用 --whatif 开启）
+        est = ""
+        if args.whatif:
+            try:
+                w = ib.whatIfOrder(contract, order)
+                parts = []
+                for k, cn in (("initMarginChange", "初始保证金变化"), ("maintMarginChange", "维持保证金变化"),
+                              ("commission", "预估佣金"), ("equityWithLoanChange", "含贷权益变化")):
+                    v = getattr(w, k, None)
+                    if v not in (None, "", "1.7976931348623157E308"):
+                        parts.append(f"{cn} {fmt(v)}")
+                est = " | ".join(parts)
+            except Exception as e:
+                est = f"（保证金预估不可用：{type(e).__name__}，通常是缺行情数据）"
+
+        print("─" * 68)
+        if is_live:
+            print("  🔴 实盘账户 —— 下面这笔是真实资金委托")
+        print(f"  环境    {env}   端口 {port}   账户模式 {'实盘' if is_live else '纸账户'}")
+        print(f"  标的    {label}   conId={contract.conId}")
+        print(f"  方向    {side}  {qty}  类型 {args.type.upper()}"
+              + (f"  价格 {px}" if px else "") + f"  TIF {args.tif}"
+              + ("  允许盘外" if args.outside_rth else ""))
+        if est:
+            print(f"  预估    {est}")
+        print("─" * 68)
+
+        from thetamill import submission_cli
         try:
-            w = ib.whatIfOrder(contract, order)
-            parts = []
-            for k, cn in (("initMarginChange", "初始保证金变化"), ("maintMarginChange", "维持保证金变化"),
-                          ("commission", "预估佣金"), ("equityWithLoanChange", "含贷权益变化")):
-                v = getattr(w, k, None)
-                if v not in (None, "", "1.7976931348623157E308"):
-                    parts.append(f"{cn} {fmt(v)}")
-            est = " | ".join(parts)
-        except Exception as e:
-            est = f"（保证金预估不可用：{type(e).__name__}，通常是缺行情数据）"
-
-    print("─" * 68)
-    if is_live:
-        print("  🔴 实盘账户 —— 下面这笔是真实资金委托")
-    print(f"  环境    {env}   端口 {port}   账户模式 {'实盘' if is_live else '纸账户'}")
-    print(f"  标的    {label}   conId={contract.conId}")
-    print(f"  方向    {side}  {qty}  类型 {args.type.upper()}"
-          + (f"  价格 {px}" if px else "") + f"  TIF {args.tif}"
-          + ("  允许盘外" if args.outside_rth else ""))
-    if est:
-        print(f"  预估    {est}")
-    print("─" * 68)
-
-    if args.code != code:
-        print(f"\n⚠️  这是{'实盘' if is_live else '纸账户'}订单，尚未提交。")
-        print(f"    复核码：{code}")
-        print(f"    确认无误后，用同一条命令追加  --code {code}  再跑一次即会真实发出。\n")
+            result = submission_cli.execute_prepared(
+                ib, cfg, args,
+                pairs=[(contract, order)],
+                strategy=f"order:{'opt' if args.opt else 'stk'}:{side.lower()}",
+                requires_filled=(),
+                delivery_evidence_path=getattr(args, "delivery_evidence", None),
+            )
+            return result.rc
+        except submission_cli.SubmissionCliError as exc:
+            msg = submission_cli._mask_account_text(str(exc), account)
+            sys.exit(f"⛔ {msg}")
+    finally:
         finish(ib)
-        return 2
-
-    if _is_code_consumed(code):
-        sys.exit(f"\n⛔ 复核码 {code} 已经被消费执行过，不可重复提交同一笔委托！如需重新下单，请重新生成复核码。\n")
-
-    # 4) 真正下单
-    trade = ib.placeOrder(contract, order)
-    _consume_code(code)
-    order_id = trade.order.orderId
-    print(f"已提交 #{order_id}，等待回执…")
-    st, filled, avg = "UNKNOWN", 0.0, None
-    try:
-        for _ in range(10):
-            ib.sleep(1)
-            st = trade.orderStatus.status
-            if st in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
-                break
-        st = trade.orderStatus.status
-        filled = trade.orderStatus.filled
-        avg = trade.orderStatus.avgFillPrice
-        print(f"  状态 {st}  已成交 {fmt(filled,0)}  均价 {fmt(avg,3)}")
-        for lg in trade.log[-3:]:
-            if lg.message:
-                print(f"  日志 {lg.status}: {_dec(lg.message)}")
-    except Exception as e:
-        print(f"  ⚠️ 回执等待中断：{type(e).__name__}: {e}")
-        print("  → 网关掉线或重启了。订单是否生效必须重新登录后用  ./ib orders  核对，")
-        print(f"     不要重复提交（orderId #{order_id} 已分配）。")
-        st = "UNKNOWN"
-
-    try:
-        ORDER_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with ORDER_LOG.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "ts": datetime.now().isoformat(timespec="seconds"), "env": env, "port": port,
-                "orderId": order_id, "label": label, "action": side, "qty": qty,
-                "type": args.type.upper(), "px": px, "tif": args.tif, "code": code,
-                "status": st, "filled": filled, "avgFillPrice": avg,
-            }, ensure_ascii=False, default=str) + "\n")
-    except Exception as e:
-        print(f"  ⚠️ 审计日志写入失败（订单已发出，不影响成交）：{e}")
-    finish(ib)
-    return 0
 
 
 def _write_audit(env, port, preset, data):
@@ -1477,6 +1494,15 @@ def cmd_combo(cfg, args):
         load_cfg(required=True)
     port, env = resolve_port(cfg, args)
     _live_guard(cfg, args, port)
+
+    # Pre-network guard for intent/code pair
+    intent_id = str(getattr(args, "intent", "") or "").strip()
+    code = str(getattr(args, "code", "") or "").strip()
+    if code and not intent_id:
+        sys.exit("⛔ --code alone is not a confirmation; an explicit --intent is required (no legacy _code path)")
+    if intent_id and not code:
+        sys.exit("⛔ --intent alone is not a confirmation; an explicit --code is required")
+
     sym, preset = args.symbol.upper(), args.preset
     right = "P" if preset == "cash-put" else "C"
     qty = _positive_number(args.qty, "期权张数", integer=True)
@@ -1488,185 +1514,128 @@ def cmd_combo(cfg, args):
     is_live = _is_live_env(cfg, args, port)
 
     ib = connect(cfg, port, readonly=False, args=args)
-    _sync_open_orders(ib)
-    account = _account_scope(ib)
-    _validate_obligations(ib)
-
-    opt, _exch = _opt(
-        ib, sym, args.expiry, strike, right, args.currency,
-        exchange=getattr(args, "exchange", None),
-        multiplier=getattr(args, "multiplier", None),
-        trading_class=getattr(args, "trading_class", None),
-        con_id=getattr(args, "con_id", None))
-    if not opt:
-        sys.exit(f"期权合约无法识别：{sym} {args.expiry} {strike:g}{right}（可用 --currency 指定币种）")
-    mult = _multiplier(ib, opt)
-    _delivery_guard(ib, opt)
-    need_shares = mult * qty
-
-    # ---- 前提校验：这就是这个策略能不能成立的条件
-    have = _shares(ib, sym, args.currency)
-    stock_contract, stock_qty, stock_note = None, 0, ""
-    busy_shares = (_short_calls_shares(ib, sym, args.currency)
-                   + _pending_short_calls_shares(ib, sym, args.currency)
-                   + _pending_stock_sales(ib, sym, args.currency))
-    busy_count = _short_calls(ib, sym, args.currency) + _pending_short_calls(ib, sym, args.currency)
-
-    if preset == "covered-call":
-        if have < 0:
-            sys.exit(f"\n⛔ 账户持有 {have:g} 股 {sym} 空头头寸（做空），禁止开具备兑 Call。\n")
-        if have < busy_shares:
-            sys.exit(f"\n⛔ 现有正股 {have:g} 股不足以覆盖现有空头 Call（已占用 {busy_shares:g} 股，缺口 {busy_shares - have:g} 股）。禁止继续开具备兑 Call。\n")
-        avail = have - busy_shares
-        if avail >= need_shares:
-            sys.exit(f"\n⛔ 你已持有 {have:g} 股 {sym}（已占用 {busy_shares:g} 股，净可用 {avail:g} 股），足够覆盖 {qty} 张（每张需 {mult} 股）。\n"
-                     f"   再买 {need_shares} 股只是加仓，不是备兑。请改用：--preset sell-call\n")
-        stock_contract = _stock(ib, sym, args.currency)
-        if not stock_contract:
-            sys.exit(f"正股合约无法识别：{sym} {args.currency}")
-        _delivery_guard(ib, opt, stock_contract)
-        if avail > 0:
-            stock_qty = need_shares - avail
-            stock_note = f"现有净可用 {avail:g} 股 → 差额补买 {stock_qty} 股（合计 {need_shares} 股覆盖 {qty} 张）"
-        else:
-            stock_qty = need_shares
-            stock_note = f"现有净可用 0 股 → 本单买入 {stock_qty} 股"
-    elif preset == "sell-call":
-        # 已被其它空头 Call 占用的股票不能再用来覆盖本单，否则就是变相裸卖
-        if have < 0:
-            sys.exit(f"\n⛔ 账户持有 {have:g} 股 {sym} 空头头寸（做空），禁止卖出 Call。\n")
-        if have < busy_shares:
-            sys.exit(f"\n⛔ 现有正股 {have:g} 股不足以覆盖现有空头 Call（已占用 {busy_shares:g} 股，缺口 {busy_shares - have:g} 股）。禁止继续卖出 Call。\n")
-        avail = have - busy_shares
-        if avail < need_shares:
-            sys.exit(f"\n⛔ 备兑卖 Call 的先决条件是持有未被覆盖的正股：\n"
-                     f"   卖 {qty} 张需 {need_shares} 股，你总持有 {have:g} 股，已有 {busy_count} 张空头持仓及挂单占用了 {busy_shares:g} 股，净可用仅 {avail:g} 股。\n"
-                     f"   没有股票覆盖的卖出 Call 是裸卖，理论上风险无限，本工具不做。\n")
-        stock_note = f"总持仓 {have:g} 股（已占用 {busy_shares:g} 股），净可用 {avail:g} 股 ≥ 需 {need_shares} 股 ✅"
-    else:
-        need_cash = strike * mult * qty
-        ok, note = _coverage(ib, args.currency, need_cash, require_cash=True)
-        if ok is False:
-            sys.exit(f"\n⛔ 现金担保不足：卖 {qty} 张 {strike:g} Put 须备足 {fmt(need_cash)} {args.currency}。\n"
-                     f"   {note}\n"
-                     f"   现金担保卖 Put 的意义就是行权时买得起，备不足即等同裸卖，本工具不做。\n")
-        stock_note = note
-
-    if stock_contract and (not float(stock_qty).is_integer() or stock_qty <= 0):
-        sys.exit("⛔ 补买正股差额为碎股；未确认券商支持，停止备兑策略")
-
-    net = args.net
-    otype = "LMT" if net not in (None, 0) else "MKT"
-
-    mode = "live" if is_live else "paper"
-    payload = dict(mode=mode, port=port, kind="strat", preset=preset, symbol=sym,
-                   conId=opt.conId, strike=strike, right=right, expiry=args.expiry,
-                   qty=qty, net=net, otype=otype, shares=stock_qty, stock_px=args.stock_px or 0,
-                   multiplier=mult, tradingClass=opt.tradingClass)
-    code = _code(payload)
-
-    print("─" * 68)
-    if is_live:
-        print("  🔴 实盘账户 —— 下面这笔是真实资金委托")
-    print(f"  环境    {env}   端口 {port}   账户模式 {'实盘' if is_live else '纸账户'}")
-    print(f"  策略    {preset} —— {PRESETS[preset]}")
-    print(f"  标的    {sym}   {qty} 张   乘数 {mult}")
-    if stock_contract:
-        pxtxt = f"限价 {args.stock_px}" if args.stock_px else "市价"
-        print(f"    BUY  {stock_qty} 股 {sym} {pxtxt}（先成交，再卖 Call）")
-    print(f"    SELL {qty}× {opt.localSymbol}"
-          + (f"  权利金 {net:.3f}（共收 {fmt(net * mult * qty)} {args.currency}）" if net else "  市价"))
-    print(f"  条件    {stock_note}")
-    print("─" * 68)
-
-    if args.code != code:
-        print(f"\n⚠️  这是{'实盘' if is_live else '纸账户'}委托，尚未提交。")
-        print(f"    复核码：{code}")
-        print(f"    确认无误后，加上  --code {code}  再跑一次即会真实发出。\n")
-        finish(ib)
-        return 2
-
-    if _is_code_consumed(code):
-        sys.exit(f"\n⛔ 复核码 {code} 已经被消费执行过，不可重复提交同一笔委托！如需重新下单，请重新生成复核码。\n")
-
-    done = []
-
-    # 1) 备兑的正股腿：先买股，没买齐就不卖 Call
-    if stock_contract:
-        if args.stock_px:
-            so = LimitOrder("BUY", stock_qty, args.stock_px)
-        else:
-            so = MarketOrder("BUY", stock_qty)
-        so.tif = "DAY"
-        if account:
-            so.account = account
-        ts = ib.placeOrder(stock_contract, so)
-        _consume_code(code)
-        for _ in range(10):
-            ib.sleep(1)
-            if ts.orderStatus.status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
-                break
-        print(f"  正股 #{ts.order.orderId} {ts.orderStatus.status}"
-              f"  成交 {fmt(ts.orderStatus.filled, 0)}/{stock_qty} 股"
-              f"  均价 {fmt(ts.orderStatus.avgFillPrice, 3)}")
-        done.append(("正股", ts.order.orderId, ts.orderStatus.status))
-        confirmed_fill = _positive_number(ts.orderStatus.filled, "正股已成交数量", integer=True) if ts.orderStatus.filled else 0
-        if confirmed_fill > stock_qty:
-            sys.exit("⛔ 正股成交量超过批准数量；期权腿未提交，请人工核对")
-        if confirmed_fill < stock_qty:
-            print("\n  ⛔ 正股未全部成交，已跳过卖 Call —— 不卖没有股票覆盖的 Call。")
-            print("     成交后改用：--preset sell-call")
-            _write_audit(env, port, preset, dict(orderId=ts.order.orderId, status=ts.orderStatus.status,
-                                                 legs=[f"正股 {stock_qty}"], qty=qty, net=net,
-                                                 otype=so.orderType, code=code, filled=ts.orderStatus.filled))
-            finish(ib)
-            return 3
-
-        # The first leg's fill is not proof that the current portfolio still
-        # covers the call: another client may have sold shares meanwhile.
-        try:
-            ib.reqAccountUpdates(account)
-        except Exception as exc:
-            sys.exit(f"⛔ 正股成交后无法刷新账户持仓；期权腿未提交：{exc}")
+    try:
+        account = _selected_account(ib, cfg, args)
+        _account_scope(ib, account)
         _sync_open_orders(ib)
         _validate_obligations(ib)
-        refreshed_have = _shares(ib, sym, args.currency)
-        refreshed_busy = (_short_calls_shares(ib, sym, args.currency)
-                          + _pending_short_calls_shares(ib, sym, args.currency)
-                          + _pending_stock_sales(ib, sym, args.currency))
-        if refreshed_have < refreshed_busy + need_shares:
-            sys.exit("⛔ 正股成交后刷新发现 Call 覆盖不足；期权腿未提交，请人工核对正股持仓与挂单")
 
-    # 2) 期权腿：卖出（收权利金）
-    order = LimitOrder("SELL", qty, net) if otype == "LMT" else MarketOrder("SELL", qty)
-    order.tif = "DAY"
-    if account:
-        order.account = account
-    trade = ib.placeOrder(opt, order)
-    _consume_code(code)
-    order_id = trade.order.orderId
-    print(f"  期权 #{order_id} 已提交，等待回执…")
-    st, filled = "UNKNOWN", 0.0
-    try:
-        for _ in range(10):
-            ib.sleep(1)
-            st = trade.orderStatus.status
-            if st in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
-                break
-        filled = trade.orderStatus.filled
-        print(f"  状态 {st}  成交 {fmt(filled, 0)} 张  均价 {fmt(trade.orderStatus.avgFillPrice, 3)}")
-        for lg in trade.log[-4:]:
-            if lg.message:
-                print(f"  日志 {lg.status}: {_dec(lg.message)[:140]}")
-    except Exception as e:
-        print(f"  ⚠️ 回执中断：{type(e).__name__}（重登后用 ./ib orders 核对，勿重复提交）")
-    done.append(("期权", order_id, st))
+        opt, _exch = _opt(
+            ib, sym, args.expiry, strike, right, args.currency,
+            exchange=getattr(args, "exchange", None),
+            multiplier=getattr(args, "multiplier", None),
+            trading_class=getattr(args, "trading_class", None),
+            con_id=getattr(args, "con_id", None))
+        if not opt:
+            sys.exit(f"期权合约无法识别：{sym} {args.expiry} {strike:g}{right}（可用 --currency 指定币种）")
+        mult = _multiplier(ib, opt)
+        opt.multiplier = str(mult)
+        _delivery_guard(ib, opt)
+        need_shares = mult * qty
 
-    _write_audit(env, port, preset, dict(orderId=order_id, status=st, legs=[opt.localSymbol],
-                                         qty=qty, net=net, otype=otype, code=code, filled=filled,
-                                         extra=[f"{k}#{i}:{s}" for k, i, s in done]))
-    finish(ib)
-    return 0
+        # ---- 前提校验：这就是这个策略能不能成立的条件
+        have = _shares(ib, sym, args.currency)
+        stock_contract, stock_qty, stock_note = None, 0, ""
+        busy_shares = (_short_calls_shares(ib, sym, args.currency)
+                       + _pending_short_calls_shares(ib, sym, args.currency)
+                       + _pending_stock_sales(ib, sym, args.currency))
+        busy_count = _short_calls(ib, sym, args.currency) + _pending_short_calls(ib, sym, args.currency)
+
+        if preset == "covered-call":
+            if have < 0:
+                sys.exit(f"\n⛔ 账户持有 {have:g} 股 {sym} 空头头寸（做空），禁止开具备兑 Call。\n")
+            if have < busy_shares:
+                sys.exit(f"\n⛔ 现有正股 {have:g} 股不足以覆盖现有空头 Call（已占用 {busy_shares:g} 股，缺口 {busy_shares - have:g} 股）。禁止继续开具备兑 Call。\n")
+            avail = have - busy_shares
+            if avail >= need_shares:
+                sys.exit(f"\n⛔ 你已持有 {have:g} 股 {sym}（已占用 {busy_shares:g} 股，净可用 {avail:g} 股），足够覆盖 {qty} 张（每张需 {mult} 股）。\n"
+                         f"   再买 {need_shares} 股只是加仓，不是备兑。请改用：--preset sell-call\n")
+            stock_contract = _stock(ib, sym, args.currency)
+            if not stock_contract:
+                sys.exit(f"正股合约无法识别：{sym} {args.currency}")
+            _delivery_guard(ib, opt, stock_contract)
+            if avail > 0:
+                stock_qty = need_shares - avail
+                stock_note = f"现有净可用 {avail:g} 股 → 差额补买 {stock_qty} 股（合计 {need_shares} 股覆盖 {qty} 张）"
+            else:
+                stock_qty = need_shares
+                stock_note = f"现有净可用 0 股 → 本单买入 {stock_qty} 股"
+        elif preset == "sell-call":
+            # 已被其它空头 Call 占用的股票不能再用来覆盖本单，否则就是变相裸卖
+            if have < 0:
+                sys.exit(f"\n⛔ 账户持有 {have:g} 股 {sym} 空头头寸（做空），禁止卖出 Call。\n")
+            if have < busy_shares:
+                sys.exit(f"\n⛔ 现有正股 {have:g} 股不足以覆盖现有空头 Call（已占用 {busy_shares:g} 股，缺口 {busy_shares - have:g} 股）。禁止继续卖出 Call。\n")
+            avail = have - busy_shares
+            if avail < need_shares:
+                sys.exit(f"\n⛔ 备兑卖 Call 的先决条件是持有未被覆盖的正股：\n"
+                         f"   卖 {qty} 张需 {need_shares} 股，你总持有 {have:g} 股，已有 {busy_count} 张空头持仓及挂单占用了 {busy_shares:g} 股，净可用仅 {avail:g} 股。\n"
+                         f"   没有股票覆盖的卖出 Call 是裸卖，理论上风险无限，本工具不做。\n")
+            stock_note = f"总持仓 {have:g} 股（已占用 {busy_shares:g} 股），净可用 {avail:g} 股 ≥ 需 {need_shares} 股 ✅"
+        else:
+            need_cash = strike * mult * qty
+            ok, note = _coverage(ib, args.currency, need_cash, require_cash=True)
+            if ok is False:
+                sys.exit(f"\n⛔ 现金担保不足：卖 {qty} 张 {strike:g} Put 须备足 {fmt(need_cash)} {args.currency}。\n"
+                         f"   {note}\n"
+                         f"   现金担保卖 Put 的意义就是行权时买得起，备不足即等同裸卖，本工具不做。\n")
+            stock_note = note
+
+        if stock_contract:
+            if not float(stock_qty).is_integer() or stock_qty <= 0:
+                sys.exit("⛔ 补买正股差额为碎股；未确认券商支持，停止备兑策略")
+            if args.stock_px is None or args.stock_px <= 0:
+                sys.exit("⛔ covered-call 买正股需要明确的限价 --stock-px（禁止无上限市价买入）")
+
+        net = args.net
+        otype = "LMT" if net not in (None, 0) else "MKT"
+
+        print("─" * 68)
+        if is_live:
+            print("  🔴 实盘账户 —— 下面这笔是真实资金委托")
+        print(f"  环境    {env}   端口 {port}   账户模式 {'实盘' if is_live else '纸账户'}")
+        print(f"  策略    {preset} —— {PRESETS[preset]}")
+        print(f"  标的    {sym}   {qty} 张   乘数 {mult}")
+        if stock_contract:
+            pxtxt = f"限价 {args.stock_px}" if args.stock_px else "市价"
+            print(f"    BUY  {stock_qty} 股 {sym} {pxtxt}（先成交，再卖 Call）")
+        print(f"    SELL {qty}× {opt.localSymbol}"
+              + (f"  权利金 {net:.3f}（共收 {fmt(net * mult * qty)} {args.currency}）" if net else "  市价"))
+        print(f"  条件    {stock_note}")
+        print("─" * 68)
+
+        # 2) 期权腿：卖出（收权利金）
+        order = LimitOrder("SELL", qty, net) if otype == "LMT" else MarketOrder("SELL", qty)
+        order.tif = "DAY"
+        if account:
+            order.account = account
+
+        if stock_contract:
+            so = LimitOrder("BUY", stock_qty, args.stock_px)
+            so.tif = "DAY"
+            if account:
+                so.account = account
+            pairs = [(stock_contract, so), (opt, order)]
+            requires_filled = (1,)
+        else:
+            pairs = [(opt, order)]
+            requires_filled = ()
+
+        from thetamill import submission_cli
+        try:
+            result = submission_cli.execute_prepared(
+                ib, cfg, args,
+                pairs=pairs,
+                strategy=preset,
+                requires_filled=requires_filled,
+                delivery_evidence_path=getattr(args, "delivery_evidence", None),
+            )
+            return result.rc
+        except submission_cli.SubmissionCliError as exc:
+            msg = submission_cli._mask_account_text(str(exc), account)
+            sys.exit(f"⛔ {msg}")
+    finally:
+        finish(ib)
 
 
 # ---------------------------------------------------------------- 计划 / 执行 / 审计
@@ -1741,6 +1710,8 @@ def _resolve_option(ib, symbol, expiry, strikes, target, right, currency, chain,
     ks = sorted(float(x) for x in strikes)
     if not ks:
         return None, None
+    target = float(target) if target is not None else 0.0
+    floor = float(floor) if floor is not None else None
     if right == "C":
         t = target if floor is None else max(target, floor)
         # 先找 ≥ 目标（由低到高）：最贴近目标的虚值/平值档；
@@ -1764,187 +1735,11 @@ def _resolve_option(ib, symbol, expiry, strikes, target, right, currency, chain,
     return None, None
 
 
-def cmd_plan(cfg, args):
+def cmd_plan(cfg, args, now: datetime | None = None):
     if not CFG_PATH.exists():
         load_cfg(required=True)
-    args.qty = _positive_number(args.qty, "计划期权张数", integer=True)
-    port, env = resolve_port(cfg, args)
-    ib = connect(cfg, port, readonly=True, force_delayed=getattr(args, "delayed", False), args=args)
-    _sync_open_orders(ib)
-
-    # 可选外部准入白名单：只做减法，默认关闭
-    uni_doc = load_universe(args.universe) if getattr(args, "universe", None) else None
-    uni_map = universe_allowed(uni_doc) if uni_doc else {}
-
-    # 标的按 (代码, 币种) 收集：显式指定的用 --currency，扫持仓的用持仓自身币种
-    targets = []
-    if args.symbols:
-        targets += [(s.strip().upper(), args.currency) for s in args.symbols.split(",") if s.strip()]
-    if args.symbol:
-        targets.append((args.symbol.upper(), args.currency))
-    if not targets:
-        for p in ib.portfolio():
-            c = p.contract
-            if c.secType == "STK" and p.position > 0:
-                key = (c.symbol.upper(), c.currency)
-                if key not in targets:
-                    targets.append(key)
-    if not targets:
-        sys.exit("未指定标的，且账户无正股持仓 —— 用 `plan AAPL` 或 `--symbols AAPL,MSFT`")
-
-    if uni_doc:
-        print(f"🔒 外部准入白名单：{len(uni_map)} 只标的 | 签字 {uni_doc['approved_by']}"
-              f" | 有效期至 {uni_doc['valid_until']}")
-        print("   本工具只做减法，不评估标的质地、不因白名单自动发单。")
-        before = len(targets)
-        targets = [t for t in targets if t[0] in uni_map]
-        if before > len(targets):
-            print(f"   已过滤 {before - len(targets)} 个不在白名单的标的")
-        if not targets:
-            print("   ⛔ 所有标的都不在白名单内，本计划不产生建议。")
-            finish(ib)
-            return 0
-        print()
-
-    print(f"{env} | 端口 {port} | DTE {args.dte_min}~{args.dte_max}（目标 {args.target_dte}）"
-          f" | 虚值目标 {args.otm:.0%} | 本计划只读，不下单")
-    print()
-
-    items = []
-    for sym, cur in targets:
-        stk, ch = _chain_safe(ib, sym, cur)
-        if not stk:
-            print(f"  {sym:<8} ✗ 无期权链，跳过")
-            continue
-        px = _spot(ib, stk)
-        if not px:
-            print(f"  {sym:<8} ✗ 取不到现价，跳过")
-            continue
-        expiry, dte = _pick_expiry(ch.expirations, args.dte_min, args.dte_max, args.target_dte)
-        if not expiry:
-            print(f"  {sym:<8} ✗ {args.dte_min}~{args.dte_max} 天内无到期日")
-            continue
-
-        have = _shares(ib, sym, cur)
-        cost = _cost_basis(ib, sym, cur)
-        note = []
-        preset_choice = getattr(args, "preset", "auto")
-        # auto 先解析真实 Call，知道每张所需股数后才判断能否备兑。
-        right = "P" if preset_choice == "cash-put" or (preset_choice == "auto" and have <= 0) else "C"
-        preset = "cash-put" if right == "P" else "sell-call"
-        target = px * (1 + args.otm) if right == "C" else px * (1 - args.otm)
-        opt, strike = _resolve_option(ib, sym, expiry, ch.strikes, target, right, cur, ch,
-                                      floor=cost if right == "C" else None)
-        mult = _multiplier(ib, opt) if opt else None
-        if preset_choice == "auto" and right == "C":
-            if not opt:
-                note.append("无可用 Call 合约，自动转为现金担保卖 Put")
-            else:
-                busy_shares = _short_calls_shares(ib, sym, cur) + _pending_short_calls_shares(ib, sym, cur)
-                avail = max(0.0, have - busy_shares)
-                if avail < mult:
-                    note.append(f"净可用 {avail:g} 股不足 1 张 Call（需 {mult:g} 股），自动转为现金担保卖 Put")
-            if not opt or avail < mult:
-                right, preset = "P", "cash-put"
-                opt, strike = _resolve_option(ib, sym, expiry, ch.strikes, px * (1 - args.otm),
-                                              right, cur, ch)
-                mult = _multiplier(ib, opt) if opt else None
-        if not opt:
-            print(f"  {sym:<8} ✗ {expiry} 无可用行权价（该月份阶梯可能不含目标价）")
-            continue
-        prem, src = _quote_premium(ib, opt)
-
-        qty = args.qty
-        if right == "C":
-            busy_shares = _short_calls_shares(ib, sym, cur) + _pending_short_calls_shares(ib, sym, cur)
-            busy = _short_calls(ib, sym, cur) + _pending_short_calls(ib, sym, cur)
-            avail = max(0.0, have - busy_shares)
-            cover = int(avail // mult) if mult else 0
-            if cover < qty:
-                qty = cover
-                if busy:
-                    note.append(f"已有 {busy} 张空头 Call 及挂单占用 {busy_shares:g} 股（净可用 {avail:g} 股只够 {cover} 张）")
-                else:
-                    note.append(f"股数只够 {cover} 张")
-            if cost and strike < cost:
-                note.append(f"行权价低于成本 {cost:.2f}，被行权即锁定亏损")
-            # 年化分母只算本单实际卖出的张数对应的担保市值，
-            # 不能用用户总持仓（多出来的股票与本单收益无关，会稀释/夸大年化）。
-            collat = qty * mult * cost if cost else qty * mult * px
-            collat_txt = f"{qty * mult} 股"
-        else:
-            need_cash = strike * mult * qty
-            ok, cov_note = _coverage(ib, cur, need_cash, require_cash=True)
-            if ok is False:
-                note.append(cov_note)
-            collat, collat_txt = need_cash, f"{fmt(need_cash)} {cur}"
-
-        if qty < 1:
-            print(f"  {sym:<8} ✗ 可卖张数为 0"
-                  + (f"（{note[0]}）" if note else "")
-                  + " —— 用 covered-call 先建仓")
-            continue
-
-        ann = None
-        if prem and collat and dte:
-            ann = prem * mult * qty / collat * 365 / max(dte, 1)
-        otm_pct = (strike - px) / px
-
-        if uni_doc:
-            ok, why = universe_gate(sym, preset, strike, uni_map)
-            if not ok:
-                print(f"  {sym:<8} ✗ 准入白名单拦截：{why}")
-                continue
-
-        items.append(dict(
-            i=len(items) + 1, preset=preset, symbol=sym, currency=cur, expiry=expiry, dte=dte,
-            strike=strike, spot=round(px, 3), otm_pct=round(otm_pct, 4), qty=qty, mult=mult,
-            conId=opt.conId, tradingClass=opt.tradingClass, exchange=opt.exchange,
-            premium=prem, premium_src=src, collateral=round(collat, 2),
-            collateral_txt=collat_txt, ann_return=round(ann, 4) if ann else None,
-            note="；".join(note),
-        ))
-
-    if not items:
-        print("没有可执行的建议。")
-        finish(ib)
-        return 0
-
-    print(f"  {'#':<3}{'策略':<12}{'标的':<8}{'到期日':<11}{'DTE':>5}{'行权价':>10}"
-          f"{'距现价':>9}{'参考权利金':>11}{'年化':>8}  担保")
-    for it in items:
-        prem = f"{it['premium']:.2f}" if it["premium"] else "-"
-        ann = f"{it['ann_return']:.1%}" if it["ann_return"] else "-"
-        print(f"  {it['i']:<3}{it['preset']:<12}{it['symbol']:<8}{it['expiry']:<11}{it['dte']:>5}"
-              f"{it['strike']:>10.2f}{it['otm_pct']:>8.1%}{prem:>11}{ann:>8}  {it['collateral_txt']}")
-        if it["note"]:
-            print(f"     ⚠️ {it['note']}")
-
-    if uni_doc:
-        print(f"\n  🔒 以上建议已受准入白名单约束（签字 {uni_doc['approved_by']}，"
-              f"有效期至 {uni_doc['valid_until']}）；标的质地由上游评估，本工具不判断。")
-
-    if any(not it["premium"] for it in items):
-        print("\n  参考权利金为 - 的条目：该市场无实时/延迟行情（未订阅），需自行定价或加 --net 手工填价。")
-
-    if args.json_out:
-        is_live = _is_live_env(cfg, args, port)
-        out = Path(args.json_out).expanduser()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({
-            "generated": datetime.now().isoformat(timespec="seconds"),
-            "valid_until": (datetime.now() + timedelta(hours=24)).isoformat(timespec="seconds"),
-            "is_live": is_live,
-            "env": env, "port": port, "currencies": sorted({it["currency"] for it in items}),
-            "window": dict(dte_min=args.dte_min, dte_max=args.dte_max, otm=args.otm),
-            "universe": meta(uni_doc) if uni_doc else None,
-            "items": items,
-        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(f"\n  已写入计划文件：{out}")
-        print(f"  执行方式：thetamill run --file {out} --i 1 [--paper]")
-
-    finish(ib)
-    return 0
+    from . import plan_cli
+    return plan_cli.cmd_plan(cfg, args, now=now)
 
 
 def cmd_run(cfg, args):
@@ -1956,21 +1751,67 @@ def cmd_run(cfg, args):
         doc = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         sys.exit(f"计划文件不是合法 JSON：{e}")
+    if not isinstance(doc, dict):
+        sys.exit("计划文件必须是 JSON 对象")
+    if doc.get("recommendation_only") or str(doc.get("schema", "")).startswith("thetamill.roll."):
+        sys.exit("⛔ 展期文件仅供建议，不能通过 run 执行；平旧仓和开新仓必须分别重新复核。")
     port, env = resolve_port(cfg, args)
     is_live = _is_live_env(cfg, args, port)
 
-    # 计划文件有效期校验（默认24小时有效）
-    vu = doc.get("valid_until")
-    if vu and str(vu) < datetime.now().isoformat():
-        sys.exit("⛔ 计划文件已过期，请重新运行 plan 生成最新计划。")
+    # Compare timestamps as instants, not lexicographically across UTC offsets.
+    if "valid_until" in doc:
+        from datetime import timezone
+        vu = doc["valid_until"]
+        try:
+            if not isinstance(vu, str) or not vu.strip():
+                raise ValueError("invalid expiry")
+            expires = datetime.fromisoformat(vu.replace("Z", "+00:00"))
+            if expires.tzinfo is None:
+                # Legacy plans used the machine's local timezone.
+                expires = expires.astimezone()
+            expired = expires.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+        except (ValueError, TypeError, OverflowError):
+            sys.exit("⛔ 计划有效期无效，请重新运行 plan 生成最新计划。")
+        if expired:
+            sys.exit("⛔ 计划文件已过期，请重新运行 plan 生成最新计划。")
+
+    def plan_number(value, name, integer=False):
+        # Legacy order construction uses floats: reject, never round, a value
+        # that cannot survive that boundary unchanged.
+        from decimal import Decimal, InvalidOperation
+        try:
+            if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                raise ValueError("invalid plan number")
+            number = Decimal(str(value))
+            if (not number.is_finite() or number <= 0
+                    or (integer and number != number.to_integral_value())):
+                raise ValueError("invalid plan number")
+            converted = float(number)
+            if not math.isfinite(converted):
+                raise ValueError("unrepresentable plan number")
+            if integer:
+                if Decimal.from_float(converted) != number:
+                    raise ValueError("quantity loses precision")
+                return int(number)
+            if Decimal(str(converted)) != number:
+                raise ValueError("price loses precision")
+            return converted
+        except (InvalidOperation, ValueError, OverflowError):
+            sys.exit(f"⛔ {name}必须是可精确传递的有限正数" + ("且为整数" if integer else ""))
 
     # 跨环境执行锁：实盘生成的计划不能在纸账户跑，反之亦然
     if doc.get("is_live") is not None and doc["is_live"] != is_live:
         sys.exit(f"⛔ 计划文件运行环境（{'实盘' if doc['is_live'] else '纸账户'}）与当前执行环境（{'实盘' if is_live else '纸账户'}）不一致，严禁跨环境执行！")
 
-    items = doc.get("items") or []
-    if not items:
-        sys.exit("计划文件里没有可执行条目")
+    items = doc.get("items")
+    if not isinstance(items, list) or not items:
+        sys.exit("计划文件里没有有效的可执行条目列表")
+    indices = set()
+    for item in items:
+        if (not isinstance(item, dict) or type(item.get("i")) is not int
+                or item["i"] <= 0 or item["i"] in indices):
+            sys.exit("⛔ 计划编号必须是唯一正整数，请重新生成计划。")
+        indices.add(item["i"])
 
     # 计划文件带白名单元信息时，先复验签字与有效期，防止过期计划被执行
     uni = doc.get("universe")
@@ -1989,12 +1830,17 @@ def cmd_run(cfg, args):
         print(f"计划文件含 {len(items)} 条建议（{doc.get('generated', '?')}）：")
         for it in items:
             print(f"  #{it['i']}  {it['preset']:<12}{it['symbol']:<8}{it['expiry']}  "
-                  f"{it['strike']:g}{'C' if it['preset'] != 'cash-put' else 'P'} × {it['qty']}")
+                  f"{plan_number(it['strike'], '计划行权价'):g}"
+                  f"{'C' if it['preset'] != 'cash-put' else 'P'} × {it['qty']}")
         sys.exit("\n用 --i N 指定要执行哪一条。")
 
-    it = next((x for x in items if int(x.get("i", -1)) == int(idx)), None)
+    if type(idx) is not int or idx <= 0:
+        sys.exit("⛔ --i 必须是正整数")
+    it = next((x for x in items if x["i"] == idx), None)
     if not it:
         sys.exit(f"计划里没有 #{idx} 这一条")
+    if "allowed" in it and it["allowed"] is not True:
+        sys.exit("⛔ 该计划条目未通过累计风险预算/证据门禁，请重新生成并复核计划。")
 
     # 二次校验：手工改过计划文件（抬高行权价 / 换标的）也绕不过白名单
     if uni:
@@ -2006,14 +1852,16 @@ def cmd_run(cfg, args):
     # 旧计划未保存完整合约身份，不能重新解析成另一种乘数的合约。
     con_id = it.get("conId")
     mult = _parse_multiplier(it.get("mult"))
+    if mult is not None:
+        mult = plan_number(it["mult"], "计划合约乘数")
     trading_class, exchange = it.get("tradingClass"), it.get("exchange")
     if (type(con_id) is not int or con_id <= 0 or mult is None
             or not isinstance(trading_class, str) or not trading_class.strip()
             or not isinstance(exchange, str) or not exchange.strip()):
         sys.exit("⛔ 计划缺少有效合约身份（conId / mult / tradingClass / exchange），请重新运行 plan 生成。")
 
-    qty = _positive_number(it.get("qty"), "计划期权张数", integer=True)
-    strike = _positive_number(it.get("strike"), "计划行权价")
+    qty = plan_number(it.get("qty"), "计划期权张数", integer=True)
+    strike = plan_number(it.get("strike"), "计划行权价")
     net = it.get("premium") if it.get("premium") else None
     if args.net is not None:
         net = args.net
@@ -2021,7 +1869,7 @@ def cmd_run(cfg, args):
         sys.exit(f"\n⛔ #{idx} 没有可用的参考权利金（该市场无行情），无法自动定价。\n"
                  f"   请手工指定：thetamill run --file {path} --i {idx} --net 5.00\n")
 
-    _positive_number(net, "计划权利金价格")
+    net = plan_number(net, "计划权利金价格")
     print(f"按计划 #{idx} 执行：{it['preset']} {it['symbol']} {it['expiry']} {strike:g} × {qty}")
     ns = argparse.Namespace(
         symbol=it["symbol"], preset=it["preset"], expiry=it["expiry"], k1=strike,
@@ -2029,6 +1877,9 @@ def cmd_run(cfg, args):
         con_id=con_id, multiplier=mult, trading_class=trading_class, exchange=exchange,
         stock_px=args.stock_px, code=args.code, live_ok=args.live_ok,
         paper=args.paper, port=args.port, delayed=args.delayed,
+        account=getattr(args, "account", None),
+        intent=getattr(args, "intent", ""),
+        delivery_evidence=getattr(args, "delivery_evidence", None),
     )
     return cmd_combo(cfg, ns)
 
@@ -2043,9 +1894,26 @@ def cmd_audit(cfg, args):
         if not line:
             continue
         try:
-            rows.append(json.loads(line))
+            row = json.loads(line)
+            if isinstance(row, dict):
+                rows.append(row)
         except json.JSONDecodeError:
             continue
+    selected = getattr(args, "account", None) or cfg.get("account")
+    known_accounts = {r["account"] for r in rows
+                      if isinstance(r.get("account"), str) and r["account"].strip()}
+    if selected is None and len(known_accounts) > 1:
+        sys.exit("审计含多个账户，请用 --account 明确选择；旧记录未知归属不能推断。")
+    if selected is None and len(known_accounts) == 1:
+        selected = next(iter(known_accounts))
+    unknown_count = sum(not isinstance(r.get("account"), str) or not r["account"].strip()
+                        for r in rows)
+    if selected is not None:
+        rows = [r for r in rows if r.get("account") == selected]
+        from .report import mask_account
+        print(f"审计账户：{mask_account(selected)}；排除 {unknown_count} 条未知账户旧记录")
+    elif unknown_count:
+        print("旧审计记录账户归属未知；不用于配额或风险额度计算。")
     if args.today:
         today = datetime.now().strftime("%Y-%m-%d")
         rows = [r for r in rows if str(r.get("ts", "")).startswith(today)]
@@ -2060,6 +1928,222 @@ def cmd_audit(cfg, args):
     return 0
 
 
+# ---------------------------------------------------------------- 只读风险报告
+def cmd_roll_plan(cfg, args):
+    from .roll_cli import cmd_roll_plan as render_plan
+    return render_plan(cfg, args)
+
+
+def _selected_account(ib, cfg, args):
+    from .broker_state import select_account, SnapshotError
+    try:
+        return select_account(ib, getattr(args, "account", None) or cfg.get("account"))
+    except SnapshotError as exc:
+        sys.exit(f"⛔ {exc}")
+
+
+def _timestamped_mid(ib, contract):
+    """Use a timestamped two-sided tick; never relabel a historical close as fresh."""
+    from decimal import Decimal
+    from datetime import timezone
+    try:
+        ticks = ib.reqTickers(contract)
+        if not isinstance(ticks, (list, tuple)) or len(ticks) != 1:
+            return None
+        tick = ticks[0]
+        if getattr(tick, "marketDataType", None) != 1:
+            return None
+        if getattr(getattr(tick, "contract", None), "conId", None) != contract.conId:
+            return None
+        stamp = getattr(tick, "time", None)
+        if not isinstance(stamp, datetime) or stamp.tzinfo is None or stamp.utcoffset() is None:
+            return None
+        age = (datetime.now(timezone.utc) - stamp).total_seconds()
+        if age < -5 or age > 30:
+            return None
+        bid, ask = tick.bid, tick.ask
+        if any(isinstance(v, bool) or not math.isfinite(v) or v <= 0 for v in (bid, ask)) or bid > ask:
+            return None
+        return (Decimal(str(bid)) + Decimal(str(ask))) / 2, stamp, "IB timestamped bid/ask midpoint"
+    except Exception:
+        return None
+
+
+def _risk_snapshot(ib, cfg, args, environment, *, required_currencies=()):
+    from decimal import Decimal
+    from .broker_state import collect_snapshot, PriceQuote, FxQuote
+    account = _selected_account(ib, cfg, args)
+    snapshot = collect_snapshot(ib, account=account, environment=environment)
+    currencies = set(snapshot.cash)
+    for currency in required_currencies:
+        if not isinstance(currency, str) or len(currency.strip()) != 3 or not currency.strip().isascii() or not currency.strip().isalpha():
+            raise ValueError("Required FX currency must be a three-letter code")
+        currencies.add(currency.strip().upper())
+    currencies.update(p.instrument.currency for p in snapshot.positions)
+    currencies.update(t.instrument.currency for t in snapshot.orders)
+    rates, fx_quotes, price_quotes = {snapshot.base_currency: Decimal(1)}, {}, {}
+    for currency in currencies - {snapshot.base_currency}:
+        for symbol, target, invert in ((currency, snapshot.base_currency, False),
+                                       (snapshot.base_currency, currency, True)):
+            try:
+                qualified = ib.qualifyContracts(Contract(secType="CASH", symbol=symbol,
+                                                        currency=target, exchange="IDEALPRO"))
+                if not isinstance(qualified, (list, tuple)) or len(qualified) != 1:
+                    continue
+                pair = qualified[0]
+                if (type(getattr(pair, "conId", None)) is not int or pair.conId <= 0
+                        or pair.secType != "CASH" or pair.symbol != symbol or pair.currency != target):
+                    continue
+                tick = _timestamped_mid(ib, pair)
+                if tick is None:
+                    continue
+                price, stamp, source = tick
+                rate = Decimal(1) / price if invert else price
+                fx_quotes[currency] = FxQuote(currency, rate, stamp, source)
+                rates[currency] = rate
+                break
+            except Exception:
+                continue
+    from dataclasses import replace
+    positions = []
+    for position in snapshot.positions:
+        if position.instrument.sec_type == "STK":
+            tick = _timestamped_mid(ib, Contract(conId=position.instrument.con_id,
+                                               exchange=position.instrument.exchange or "SMART"))
+            if tick is not None:
+                price, stamp, source = tick
+                price_quotes[position.instrument.con_id] = PriceQuote(position.instrument.con_id,
+                                                                      price, stamp, source)
+                position = replace(position, price=price)
+            else:
+                position = replace(position, price=None)
+        positions.append(position)
+    return replace(snapshot, fx=rates, fx_quotes=fx_quotes, price_quotes=price_quotes,
+                   positions=positions)
+
+
+@contextmanager
+def _private_broker_diagnostics():
+    """Do not expose raw broker messages in privacy-preserving reports."""
+    with open(os.devnull, "w", encoding="utf-8") as sink:
+        with redirect_stdout(sink), redirect_stderr(sink):
+            yield
+
+
+def cmd_report(cfg, args):
+    from .report import build_report, render_report, write_report
+    from .risk import summarize, validate_risk_config
+    snapshot, summary, ledger_summary, issues, ib = None, None, None, [], None
+    max_data_age = 30
+    try:
+        port, _ = resolve_port(cfg, args)
+        environment = "live" if _is_live_env(cfg, args, port) else "paper"
+        with _private_broker_diagnostics():
+            ib = connect(cfg, port, readonly=True, args=args)
+            snapshot = _risk_snapshot(ib, cfg, args, environment)
+        # Available budgets are unknown until local reservations are included.
+        # A report never creates an empty ledger that could imply fresh quota.
+        path = _data_dir() / "state.sqlite3"
+        if path.exists():
+            from .state import SubmissionLedger
+            ledger = SubmissionLedger(path, cfg.get("risk", {}).get("day_timezone", "UTC"),
+                                      read_only=True)
+            outstanding = ledger.outstanding_reservations(account=snapshot.account, environment=environment)
+            from .execution import aggregate_reservations
+            reservations = aggregate_reservations(ledger, snapshot.account, environment)
+            limits = validate_risk_config(cfg)
+            max_data_age = limits.max_snapshot_age_seconds or 30
+            summary = summarize(snapshot, reservations=reservations, limits=limits)
+            from .state import day_key_for
+            quota_day = day_key_for(limits.day_timezone or "UTC")
+            quota = ledger.get_day_budget(account=snapshot.account, environment=environment,
+                                          day_key=quota_day) if limits.enabled else None
+            if limits.enabled and (not quota.get("exists") or quota.get("migration_frozen")):
+                issues.append("Daily submission history is unknown or frozen; quota is not available")
+            ledger_summary = {"outstanding": len(outstanding),
+                              "states": [r.state for r in outstanding],
+                              "daily_limits_enabled": limits.enabled,
+                              "quota_day": quota_day if limits.enabled else None,
+                              "quota": quota}
+        else:
+            issues.append("Local intent ledger does not exist; submission history is unknown")
+    except (Exception, SystemExit) as exc:
+        # Broker errors can include raw account IDs even before a snapshot exists.
+        issues.append(f"Snapshot incomplete ({type(exc).__name__}); broker details withheld for privacy")
+    finally:
+        if ib is not None:
+            try:
+                with _private_broker_diagnostics():
+                    finish(ib)
+            except (Exception, SystemExit):
+                issues.append("Broker disconnect incomplete; details withheld for privacy")
+    report = build_report(snapshot, risk_summary=summary, ledger_summary=ledger_summary,
+                          issues=issues, reveal_account=getattr(args, "reveal_account", False),
+                          max_data_age_seconds=max_data_age)
+    text = render_report(report, args.format)
+    if args.output:
+        try:
+            write_report(args.output, text)
+        except OSError as exc:
+            sys.exit(f"报告未写入（不会覆盖既有文件）：{exc}")
+        print(f"报告已创建：{args.output}")
+    else:
+        print(text, end="")
+    return 0 if report["complete"] else 3
+
+
+def cmd_reconcile(cfg, args):
+    """Observe broker identities; never resubmit, cancel or release uncertainty."""
+    from .state import SubmissionLedger, StateError
+    path = _data_dir() / "state.sqlite3"
+    if not path.exists():
+        sys.exit("没有本地提交账本；不会创建空库或推断历史为零")
+    port, _ = resolve_port(cfg, args)
+    environment = "live" if _is_live_env(cfg, args, port) else "paper"
+    ib = connect(cfg, port, readonly=True, args=args)
+    try:
+        account = _selected_account(ib, cfg, args)
+        # Validate the existing schema without creating/migrating an empty DB.
+        SubmissionLedger(path, cfg.get("risk", {}).get("day_timezone", "UTC"), read_only=True)
+        ledger = SubmissionLedger(path, cfg.get("risk", {}).get("day_timezone", "UTC"))
+        trades = ib.reqAllOpenOrders()
+        if not isinstance(trades, (list, tuple)):
+            raise StateError("无法同步券商挂单")
+        if any(not isinstance(getattr(t.order, "account", None), str)
+               or not t.order.account.strip() for t in trades):
+            raise StateError("券商订单账户范围未知，停止对账")
+        scoped = [t for t in trades if t.order.account == account]
+        observed = 0
+        for leg in ledger.list_legs(account=account, environment=environment):
+            matches = [t for t in scoped if getattr(t.order, "orderRef", "") == leg.order_ref
+                       or (leg.perm_id and str(getattr(t.order, "permId", "")) == str(leg.perm_id))]
+            if len(matches) > 1:
+                raise StateError("同一本地腿匹配多个券商订单，停止对账")
+            if matches:
+                trade = matches[0]
+                actual_ref = getattr(trade.order, "orderRef", "")
+                actual_perm = getattr(trade.order, "permId", 0)
+                if (actual_ref and actual_ref != leg.order_ref
+                        or leg.perm_id and actual_perm and str(actual_perm) != str(leg.perm_id)):
+                    raise StateError("券商订单稳定标识互相矛盾，停止对账")
+                ledger.reconcile(account=account, environment=environment,
+                                 order_ref=leg.order_ref,
+                                 perm_id=getattr(trade.order, "permId", None) or None,
+                                 order_id=getattr(trade.order, "orderId", None),
+                                 status="confirmed", broker_status=trade.orderStatus.status)
+                observed += 1
+            else:
+                ledger.reconcile(account=account, environment=environment,
+                                 order_ref=leg.order_ref, status="absent_open_order",
+                                 note="Not in current open orders; this is NOT proof of no submission")
+        print(f"已记录 {observed} 条可确认的券商订单观察；未找到不代表未发送，未解除未知预留。")
+    except StateError as exc:
+        sys.exit(f"对账失败：{exc}")
+    finally:
+        finish(ib)
+    return 0
+
+
 # ---------------------------------------------------------------- 入口
 def _global_flags(parser, hidden=False):
     """全局开关同时挂到顶层与子命令，前写后写都生效（--paper account / account --paper 均可）"""
@@ -2068,6 +2152,7 @@ def _global_flags(parser, hidden=False):
     parser.add_argument("--paper", action="store_true", help=h or "用纸账户端口", **kw)
     parser.add_argument("--port", type=int, help=h or "手动指定端口（覆盖 --paper）", **kw)
     parser.add_argument("--delayed", action="store_true", help=h or "强制使用延迟行情（未订阅实时行情时更快）", **kw)
+    parser.add_argument("--account", help=h or "明确选择账户；多账户会话必填", **kw)
 
 
 def main():
@@ -2107,9 +2192,12 @@ def main():
     o.add_argument("--tif", default="DAY"); o.add_argument("--outside-rth", action="store_true")
     o.add_argument("--currency", default=cfg["default_currency"])
     o.add_argument("--exchange", help="指定交易所，如 SEHK/SMART（默认自动判断）")
+    o.add_argument("--con-id", type=int, help="明确指定期权 conId，仍校验全部经济字段")
     o.add_argument("--multiplier", help="期权乘数，如 10/100/500；用于区分同名合约")
     o.add_argument("--trading-class", help="期权交易类别；用于区分标准、迷你或调整合约")
     o.add_argument("--code", default="", help="复核码，不填只做预检不提交")
+    o.add_argument("--intent", default="", help="执行意图 ID，与 --code 成对使用")
+    o.add_argument("--delivery-evidence", help="逐期权 conId 的已核实交割证据文件")
     o.add_argument("--whatif", action="store_true", help="预估保证金与佣金（需有行情，可能较慢）")
     o.add_argument("--live-ok", action="store_true", help="实盘账户下单必须加此开关（防手滑）")
 
@@ -2124,10 +2212,13 @@ def main():
     cb.add_argument("--qty", type=int, default=1, help="张数（1 张 = 乘数股）")
     cb.add_argument("--currency", default=cfg["default_currency"])
     cb.add_argument("--exchange", help="指定期权交易所，如 SEHK/SMART（默认自动判断）")
+    cb.add_argument("--con-id", type=int, help="明确指定期权 conId，仍校验全部经济字段")
     cb.add_argument("--multiplier", help="期权乘数，如 10/100/500；用于区分同名合约")
     cb.add_argument("--trading-class", help="期权交易类别；用于区分标准、迷你或调整合约")
     cb.add_argument("--stock-px", type=float, help="covered-call 买正股的限价，不填用市价")
     cb.add_argument("--code", default="", help="复核码，不填只做预检")
+    cb.add_argument("--intent", default="", help="执行意图 ID，与 --code 成对使用")
+    cb.add_argument("--delivery-evidence", help="逐期权 conId 的已核实交割证据文件")
     cb.add_argument("--live-ok", action="store_true", help="实盘必须加")
 
     pl = sub.add_parser("plan", help="生成当日卖方建议（只读，不下单）")
@@ -2144,6 +2235,7 @@ def main():
     pl.add_argument("--currency", default=cfg["default_currency"])
     pl.add_argument("--json", dest="json_out", help="把建议写成 JSON，供 run 使用")
     pl.add_argument("--universe", help="可选外部准入白名单 JSON，只做减法过滤（默认关闭）")
+    pl.add_argument("--delivery-evidence", help="逐期权 conId 的已核实交割证据文件")
 
     rn = sub.add_parser("run", help="执行 plan 生成的建议（仍走复核码）")
     rn.set_defaults(func=cmd_run)
@@ -2152,7 +2244,32 @@ def main():
     rn.add_argument("--net", type=float, help="覆盖计划里的权利金（无行情时必填）")
     rn.add_argument("--stock-px", type=float, help="covered-call 买正股的限价")
     rn.add_argument("--code", default="", help="复核码，不填只做预检")
+    rn.add_argument("--intent", default="", help="执行意图 ID，与 --code 成对使用")
+    rn.add_argument("--delivery-evidence", help="逐期权 conId 的已核实交割证据文件")
     rn.add_argument("--live-ok", action="store_true", help="实盘必须加")
+
+    roll = sub.add_parser("roll-plan", help="只读展期建议；独立文件不可通过 run 执行")
+    roll.set_defaults(func=cmd_roll_plan)
+    roll.add_argument("--con-id", type=int, required=True, help="现有空头期权 conId")
+    roll.add_argument("--qty", type=int, required=True, help="建议买回/新开的张数，各腿按真实乘数计算")
+    roll.add_argument("--candidate-con-id", type=int, action="append", default=[],
+                      help="明确候选期权 conId，可重复；不自动放宽或截断候选范围")
+    roll.add_argument("--dte-min", type=int, default=21)
+    roll.add_argument("--dte-max", type=int, default=45)
+    roll.add_argument("--cost-floor", help="净收支下限（交易币种；未扣未知费用）")
+    roll.add_argument("--max-entry", help="候选行权价上限")
+    roll.add_argument("--universe", help="外部准入白名单，只做减法")
+    roll.add_argument("--delivery-evidence", help="逐期权 conId 的已核实交割证据文件；不得按乘数猜测")
+    roll.add_argument("--format", choices=["terminal", "json", "markdown"], default="terminal")
+    roll.add_argument("--output", help="创建本地建议文件，拒绝覆盖")
+
+    sub.add_parser("reconcile", help="只读券商对账；不重发、不撤单、不自动解除未知预留").set_defaults(func=cmd_reconcile)
+
+    report = sub.add_parser("report", help="只读风险快照（缺失数据明确标记未知）")
+    report.set_defaults(func=cmd_report)
+    report.add_argument("--format", choices=["terminal", "json", "markdown"], default="terminal")
+    report.add_argument("--output", help="创建本地文件；拒绝覆盖既有文件")
+    report.add_argument("--reveal-account", action="store_true", help="显式显示完整账户；默认脱敏")
 
     au = sub.add_parser("audit", help="查看审计日志")
     au.set_defaults(func=cmd_audit)

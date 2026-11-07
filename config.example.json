@@ -7,5 +7,14 @@
   "default_exchange": "SMART",
   "default_currency": "USD",
   "connect_timeout": 4,
-  "live_enabled": false
+  "live_enabled": false,
+  "account": null,
+  "risk": {
+    "enabled": false,
+    "day_timezone": "Asia/Hong_Kong",
+    "max_daily_submissions": null,
+    "max_snapshot_age_seconds": 30,
+    "per_underlying": {"amount": null, "ratio": null},
+    "portfolio": {"amount": null, "ratio": null}
+  }
 }

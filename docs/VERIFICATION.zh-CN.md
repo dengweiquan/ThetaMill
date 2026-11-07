@@ -1,5 +1,36 @@
 # 验证记录与证据边界
 
+## 新一轮工程验收状态（2026-11-07）
+
+以下为当前可追溯的离线检查点，不覆盖后面的历史券商观察，也不代表 A–F 已全部完成。
+
+| 固定候选 | 验证范围 | 实际结果 | 限制 |
+|---|---|---|---|
+| `834f1e60491c9bf62dbff8be246759404b0e7966` | A 合约身份、真实乘数、覆盖/资金及执行安全；全新浅 clone | Python 3.10.20 / 3.13.12 各 111 项源码测试及 111 项安装 wheel 测试通过；确认从 site-packages 导入 | 仅离线；PR #1 尚未合并，不是 main 上线或券商验收 |
+| `f321eb0832850db0c699909202d40580e9493c32` | 公共快照、Decimal 风险、纯展期引擎及不可变行情/FX 证据基础 | 全新 clone 构建 wheel，显式安装实际依赖 ib_async 2.1.0 后 Python 3.10 / 3.13 各 300 项安装包测试通过 | 不含未提交的账本/执行适配层/CLI 接线；初次缺依赖的失败运行已废弃 |
+| 本地完整工作区候选 | B–E 全量集成（权威 SQLite 账本、配额、净减例外、报告、展期建议、CLI 统一执行协议） | Python 3.13.12 / 3.10.20 各 778 项离线测试全绿（0 错误 0 失败）；独立构建 wheel `thetamill-0.1.0-py3-none-any.whl`（SHA-256 `6a707134e06caf52f727c6e8640cd828b3bd3d7ab7b9ea8153787280cea00329`），隔离纯净虚拟环境安装并验证 16 个子命令帮助正常 | 仅离线 Mock 与真实 ib_async 合约对象离线测试；零真实券商网络连接，未执行纸账户或实盘下单/撤单 |
+
+第二个检查点 wheel SHA-256：`3c39c164519885b19016ac29011b8d425208fed10fcf6986f3db8d8fc6c9b7f2`。第三个完整集成候选 wheel SHA-256：`6a707134e06caf52f727c6e8640cd828b3bd3d7ab7b9ea8153787280cea00329`。构建存在 setuptools 既有 license 元数据弃用警告，不宣称零警告。
+
+本地完整工作区集成测试矩阵（778 项，双环境 100% 通过）：
+- `test_account_scope.py` (20)
+- `test_broker_state.py` (27)
+- `test_cli_logic.py` (38)
+- `test_contract_identity.py` (25)
+- `test_execution_safety.py` (34)
+- `test_execution_state.py` (59)
+- `test_plan_cli.py` (59)
+- `test_planning.py` (60)
+- `test_report.py` (31)
+- `test_risk_limits.py` (78)
+- `test_roll.py` (88)
+- `test_roll_cli.py` (67)
+- `test_state.py` (59)
+- `test_submission_cli.py` (100)
+- `test_submission_integration.py` (8)
+- `test_universe.py` (14)
+所有公共执行路径（`cmd_order`、`cmd_combo`、`cmd_run`）已完全统一代理至 `submission_cli.execute_prepared`，旧 `_code` 回退与直接 `ib.placeOrder` 完全移除；正向 handoff 严格核验 11 项规范合约身份字段；全新账本净减风险例外保留迁移冻结门禁。
+
 ## 当前阅读口径（Stage A 文档纠偏）
 
 以下第 1–14 节保留 v0.1.0 以来的历史记录，不是本次修订重跑的券商证据。本次文档修改没有连接 Gateway、提交、撤单或验证成交。历史订单号、报价与账户余额仅指原记录中的时点，不能推定当前账户状态或新版风控已经通过同等验收；历史记录未提供可独立复现的完整原始回执和对应候选 SHA，须按这一限制使用。
