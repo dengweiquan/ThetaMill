@@ -46,16 +46,19 @@ pip install -e .
 建配置（示例默认锁死实盘）：
 
 ```bash
-cp config.example.json config.json      # 当前目录优先
+cp config.example.json config.json      # 项目根目录，任意工作目录都能找到
 # 或：mkdir -p ~/.config/thetamill && cp config.example.json ~/.config/thetamill/config.json
+# 或：export THETAMILL_CONFIG=/path/to/config.json
 ```
 
-配置文件查找顺序：`$THETAMILL_CONFIG` → `./config.json` → `~/.config/thetamill/config.json`
+配置文件查找顺序：`$THETAMILL_CONFIG` → `./config.json` → 项目根 `config.json` → `~/.config/thetamill/config.json`
 审计日志：`$THETAMILL_DATA` → `~/.local/share/thetamill/orders.jsonl`
 
 ---
 
 ## 快速上手
+
+> 不写 `--paper` 时会自动识别当前登录的网关，输出首行标明用的是纸账户还是实盘；两个账户都开着时默认实盘，建议显式指定。
 
 ```bash
 # 1. 网关通了吗
@@ -94,7 +97,7 @@ thetamill --paper audit --today
 | `run` | 执行 `plan` 生成的建议 | 需复核码 |
 | `cancel` | 撤单 | — |
 
-全局参数：`--paper`、`--port N`、`--delayed`
+全局参数：`--paper`、`--port N`、`--delayed`，写在子命令前后都生效（`thetamill --paper account` 与 `thetamill account --paper` 等价）。
 
 ---
 

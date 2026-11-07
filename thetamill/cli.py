@@ -16,19 +16,21 @@ import hashlib
 import json
 import logging
 import os
+import socket
 import sys
 from datetime import datetime, date
 from pathlib import Path
 
 
 def _cfg_path() -> Path:
-    """配置文件查找顺序：$THETAMILL_CONFIG → 当前目录 config.json → ~/.config/thetamill/"""
+    """查找顺序：$THETAMILL_CONFIG → 当前目录 → 项目根目录 → ~/.config/thetamill/"""
     env = os.environ.get("THETAMILL_CONFIG")
     if env:
         return Path(env).expanduser()
-    local = Path.cwd() / "config.json"
-    if local.exists():
-        return local
+    for c in (Path.cwd() / "config.json",
+              Path(__file__).resolve().parent.parent / "config.json"):
+        if c.exists():
+            return c
     return Path.home() / ".config" / "thetamill" / "config.json"
 
 
@@ -51,16 +53,35 @@ from ib_async import (IB, Stock, Option, Contract,  # noqa: E402
 # ---------------------------------------------------------------- 配置 / 连接
 def load_cfg():
     if not CFG_PATH.exists():
-        sys.exit(f"缺少配置文件: {CFG_PATH}")
+        sys.exit(f"缺少配置文件: {CFG_PATH}\n"
+                 f"   把 config.example.json 复制到该路径，或用环境变量指定：\n"
+                 f"   THETAMILL_CONFIG=/path/to/config.json thetamill status")
     return json.loads(CFG_PATH.read_text(encoding="utf-8"))
 
 
+def _port_open(host, port, timeout=0.35):
+    """只做 TCP 握手，不发任何报文（Gateway 会记一条无害的断开日志）"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def resolve_port(cfg, args):
+    """未显式指定账户时，按当前实际登录的网关自动选择，避免连错账户"""
     if getattr(args, "port", None):
         return args.port, "自定义"
     if getattr(args, "paper", False):
         return cfg["paper_port"], "纸账户(Paper)"
-    return cfg["live_port"], "实盘(Live)"
+    host = cfg.get("host", "127.0.0.1")
+    live, paper = cfg["live_port"], cfg["paper_port"]
+    lo, po = _port_open(host, live), _port_open(host, paper)
+    if po and not lo:
+        return paper, "纸账户(Paper·自动识别)"
+    if lo and not po:
+        return live, "实盘(Live·自动识别)"
+    return live, "实盘(Live)"
 
 
 ROUTINE_CODES = {200, 2100, 2104, 2106, 2107, 2108, 2109, 2110, 2119, 2150, 2152, 2158, 2168, 2169}
@@ -458,7 +479,7 @@ def _live_guard(cfg, args, port):
                  "   确实要开放实盘委托，把 live_enabled 改成 true 再来。\n")
     if not getattr(args, "live_ok", False):
         sys.exit("\n⛔ 这是实盘账户，委托需要显式加 --live-ok\n"
-                 "   例：./ib order AAPL --action BUY --qty 1 --type LMT --limit 180 --live-ok\n"
+                 "   例：thetamill order AAPL --action BUY --qty 1 --type LMT --limit 180 --live-ok\n"
                  "   要回到模拟账户，改加 --paper。\n")
 
 
@@ -1108,6 +1129,15 @@ def cmd_audit(cfg, args):
 
 
 # ---------------------------------------------------------------- 入口
+def _global_flags(parser, hidden=False):
+    """全局开关同时挂到顶层与子命令，前写后写都生效（--paper account / account --paper 均可）"""
+    kw = {"default": argparse.SUPPRESS} if hidden else {}
+    h = argparse.SUPPRESS if hidden else None
+    parser.add_argument("--paper", action="store_true", help=h or "用纸账户端口", **kw)
+    parser.add_argument("--port", type=int, help=h or "手动指定端口（覆盖 --paper）", **kw)
+    parser.add_argument("--delayed", action="store_true", help=h or "强制使用延迟行情（未订阅实时行情时更快）", **kw)
+
+
 def main():
     cfg = load_cfg()
     p = argparse.ArgumentParser(
@@ -1115,9 +1145,7 @@ def main():
         description="ThetaMill — 低频期权卖方工具箱（IBKR / TWS API），实盘下单需复核码",
         epilog="完整文档见 docs/DESIGN.zh-CN.md；建议先在纸账户（--paper）跑通全链路。",
     )
-    p.add_argument("--paper", action="store_true", help="用纸账户端口")
-    p.add_argument("--port", type=int, help="手动指定端口（覆盖 --paper）")
-    p.add_argument("--delayed", action="store_true", help="强制使用延迟行情（未订阅实时行情时更快）")
+    _global_flags(p)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status", help="探测本机哪条网关通了").set_defaults(func=cmd_status)
@@ -1192,6 +1220,12 @@ def main():
 
     x = sub.add_parser("cancel", help="撤单"); x.set_defaults(func=cmd_cancel)
     x.add_argument("order_id", type=int)
+
+    seen = set()
+    for sp in sub.choices.values():
+        if id(sp) not in seen:
+            _global_flags(sp, hidden=True)
+            seen.add(id(sp))
 
     args = p.parse_args()
     sys.exit(args.func(cfg, args))

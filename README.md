@@ -46,18 +46,19 @@ pip install -e .
 Create a config file (the example is safe by default — live trading is disabled):
 
 ```bash
-cp config.example.json config.json      # picked up from the current directory
+cp config.example.json config.json      # project root — works from any working directory
 # or: mkdir -p ~/.config/thetamill && cp config.example.json ~/.config/thetamill/config.json
+# or: export THETAMILL_CONFIG=/path/to/config.json
 ```
 
-Config lookup order: `$THETAMILL_CONFIG` → `./config.json` → `~/.config/thetamill/config.json`.
+Config lookup order: `$THETAMILL_CONFIG` → `./config.json` → project-root `config.json` → `~/.config/thetamill/config.json`.
 Audit log location: `$THETAMILL_DATA` → `~/.local/share/thetamill/orders.jsonl`.
 
 ---
 
 ## Quick start
 
-Every command below uses `--paper` (the paper account, port 4002). Drop the flag to point at the live account.
+Every command below uses `--paper` (port 4002). Without it the CLI auto-detects which gateway is logged in and prints the chosen account on the first line. Global flags work before or after the subcommand.
 
 ```bash
 # 1. Is the gateway reachable?
@@ -96,7 +97,7 @@ thetamill --paper audit --today
 | `run` | Execute a plan item | approval code |
 | `cancel` | Cancel a working order | — |
 
-Global flags: `--paper`, `--port N`, `--delayed`.
+Global flags: `--paper`, `--port N`, `--delayed` — accepted before or after the subcommand (e.g. `thetamill account --paper`).
 
 ---
 
