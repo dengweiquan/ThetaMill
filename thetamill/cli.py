@@ -44,7 +44,7 @@ ORDER_LOG = _data_dir() / "orders.jsonl"
 logging.getLogger("ib_async").setLevel(logging.CRITICAL)
 logging.getLogger("ib_insync").setLevel(logging.CRITICAL)
 
-from ib_async import (IB, Stock, Option, Contract, ComboLeg,  # noqa: E402
+from ib_async import (IB, Stock, Option, Contract,  # noqa: E402
                       MarketOrder, LimitOrder, StopOrder)
 
 
@@ -828,23 +828,6 @@ def _pick_expiry(exps, dmin, dmax, target):
     win = [(e, d) for e, d in rows if dmin <= d <= dmax] or rows
     win.sort(key=lambda x: abs(x[1] - target))
     return win[0]
-
-
-def _pick_strike(strikes, target, right, floor=None):
-    """C：取 ≥ 目标的最小一档（可被 floor 抬高到成本价之上）；P：取 ≤ 目标的最大一档"""
-    ks = sorted(float(x) for x in strikes)
-    if not ks:
-        return None
-    if right == "C":
-        t = target if floor is None else max(target, floor)
-        for k in ks:
-            if k >= t - 1e-9:
-                return k
-        return ks[-1]
-    for k in reversed(ks):
-        if k <= target + 1e-9:
-            return k
-    return ks[0]
 
 
 def _cost_basis(ib, symbol, currency):
