@@ -96,6 +96,8 @@ class Quote:
             raise RollError("quote bid must be non-negative")
         if ask is not None and ask < 0:
             raise RollError("quote ask must be non-negative")
+        if bid is not None and ask is not None and bid > ask:
+            raise RollError("crossed quote: bid must not exceed ask")
         object.__setattr__(self, "bid", bid)
         object.__setattr__(self, "ask", ask)
 
@@ -111,6 +113,9 @@ class RollConstraints:
     allowed_symbols: frozenset = frozenset()   # universe whitelist; empty = no filter
     max_quote_age: timedelta = timedelta(minutes=5)
     valid_for: timedelta = timedelta(minutes=15)  # recommendation lifetime
+    # Appended for positional-call compatibility; quotes and holdings have
+    # separate freshness policies. Snapshot future skew is limited to 5 seconds.
+    max_snapshot_age: timedelta = timedelta(seconds=30)
 
     def __post_init__(self):
         for name in ("min_dte", "max_dte"):
@@ -141,7 +146,7 @@ class RollConstraints:
             normalized.add(s.strip().upper())
         object.__setattr__(self, "allowed_symbols", frozenset(normalized))
 
-        for name in ("max_quote_age", "valid_for"):
+        for name in ("max_quote_age", "valid_for", "max_snapshot_age"):
             value = getattr(self, name)
             if not isinstance(value, timedelta) or value.total_seconds() <= 0:
                 raise RollError(f"{name} must be a positive timedelta")
@@ -257,6 +262,60 @@ def _validate_quantity(quantity) -> int:
     if isinstance(quantity, bool) or type(quantity) is not int or quantity <= 0:
         raise RollError("quantity must be a positive finite integer (bool/fraction rejected)")
     return quantity
+
+
+def _validate_snapshot_inputs(snapshot: Snapshot, candidates: Sequence[Instrument],
+                              now_utc: datetime, constraints: RollConstraints) -> None:
+    captured = snapshot.captured_at
+    if not isinstance(captured, datetime) or captured.tzinfo is None:
+        raise RollError("snapshot timestamp must include a timezone")
+    age = now_utc - captured.astimezone(timezone.utc)
+    if age < -_CLOCK_SKEW:
+        raise RollError("snapshot timestamp is in the future")
+    if age > constraints.max_snapshot_age:
+        raise RollError("snapshot is stale (older than max_snapshot_age)")
+
+    identities = {}
+    signs = {}
+
+    def check_identity(inst):
+        if not isinstance(inst, Instrument):
+            return  # malformed candidates retain their ordinary rejected row
+        if type(inst.con_id) is not int or inst.con_id <= 0:
+            return
+        # Routing exchange is not an economic field. Numeric identity fields
+        # are compared by value, not Decimal spelling (100 == 100.0).
+        def number(value):
+            try:
+                return _finite_decimal(value, "identity number")
+            except RollError:
+                return repr(value)
+        identity = (inst.sec_type, inst.underlying_id, inst.symbol, inst.currency,
+                    number(inst.multiplier), inst.right, number(inst.strike),
+                    inst.expiry, inst.trading_class)
+        previous = identities.setdefault(inst.con_id, identity)
+        if previous != identity:
+            raise RollError(f"inconsistent economic identity for conId={inst.con_id}")
+
+    for p in snapshot.positions:
+        check_identity(p.instrument)
+        value = _finite_quantity(p.quantity, "position quantity")
+        if p.instrument.sec_type == "OPT" and value != value.to_integral_value():
+            raise RollError("position quantity is not an integer number of contracts")
+        if value:
+            present = signs.setdefault(p.instrument.con_id, set())
+            present.add(value > 0)
+            if len(present) > 1:
+                raise RollError("conflicting signed position rows for the same conId")
+    for order in snapshot.orders:
+        check_identity(order.instrument)
+        value = _finite_quantity(order.remaining, "pending order remaining")
+        if value < 0:
+            raise RollError("negative pending order remaining")
+        if order.instrument.sec_type == "OPT" and value != value.to_integral_value():
+            raise RollError("pending option remaining must be whole contracts")
+    for candidate in candidates:
+        check_identity(candidate)
 
 
 def _resolve_short(snapshot: Snapshot, con_id: int, qty: int) -> Instrument:
@@ -439,6 +498,7 @@ def build_roll_recommendation(
         deliverables.add(d)
     deliverables = frozenset(deliverables)
 
+    _validate_snapshot_inputs(snapshot, candidates, now_utc, constraints)
     old = _resolve_short(snapshot, con_id, qty)
     # The close leg itself needs per-contract evidence. Confirming a candidate, or the
     # shared underlying, does NOT establish the old short's deliverable structure.
@@ -490,6 +550,7 @@ def build_roll_recommendation(
             "max_entry": _s(constraints.max_entry),
             "allowed_symbols": sorted(constraints.allowed_symbols),
             "max_quote_age_seconds": int(constraints.max_quote_age.total_seconds()),
+            "max_snapshot_age_seconds": constraints.max_snapshot_age.total_seconds(),
         },
         # confirmed_deliverables is a set of OPTION conIds with independently verified
         # stock-only delivery. Never reuse an underlying conId as evidence for a
@@ -667,6 +728,9 @@ def validate_recommendation(doc, *, now: datetime | None = None) -> tuple[bool, 
         problems.append("expires_at must be after created_at")
 
     now_utc = _now_utc(now)
+    if created is not None and created.tzinfo is not None:
+        if created.astimezone(timezone.utc) - now_utc > _CLOCK_SKEW:
+            problems.append("created_at is in the future; recommendation is not yet valid")
     if expires is not None and expires.tzinfo is not None:
         if now_utc >= expires.astimezone(timezone.utc):
             problems.append("recommendation has expired; regenerate before acting (do not act on it)")

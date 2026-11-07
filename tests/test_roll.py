@@ -202,7 +202,7 @@ class CandidateIdentityTests(unittest.TestCase):
         self.assertIn("symbol does not match", joined_reasons(doc))
 
     def test_same_contract_as_short_rejected(self):
-        doc = build(candidates=[candidate(con_id=20, expiry=NEW_EXPIRY)])
+        doc = build(candidates=[old_inst()])
         self.assertIn("same contract as the existing short", joined_reasons(doc))
 
     def test_malformed_identity_rejected(self):
@@ -645,6 +645,88 @@ class SchemaAndValidationTests(unittest.TestCase):
             build(constraints="strict")
         with self.assertRaises(RollError):
             build(now=datetime(2026, 11, 7))  # naive timestamp
+
+
+class ReviewSafetyTests(unittest.TestCase):
+    def test_snapshot_age_policy_boundaries_and_override(self):
+        for age in (timedelta(seconds=31), timedelta(days=365), -timedelta(seconds=6)):
+            with self.subTest(age=age), self.assertRaises(RollError):
+                build(snapshot=make_snapshot(captured_at=NOW-age))
+        for age in (timedelta(seconds=30), -timedelta(seconds=5)):
+            with self.subTest(age=age):
+                self.assertEqual(build(snapshot=make_snapshot(captured_at=NOW-age))[
+                    "recommended_count"], 1)
+        constraints = RollConstraints(max_snapshot_age=timedelta(minutes=2))
+        doc = build(snapshot=make_snapshot(captured_at=NOW-timedelta(seconds=60)),
+                    constraints=constraints)
+        self.assertEqual(doc["constraints"]["max_snapshot_age_seconds"], 120)
+
+    def test_invalid_snapshot_age_policy(self):
+        for bad in (None, True, 30, timedelta(0), timedelta(seconds=-1)):
+            with self.subTest(value=bad), self.assertRaises(RollError):
+                RollConstraints(max_snapshot_age=bad)
+
+    def test_contradictory_old_position_identity_fails_closed(self):
+        positions = (Position(old_inst(), D(-1), D(2)),
+                     Position(old_inst(D(500)), D(-1), D(2)))
+        with self.assertRaises(RollError):
+            build(snapshot=make_snapshot(positions=positions))
+
+    def test_same_conid_economic_fields_consistent_across_all_inputs(self):
+        changes = ({"underlying_id": 11}, {"symbol": "MSFT"}, {"currency": "EUR"},
+                   {"right": "C"}, {"strike": D(41)}, {"expiry": "20270219"},
+                   {"multiplier": D(200)}, {"trading_class": "AAPL1"}, {"sec_type": "STK"})
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(RollError):
+                build(snapshot=make_snapshot(orders=(pending_buy(D(1), old_inst(**change)),)))
+            with self.subTest(candidate_change=change), self.assertRaises(RollError):
+                build(candidates=[candidate(), candidate(**change)])
+        with self.assertRaises(RollError):
+            build(snapshot=make_snapshot(positions=(Position(old_inst(), D(-5), D(2)),
+                                                   Position(candidate(multiplier=D(500)), D(-1), D(2)))))
+        with self.assertRaises(RollError):
+            build(snapshot=make_snapshot(orders=(pending_buy(D(1), candidate(multiplier=D(500))),)))
+
+    def test_economic_identity_ignores_routing_and_numeric_spelling(self):
+        equivalent = old_inst(D("100.0"), exchange="CBOE")
+        doc = build(snapshot=make_snapshot(
+            orders=(pending_buy(D(1), equivalent),)))
+        self.assertEqual(doc["recommended_count"], 1)
+        # Preserve the previous positional API by appending the new policy.
+        constraints = RollConstraints(None, None, None, None, frozenset(),
+                                      timedelta(minutes=5), timedelta(minutes=15))
+        self.assertEqual(constraints.max_snapshot_age, timedelta(seconds=30))
+
+    def test_opposite_signed_rows_do_not_create_close_capacity(self):
+        with self.assertRaises(RollError):
+            build(snapshot=make_snapshot(positions=(Position(old_inst(), D(-5), D(2)),
+                                                   Position(old_inst(), D(1), D(2)))))
+
+    def test_each_pending_remaining_validated_before_sum(self):
+        for values in ((D(3), D(-3)), (D("0.5"), D("0.5")), (D("NaN"), D(1))):
+            with self.subTest(values=values), self.assertRaises(RollError):
+                build(snapshot=make_snapshot(short=D(-2),
+                      orders=tuple(pending_buy(v) for v in values)))
+        with self.assertRaises(RollError):
+            build(snapshot=make_snapshot(positions=(Position(old_inst(), D("-1.5"), D(2)),
+                                                   Position(old_inst(), D("-0.5"), D(2)))))
+
+    def test_crossed_quote_cannot_establish_cost_floor(self):
+        with self.assertRaises(RollError):
+            build(quotes={20: quote(20, D(10), D(1)), 30: quote(30, D(10), D(1))},
+                  constraints=RollConstraints(cost_floor=D(1000)))
+        self.assertEqual(quote(30, D(0), D(0)).bid, D(0))
+        self.assertEqual(quote(30, D(3), D(3)).bid, D(3))
+
+    def test_future_created_recommendation_invalid(self):
+        doc = build()
+        doc["created_at"] = (NOW+timedelta(hours=1)).isoformat()
+        doc["expires_at"] = (NOW+timedelta(hours=2)).isoformat()
+        self.assertFalse(validate_recommendation(doc, now=NOW)[0])
+        doc["created_at"] = (NOW+timedelta(seconds=5)).isoformat()
+        self.assertTrue(validate_recommendation(doc, now=NOW)[0])
+        doc["created_at"] = (NOW+timedelta(seconds=6)).isoformat()
+        self.assertFalse(validate_recommendation(doc, now=NOW)[0])
 
 
 if __name__ == "__main__":
