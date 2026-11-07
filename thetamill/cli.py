@@ -46,15 +46,80 @@ ORDER_LOG = _data_dir() / "orders.jsonl"
 logging.getLogger("ib_async").setLevel(logging.CRITICAL)
 logging.getLogger("ib_insync").setLevel(logging.CRITICAL)
 
-from ib_async import (IB, Stock, Option, Contract,  # noqa: E402
-                      MarketOrder, LimitOrder, StopOrder)
+try:
+    from ib_async import (IB, Stock, Option, Contract,  # noqa: E402
+                          MarketOrder, LimitOrder, StopOrder)
+except ImportError:
+    class Contract:  # type: ignore[no-redef]
+        def __init__(self, *args, secType="", symbol="", currency="", exchange="", conId=0, comboLegs=None, **kwargs):
+            self.secType = secType
+            self.symbol = symbol
+            self.currency = currency
+            self.exchange = exchange
+            self.conId = conId
+            self.comboLegs = comboLegs or []
+            self.localSymbol = kwargs.get("localSymbol", symbol)
+            self.primaryExchange = kwargs.get("primaryExchange", exchange)
+
+    class Stock(Contract):  # type: ignore[no-redef]
+        def __init__(self, symbol="", exchange="", currency=""):
+            super().__init__(secType="STK", symbol=symbol, exchange=exchange, currency=currency)
+
+    class Option(Contract):  # type: ignore[no-redef]
+        def __init__(self, symbol="", lastTradeDateOrContractMonth="", strike=0.0, right="",
+                     exchange="", multiplier="100", currency="", tradingClass=""):
+            super().__init__(secType="OPT", symbol=symbol, exchange=exchange, currency=currency)
+            self.lastTradeDateOrContractMonth = lastTradeDateOrContractMonth
+            self.strike = float(strike) if strike else 0.0
+            self.right = right
+            self.multiplier = multiplier
+            self.tradingClass = tradingClass
+
+    class Order:
+        def __init__(self, action="", totalQuantity=0, orderType="", lmtPrice=None, **kwargs):
+            self.action = action
+            self.totalQuantity = totalQuantity
+            self.orderType = orderType
+            self.lmtPrice = lmtPrice
+            self.tif = "DAY"
+            self.outsideRth = False
+
+    class MarketOrder(Order):  # type: ignore[no-redef]
+        def __init__(self, action="", totalQuantity=0):
+            super().__init__(action=action, totalQuantity=totalQuantity, orderType="MKT")
+
+    class LimitOrder(Order):  # type: ignore[no-redef]
+        def __init__(self, action="", totalQuantity=0, lmtPrice=None):
+            super().__init__(action=action, totalQuantity=totalQuantity, orderType="LMT", lmtPrice=lmtPrice)
+
+    class StopOrder(Order):  # type: ignore[no-redef]
+        def __init__(self, action="", totalQuantity=0, stopPrice=None):
+            super().__init__(action=action, totalQuantity=totalQuantity, orderType="STP")
+            self.stopPrice = stopPrice
+
+    class IB:  # type: ignore[no-redef]
+        errorEvent = []
+        def disconnect(self):
+            pass
 from .universe import (load_universe, universe_allowed, universe_gate,  # noqa: E402
                        validate, meta)
 
 
+DEFAULT_CFG = {
+    "default_currency": "USD",
+    "host": "127.0.0.1",
+    "live_port": 4001,
+    "paper_port": 4002,
+    "client_id": 1,
+    "live_enabled": False,
+}
+
+
 # ---------------------------------------------------------------- 配置 / 连接
-def load_cfg():
+def load_cfg(required=True):
     if not CFG_PATH.exists():
+        if not required:
+            return dict(DEFAULT_CFG)
         sys.exit(f"缺少配置文件: {CFG_PATH}\n"
                  f"   把 config.example.json 复制到该路径，或用环境变量指定：\n"
                  f"   THETAMILL_CONFIG=/path/to/config.json thetamill status")
@@ -248,6 +313,8 @@ def fmt(v, nd=2):
 
 # ---------------------------------------------------------------- 查询类
 def cmd_status(cfg, args):
+    if not CFG_PATH.exists():
+        load_cfg(required=True)
     print(f"主机 {cfg['host']} — 逐端口探测：")
     names = {4001: "Live Gateway", 4002: "Paper Gateway", 7496: "Live TWS", 7497: "Paper TWS"}
     alive = []
@@ -274,6 +341,8 @@ def cmd_status(cfg, args):
 
 
 def cmd_account(cfg, args):
+    if not CFG_PATH.exists():
+        load_cfg(required=True)
     port, env = resolve_port(cfg, args)
     ib = connect(cfg, port, readonly=True)
     print(f"环境：{env}  端口：{port}")
@@ -292,6 +361,8 @@ def cmd_account(cfg, args):
 
 
 def cmd_positions(cfg, args):
+    if not CFG_PATH.exists():
+        load_cfg(required=True)
     port, env = resolve_port(cfg, args)
     ib = connect(cfg, port, readonly=True)
     ib.sleep(2)
@@ -314,6 +385,8 @@ def cmd_positions(cfg, args):
 
 
 def cmd_quote(cfg, args):
+    if not CFG_PATH.exists():
+        load_cfg(required=True)
     port, env = resolve_port(cfg, args)
     ib = connect(cfg, port, readonly=True, force_delayed=getattr(args, "delayed", False))
     c = _stock(ib, args.symbol, args.currency, getattr(args, "exchange", None))
@@ -354,6 +427,8 @@ def _opt_params(ib, symbol, currency):
 
 
 def cmd_chain(cfg, args):
+    if not CFG_PATH.exists():
+        load_cfg(required=True)
     port, env = resolve_port(cfg, args)
     ib = connect(cfg, port, readonly=True, force_delayed=getattr(args, "delayed", False))
     stk, ch = _opt_params(ib, args.symbol.upper(), args.currency)
@@ -428,6 +503,8 @@ def cmd_chain(cfg, args):
 
 
 def cmd_orders(cfg, args):
+    if not CFG_PATH.exists():
+        load_cfg(required=True)
     port, env = resolve_port(cfg, args)
     ib = connect(cfg, port, readonly=True)
     ib.sleep(1.5)
@@ -452,6 +529,8 @@ def cmd_orders(cfg, args):
 
 
 def cmd_cancel(cfg, args):
+    if not CFG_PATH.exists():
+        load_cfg(required=True)
     port, env = resolve_port(cfg, args)
     ib = connect(cfg, port, readonly=False)
     ib.sleep(1.5)
@@ -486,6 +565,8 @@ def _live_guard(cfg, args, port):
 
 
 def cmd_order(cfg, args):
+    if not CFG_PATH.exists():
+        load_cfg(required=True)
     port, env = resolve_port(cfg, args)
     _live_guard(cfg, args, port)
     ib = connect(cfg, port, readonly=False)
@@ -495,15 +576,30 @@ def cmd_order(cfg, args):
         for req in ("expiry", "strike", "right"):
             if not getattr(args, req):
                 sys.exit(f"期权单缺少 --{req}")
+        exchange = getattr(args, "exchange", None) or ("SEHK" if args.currency == "HKD" else "SMART")
         contract = Option(args.symbol.upper(), args.expiry, args.strike, args.right.upper(),
-                          "SMART", currency=args.currency)
+                          exchange, currency=args.currency)
         label = f"{args.symbol.upper()} {args.expiry} {args.strike}{args.right.upper()}"
+        try:
+            q = ib.qualifyContracts(contract)
+        except Exception:
+            q = []
+        if (not q or not q[0].conId) and exchange == "SEHK":
+            try:
+                contract = Option(args.symbol.upper(), args.expiry, args.strike, args.right.upper(),
+                                  "SMART", currency=args.currency)
+                q = ib.qualifyContracts(contract)
+            except Exception:
+                q = []
     else:
         contract = _stock(ib, args.symbol, args.currency, getattr(args, "exchange", None))
         if not contract:
             sys.exit(f"合约无法识别：{args.symbol} {args.currency}（可用 --exchange SEHK 手动指定）")
         label = f"{contract.symbol} 正股"
-    q = ib.qualifyContracts(contract)
+        try:
+            q = ib.qualifyContracts(contract)
+        except Exception:
+            q = []
     if not q or not q[0].conId:
         sys.exit(f"合约无法识别：{label}")
     contract = q[0]
@@ -527,7 +623,9 @@ def cmd_order(cfg, args):
     order.tif = args.tif
     order.outsideRth = bool(args.outside_rth)
 
-    payload = dict(env=env, port=port, contract=contract.conId, sec=contract.secType,
+    is_live = port == cfg.get("live_port")
+    mode = "live" if is_live else "paper"
+    payload = dict(mode=mode, port=port, contract=contract.conId, sec=contract.secType,
                    action=side, qty=qty, otype=args.type.upper(), px=px, tif=args.tif,
                    outside_rth=bool(args.outside_rth))
     code = _code(payload)
@@ -547,7 +645,6 @@ def cmd_order(cfg, args):
         except Exception as e:
             est = f"（保证金预估不可用：{type(e).__name__}，通常是缺行情数据）"
 
-    is_live = port == cfg.get("live_port")
     print("─" * 68)
     if is_live:
         print("  🔴 实盘账户 —— 下面这笔是真实资金委托")
@@ -732,6 +829,8 @@ def _coverage(ib, currency, need):
 
 
 def cmd_combo(cfg, args):
+    if not CFG_PATH.exists():
+        load_cfg(required=True)
     port, env = resolve_port(cfg, args)
     _live_guard(cfg, args, port)
     sym, preset = args.symbol.upper(), args.preset
@@ -784,7 +883,8 @@ def cmd_combo(cfg, args):
     net = args.net
     otype = "LMT" if net not in (None, 0) else "MKT"
 
-    payload = dict(env=env, port=port, kind="strat", preset=preset, symbol=sym,
+    mode = "live" if is_live else "paper"
+    payload = dict(mode=mode, port=port, kind="strat", preset=preset, symbol=sym,
                    conId=opt.conId, strike=strike, right=right, expiry=args.expiry,
                    qty=qty, net=net, otype=otype, shares=stock_qty, stock_px=args.stock_px or 0)
     code = _code(payload)
@@ -988,6 +1088,8 @@ def _resolve_option(ib, symbol, expiry, strikes, target, right, currency, chain,
 
 
 def cmd_plan(cfg, args):
+    if not CFG_PATH.exists():
+        load_cfg(required=True)
     port, env = resolve_port(cfg, args)
     ib = connect(cfg, port, readonly=True, force_delayed=getattr(args, "delayed", False))
 
@@ -1046,8 +1148,27 @@ def cmd_plan(cfg, args):
 
         have = _shares(ib, sym, cur)
         cost = _cost_basis(ib, sym, cur)
-        right = "C" if have > 0 else "P"
-        preset = "sell-call" if have > 0 else "cash-put"
+        note = []
+        preset_choice = getattr(args, "preset", "auto")
+        if preset_choice == "sell-call":
+            right, preset = "C", "sell-call"
+        elif preset_choice == "cash-put":
+            right, preset = "P", "cash-put"
+        else:
+            if have >= 100:
+                busy = _short_calls(ib, sym, cur)
+                avail = max(0.0, have - busy * 100)
+                if avail >= 100:
+                    right, preset = "C", "sell-call"
+                else:
+                    right, preset = "P", "cash-put"
+                    note.append(f"现有 {have:g} 股已被 {busy} 张 Call 占满，自动转为现金担保卖 Put")
+            elif have > 0:
+                right, preset = "P", "cash-put"
+                note.append(f"持有 {have:g} 股不足 1 手（需 100 股），自动转为现金担保卖 Put")
+            else:
+                right, preset = "P", "cash-put"
+
         target = px * (1 + args.otm) if right == "C" else px * (1 - args.otm)
         opt, strike = _resolve_option(ib, sym, expiry, ch.strikes, target, right, cur, ch,
                                       floor=cost if right == "C" else None)
@@ -1058,7 +1179,6 @@ def cmd_plan(cfg, args):
         prem, src = _quote_premium(ib, opt)
 
         qty = args.qty
-        note = []
         if right == "C":
             busy = _short_calls(ib, sym, cur)
             avail = max(0.0, have - busy * mult)
@@ -1245,7 +1365,7 @@ def _global_flags(parser, hidden=False):
 
 
 def main():
-    cfg = load_cfg()
+    cfg = load_cfg(required=False)
     p = argparse.ArgumentParser(
         prog="thetamill",
         description="ThetaMill — 低频期权卖方工具箱（IBKR / TWS API），实盘下单需复核码",
@@ -1280,6 +1400,7 @@ def main():
     o.add_argument("--limit", type=float); o.add_argument("--stop", type=float)
     o.add_argument("--tif", default="DAY"); o.add_argument("--outside-rth", action="store_true")
     o.add_argument("--currency", default=cfg["default_currency"])
+    o.add_argument("--exchange", help="指定交易所，如 SEHK/SMART（默认自动判断）")
     o.add_argument("--code", default="", help="复核码，不填只做预检不提交")
     o.add_argument("--whatif", action="store_true", help="预估保证金与佣金（需有行情，可能较慢）")
     o.add_argument("--live-ok", action="store_true", help="实盘账户下单必须加此开关（防手滑）")
@@ -1302,6 +1423,8 @@ def main():
     pl.set_defaults(func=cmd_plan)
     pl.add_argument("symbol", nargs="?", help="标的代码；不填则扫描账户里的正股持仓")
     pl.add_argument("--symbols", help="多个标的，逗号分隔，如 AAPL,MSFT")
+    pl.add_argument("--preset", choices=["auto", "sell-call", "cash-put"], default="auto",
+                    help="策略选择：auto（自动）| sell-call（备兑卖Call）| cash-put（现金担保卖Put）")
     pl.add_argument("--dte-min", type=int, default=21, help="最短剩余天数（默认 21）")
     pl.add_argument("--dte-max", type=int, default=45, help="最长剩余天数（默认 45）")
     pl.add_argument("--target-dte", type=int, default=30, help="窗口内优先取最接近的天数（默认 30）")
