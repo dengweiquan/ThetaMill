@@ -362,6 +362,48 @@ def _parse_multiplier(value):
     return int(value) if value.is_integer() else value
 
 
+def _positive_number(value, name, integer=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        sys.exit(f"⛔ {name}必须是有限正数")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        sys.exit(f"⛔ {name}必须是有限正数")
+    if not math.isfinite(number) or number <= 0 or (integer and not number.is_integer()):
+        sys.exit(f"⛔ {name}必须是有限正数" + ("且为整数" if integer else ""))
+    return int(number) if integer else number
+
+
+def _sync_open_orders(ib):
+    try:
+        trades = ib.reqAllOpenOrders()
+        ib.sleep(0.5)
+        if trades is None:
+            raise ValueError("open orders unavailable")
+    except Exception as exc:
+        sys.exit(f"⛔ 无法同步全部活跃挂单：{type(exc).__name__}: {exc}")
+
+
+def _portfolio(ib):
+    try:
+        positions = ib.portfolio()
+        if positions is None:
+            raise ValueError("portfolio unavailable")
+        return positions
+    except Exception as exc:
+        sys.exit(f"⛔ 无法确认持仓：{type(exc).__name__}: {exc}")
+
+
+def _open_trades(ib):
+    try:
+        trades = ib.openTrades()
+        if trades is None:
+            raise ValueError("open trades unavailable")
+        return trades
+    except Exception as exc:
+        sys.exit(f"⛔ 无法确认活跃挂单：{type(exc).__name__}: {exc}")
+
+
 def _option_matches(contract, symbol, expiry, strike, right, currency, multiplier=None,
                     trading_class=None, con_id=None):
     """qualify 结果仍须匹配请求身份，不能按返回列表位置认领合约。"""
@@ -719,11 +761,15 @@ def cmd_order(cfg, args):
     port, env = resolve_port(cfg, args)
     _live_guard(cfg, args, port)
     ib = connect(cfg, port, readonly=False, args=args)
-    try:
-        ib.reqAllOpenOrders()
-        ib.sleep(0.5)
-    except Exception:
-        pass
+    _sync_open_orders(ib)
+
+    qty = _positive_number(args.qty, "委托数量", integer=True)
+    if args.opt:
+        args.strike = _positive_number(args.strike, "行权价")
+    if args.type.upper() == "LMT":
+        args.limit = _positive_number(args.limit, "限价")
+    elif args.type.upper() == "STP":
+        args.stop = _positive_number(args.stop, "止损价")
 
     # 1) 合约
     if args.opt:
@@ -752,17 +798,32 @@ def cmd_order(cfg, args):
 
     # 2) 委托
     side = args.action.upper()
-    qty = args.qty
     is_live = _is_live_env(cfg, args, port)
+
+    if not args.opt and side == "SELL":
+        have = _shares(ib, args.symbol, args.currency)
+        reserved = (_short_calls_shares(ib, args.symbol, args.currency)
+                    + _pending_short_calls_shares(ib, args.symbol, args.currency)
+                    + _pending_stock_sales(ib, args.symbol, args.currency))
+        if have - reserved < qty:
+            sys.exit("⛔ 卖股将使现有或在途空头 Call 失去覆盖，或超过未被挂单占用的持股")
+
+    if args.opt and side == "BUY":
+        short = _short_options_by_id(ib, contract.conId)
+        pending = _pending_option_buys_by_id(ib, contract.conId)
+        if qty > short - pending:
+            sys.exit("⛔ 买回数量超过同一 conId 的未占用净空头；不支持开立期权多头")
 
     if args.opt and side == "SELL":
         mult = _multiplier(ib, contract)
-        qty_val = int(qty) if float(qty).is_integer() else qty
+        qty_val = qty
         if args.right.upper() == "C":
             have = _shares(ib, args.symbol, args.currency)
             if have < 0:
                 sys.exit(f"\n⛔ 账户持有 {have:g} 股 {args.symbol} 空头头寸（做空），禁止开具备兑 Call。\n")
-            busy_shares = _short_calls_shares(ib, args.symbol, args.currency) + _pending_short_calls_shares(ib, args.symbol, args.currency)
+            busy_shares = (_short_calls_shares(ib, args.symbol, args.currency)
+                           + _pending_short_calls_shares(ib, args.symbol, args.currency)
+                           + _pending_stock_sales(ib, args.symbol, args.currency))
             if have < busy_shares:
                 sys.exit(f"\n⛔ 现有正股 {have:g} 股不足以覆盖现有空头 Call（已占用 {busy_shares:g} 股，缺口 {busy_shares - have:g} 股）。禁止继续卖出 Call。\n")
             avail = have - busy_shares
@@ -899,12 +960,12 @@ PRESET_KEYS = ("covered-call", "sell-call", "cash-put")
 def _shares(ib, symbol, currency):
     """已有正股净持仓"""
     sym = symbol.upper()
-    for p in (ib.portfolio() or []):
+    for p in _portfolio(ib):
         c = getattr(p, "contract", None)
         if not c:
             continue
         if getattr(c, "secType", "") == "STK" and getattr(c, "symbol", "").upper() == sym and getattr(c, "currency", "") == currency:
-            return float(getattr(p, "position", 0) or 0)
+            return _finite_position(p)
     return 0.0
 
 
@@ -931,7 +992,7 @@ def _short_calls_shares(ib, symbol, currency):
     total_shares = 0.0
     sym = symbol.upper()
     cur = str(currency).upper()
-    for p in (ib.portfolio() or []):
+    for p in _portfolio(ib):
         c = getattr(p, "contract", None)
         if not c:
             continue
@@ -939,30 +1000,76 @@ def _short_calls_shares(ib, symbol, currency):
                 getattr(c, "symbol", "").upper() == sym and
                 str(getattr(c, "currency", "")).upper() == cur and
                 getattr(c, "right", "").upper() == "C" and
-                getattr(p, "position", 0) < 0):
+                _finite_position(p) < 0):
             mult = _multiplier(ib, c)
-            total_shares += abs(float(p.position)) * mult
+            total_shares += abs(_finite_position(p)) * mult
     return total_shares
 
 
 def _trade_remaining(trade) -> float:
+    rem = getattr(trade.orderStatus, "remaining", None)
+    if rem is not None:
+        try:
+            value = float(rem)
+            if math.isfinite(value) and value >= 0:
+                return value
+        except (TypeError, ValueError, OverflowError):
+            pass
+        sys.exit("⛔ 活跃挂单剩余量无效，不能按零计算")
     try:
-        rem = getattr(trade.orderStatus, "remaining", None)
-        if rem is not None and float(rem) >= 0:
-            return float(rem)
-    except Exception:
+        tot = float(trade.order.totalQuantity)
+        filled = float(trade.orderStatus.filled)
+        if all(math.isfinite(x) for x in (tot, filled)) and tot > 0 and 0 <= filled <= tot:
+            return tot - filled
+    except (TypeError, ValueError, OverflowError, AttributeError):
         pass
+    sys.exit("⛔ 无法确认活跃挂单剩余量，不能按零计算")
+
+
+def _finite_position(item):
     try:
-        tot = float(trade.order.totalQuantity or 0)
-        filled = float(trade.orderStatus.filled or 0)
-        return max(0.0, tot - filled)
-    except Exception:
-        return 0.0
+        value = float(item.position)
+        if math.isfinite(value):
+            return value
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        pass
+    sys.exit("⛔ 持仓数量无效")
+
+
+def _pending_stock_sales(ib, symbol, currency):
+    total = 0.0
+    for trade in _open_trades(ib):
+        if getattr(trade.orderStatus, "status", "") in {"Cancelled", "ApiCancelled", "Inactive", "Filled"}:
+            continue
+        c, o = trade.contract, trade.order
+        if (c.secType == "STK" and c.symbol.upper() == symbol.upper()
+                and c.currency.upper() == currency.upper() and o.action.upper() == "SELL"):
+            total += _trade_remaining(trade)
+    return total
+
+
+def _short_options_by_id(ib, con_id):
+    total = 0.0
+    for p in _portfolio(ib):
+        if getattr(p.contract, "secType", "") == "OPT" and p.contract.conId == con_id:
+            total -= _finite_position(p)
+    return max(0.0, total)
+
+
+def _pending_option_buys_by_id(ib, con_id):
+    total = 0.0
+    for t in _open_trades(ib):
+        if getattr(t.orderStatus, "status", "") in {"Cancelled", "ApiCancelled", "Inactive", "Filled"}:
+            continue
+        if (getattr(t.contract, "secType", "") == "OPT" and t.contract.conId == con_id
+                and t.order.action.upper() == "BUY"):
+            total += _trade_remaining(t)
+    return total
 
 
 def _pending_short_calls(ib, symbol, currency):
     """未完全成交的空头 Call 挂单张数（按未成交张数 remaining 汇总）"""
-    trades = ib.openTrades() if callable(getattr(ib, "openTrades", None)) else []
+    trades = _open_trades(ib)
     inactive = {"Cancelled", "ApiCancelled", "Inactive", "Filled"}
     total_remaining = 0.0
     sym = symbol.upper()
@@ -987,7 +1094,7 @@ def _pending_short_calls(ib, symbol, currency):
 
 def _pending_short_calls_shares(ib, symbol, currency):
     """未完全成交的空头 Call 挂单占用的正股股数（按各个期权合约自身乘数累加）"""
-    trades = ib.openTrades() if callable(getattr(ib, "openTrades", None)) else []
+    trades = _open_trades(ib)
     inactive = {"Cancelled", "ApiCancelled", "Inactive", "Filled"}
     total_shares = 0.0
     sym = symbol.upper()
@@ -1013,7 +1120,7 @@ def _pending_short_calls_shares(ib, symbol, currency):
 
 def _pending_cash_puts(ib, currency):
     """未完全成交的卖 Put 挂单所需现金担保合计"""
-    trades = ib.openTrades() if callable(getattr(ib, "openTrades", None)) else []
+    trades = _open_trades(ib)
     inactive = {"Cancelled", "ApiCancelled", "Inactive", "Filled"}
     total_cash = 0.0
     cur = str(currency).upper()
@@ -1040,7 +1147,7 @@ def _short_puts_collateral(ib, currency):
     """统计当前账户在某币种下已有已成交空头 Put 的现金担保总额（strike * mult * |position|）"""
     total_cash = 0.0
     cur_u = str(currency).upper()
-    for p in (ib.portfolio() or []):
+    for p in _portfolio(ib):
         c = getattr(p, "contract", None)
         if not c:
             continue
@@ -1214,15 +1321,16 @@ def cmd_combo(cfg, args):
     _live_guard(cfg, args, port)
     sym, preset = args.symbol.upper(), args.preset
     right = "P" if preset == "cash-put" else "C"
-    qty, strike = args.qty, args.k1
+    qty = _positive_number(args.qty, "期权张数", integer=True)
+    strike = _positive_number(args.k1, "行权价")
+    if args.net is not None:
+        _positive_number(args.net, "权利金价格")
+    if args.stock_px is not None:
+        _positive_number(args.stock_px, "正股价格")
     is_live = _is_live_env(cfg, args, port)
 
     ib = connect(cfg, port, readonly=False, args=args)
-    try:
-        ib.reqAllOpenOrders()
-        ib.sleep(0.5)
-    except Exception:
-        pass
+    _sync_open_orders(ib)
 
     opt, _exch = _opt(
         ib, sym, args.expiry, strike, right, args.currency,
@@ -1238,7 +1346,9 @@ def cmd_combo(cfg, args):
     # ---- 前提校验：这就是这个策略能不能成立的条件
     have = _shares(ib, sym, args.currency)
     stock_contract, stock_qty, stock_note = None, 0, ""
-    busy_shares = _short_calls_shares(ib, sym, args.currency) + _pending_short_calls_shares(ib, sym, args.currency)
+    busy_shares = (_short_calls_shares(ib, sym, args.currency)
+                   + _pending_short_calls_shares(ib, sym, args.currency)
+                   + _pending_stock_sales(ib, sym, args.currency))
     busy_count = _short_calls(ib, sym, args.currency) + _pending_short_calls(ib, sym, args.currency)
 
     if preset == "covered-call":
