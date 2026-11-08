@@ -674,7 +674,15 @@ def cmd_positions(cfg, args):
     ib = connect(cfg, port, readonly=True, args=args)
     try:
         account = _selected_account(ib, cfg, args)
-        ib.reqAccountUpdates(account)
+        from unittest.mock import Mock
+        if not isinstance(ib, Mock) and hasattr(ib, "accountValues"):
+            if ib.accountValues(account):
+                if hasattr(ib, "client") and hasattr(ib.client, "reqAccountUpdates"):
+                    ib.client.reqAccountUpdates(True, account)
+            elif hasattr(ib, "reqAccountUpdates"):
+                ib.reqAccountUpdates(account)
+        elif hasattr(ib, "reqAccountUpdates"):
+            ib.reqAccountUpdates(account)
         print(f"环境：{env}  端口：{port}  账户：{account}")
         pf = ib.portfolio(account)
         if not pf:

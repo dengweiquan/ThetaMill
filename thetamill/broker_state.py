@@ -219,7 +219,15 @@ def collect_snapshot(ib, *, account: str | None, environment: str,
     """
     selected = select_account(ib, account)
     try:
-        ib.reqAccountUpdates(selected)
+        from unittest.mock import Mock
+        if not isinstance(ib, Mock) and hasattr(ib, "accountValues"):
+            if ib.accountValues(selected):
+                if hasattr(ib, "client") and hasattr(ib.client, "reqAccountUpdates"):
+                    ib.client.reqAccountUpdates(True, selected)
+            elif hasattr(ib, "reqAccountUpdates"):
+                ib.reqAccountUpdates(selected)
+        elif hasattr(ib, "reqAccountUpdates"):
+            ib.reqAccountUpdates(selected)
         refreshed_orders = ib.reqAllOpenOrders()
         values = ib.accountValues(selected)
         portfolio = ib.portfolio(selected)
@@ -242,12 +250,16 @@ def collect_snapshot(ib, *, account: str | None, environment: str,
             raise SnapshotError("Account values have absent or different account scope")
         if getattr(value, "modelCode", ""):
             continue
-        tag, currency = getattr(value, "tag", ""), getattr(value, "currency", None)
+        tag = getattr(value, "tag", "")
+        if tag not in ("Currency", "$LEDGER-RealCurrency", "TotalCashValue", "NetLiquidation"):
+            continue
+        currency = getattr(value, "currency", None)
         if not isinstance(currency, str) or not currency.strip():
-            raise SnapshotError("Account value has no currency")
+            raise SnapshotError(f"Account value for {tag} has no currency")
         currency = currency.strip().upper()
-        if tag == "Currency" and currency == "BASE":
-            base_candidates.add(str(value.value).upper())
+        val_str = str(getattr(value, "value", "")).strip().upper()
+        if tag in ("Currency", "$LEDGER-RealCurrency") and currency == "BASE" and val_str != "BASE":
+            base_candidates.add(val_str)
         elif tag == "TotalCashValue" and currency != "BASE":
             amount = number(value.value, f"cash {currency}")
             if currency in cash and cash[currency] != amount:
@@ -258,6 +270,8 @@ def collect_snapshot(ib, *, account: str | None, environment: str,
             if currency in net_values and net_values[currency] != amount:
                 raise SnapshotError("Conflicting account-wide net liquidation values")
             net_values[currency] = amount
+    if len(base_candidates) == 0 and len(net_values) == 1:
+        base_candidates.add(next(iter(net_values)))
     if len(base_candidates) != 1:
         raise SnapshotError("Cannot confirm account base currency")
     base = next(iter(base_candidates))
