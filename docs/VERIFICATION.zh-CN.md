@@ -1,8 +1,29 @@
 # 验证记录与证据边界
 
+## 真实 IB Gateway 纸账户验收（2026-11-08）
+
+本轮在**本地运行的 IB Gateway 10.x + 纸账户（端口 4002）**上完成了 A–F 执行链的真实网关验收；与下方纯离线检查点分列，不互相替代。
+
+| 项目 | 实际执行 | 结果 |
+|---|---|---|
+| 连接与账户选择 | `status` / `account` / `positions` | 自动识别 4002，账户 `DUR***329`，读数正常 |
+| 行情 | `quote AAPL` / `chain AAPL` | 延迟行情回退 `[10167]`；24 个期权到期日、131 档行权价 |
+| 股票两阶段提交 | `order AAPL --action BUY --qty 1 --type LMT --limit 100` | 预检 rc=2 零发单；确认后 rc=0，券商回执 `[399]`，挂单 `#133` `PreSubmitted` |
+| 期权两阶段提交 | `order AAPL --opt --expiry 20261204 --strike 350 --right P --action SELL --qty 1 --type LMT --limit 1.00` | 预检 rc=2 零发单；确认后 rc=0，券商回执 `[399]`，挂单 `#140` `PreSubmitted` |
+| 多乘数担保 | 同上 Put（乘数 100、行权价 350、1 张） | 报告 `put_cash_obligations.USD = 35000.00`，`reserved_cash_base = 35000.0`，与 `350×100×1` 完全一致 |
+| 撤单与账本恢复 | `cancel 133` / `cancel 140` | 券商回执 `[202]`，状态 `Cancelled`；账本腿置 `confirmed`，`has_unresolved_submissions = False` |
+| 对账 | `reconcile` | 记录可确认券商观察；未找到不解除未知预留 |
+| 全量离线门禁 | `python -m unittest discover -s tests` | Python 3.13.12 与 3.10.20 各 **778 项全绿**（0 错误 0 失败） |
+
+本轮修复并验证的两项网关兼容缺陷：
+1. `ib_async` 在 `connectAsync` 已完成账户同步后，再次同步调用 `reqAccountUpdates` 会因等不到 `accountDownloadEnd` 而无限阻塞 → 改为在已填充资金时仅以非阻塞底层订阅保活，`positions`/`collect_snapshot` 不再挂起。
+2. 真实网关的 `AccountValue` 含 `AccountType`、`AccountReady`、`Cushion` 等空币种字段，且基准币通过 `$LEDGER-RealCurrency` 暴露 → 限定只校验货币相关标签，并支持单币种基准推断。
+
+**仍未验证**：成交（本轮委托均在同日休市时段、收盘前未撮合）、成交后持仓变动、实盘账户、非美元合约、非标/调整合约交割结构。`delivery_evidence.json` 中的交割证据仅对具体 conId `937548729` 有效，不代表其他合约已获授权。
+
 ## 新一轮工程验收状态（2026-11-07）
 
-以下为当前可追溯的离线检查点，不覆盖后面的历史券商观察，也不代表 A–F 已全部完成。
+以下为 2026-11-07 记录的可追溯离线检查点，不覆盖其后 2026-11-08 的真实网关验收，也不代表 A–F 已全部完成。
 
 | 固定候选 | 验证范围 | 实际结果 | 限制 |
 |---|---|---|---|
