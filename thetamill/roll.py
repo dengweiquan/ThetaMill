@@ -770,7 +770,6 @@ def render_roll_recommendation(doc: Mapping, fmt: str = "terminal") -> str:
     lines.extend(["", "## 候选", "| conId | 标的 | 到期 | 乘数 | DTE | 状态 | 净额/币种 | 过滤原因 |",
                   "|---|---|---|---:|---:|---|---|---|"])
     for c in doc.get("candidates", []):
-        inst = c.get("instrument") or {}
         estimate = c.get("net_estimate")
         net = (f"{estimate['net']} {estimate['currency']}"
                if estimate and estimate.get("net") is not None

@@ -342,7 +342,6 @@ class RealIbAsyncMultiplierTests(AdapterTestCase):
         return o
 
     def test_multiplier_strings_100_200_500_verify(self):
-        from ib_async import Option
         for con_id, mult in ((2001, "100"), (2002, "200"), (2003, "500")):
             contract = self._qualified(con_id, mult)
             self.assertIsInstance(contract.multiplier, str)  # real IB shape
@@ -569,6 +568,9 @@ class DeliveryEvidenceTests(AdapterTestCase):
         # (2002) with the SAME underlying/tradingClass/multiplier.
         standard = opt_instrument(con_id=2001)
         adjusted = opt_instrument(con_id=2002, trading_class="AAPL1")
+        # Evidence is keyed by option conId, never by shared underlying identity.
+        self.assertEqual(standard.key, adjusted.key)
+        self.assertNotEqual(standard.con_id, adjusted.con_id)
         path = write_evidence(self.root / "ev.json", [standard])
         ib = MockIB()
         ib.contract_details = {2002: [MockDetail(

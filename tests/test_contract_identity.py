@@ -230,7 +230,6 @@ class PlanRunIdentityTests(unittest.TestCase):
             ledger_path = data_dir / "state.sqlite3"
             state.SubmissionLedger(ledger_path, "UTC")
 
-            from datetime import timezone, timedelta
             now = datetime.now(timezone.utc)
             mult_str = str(multiplier) if multiplier else "100"
             ev_records = [

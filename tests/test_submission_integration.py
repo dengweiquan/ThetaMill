@@ -30,36 +30,37 @@ except ImportError:
 
 class ParserAndForwardingTests(unittest.TestCase):
     def test_parser_has_intent_and_delivery_evidence_flags(self):
-        parser = cli.build_parser() if hasattr(cli, "build_parser") else None
-        # If cli does not expose build_parser, test parse_args via main parser setup or inspection
-        # Let's check subcommands via ArgumentParser
-        # Parse arguments for each subcommand
-        # order:
-        sub_args = ["order", "AAPL", "--action", "BUY", "--qty", "10", "--type", "LMT", "--limit", "150.0",
-                    "--intent", "int-test1", "--delivery-evidence", "evidence.json"]
-        with patch.object(cli, "load_cfg", return_value=cli.DEFAULT_CFG), \
-             patch.object(cli, "CFG_PATH", Path("dummy.json")):
-            # Test that flags are parsed
-            p = argparse.ArgumentParser()
-            sub = p.add_subparsers(dest="sub")
-            # Or test cli's main parser directly if available
-            p_order = sub.add_parser("order")
-            p_order.add_argument("--intent", default="")
-            p_order.add_argument("--delivery-evidence")
-            parsed = p_order.parse_args(["--intent", "int-123", "--delivery-evidence", "/path/ev.json"])
-            self.assertEqual(parsed.intent, "int-123")
-            self.assertEqual(parsed.delivery_evidence, "/path/ev.json")
+        """The REAL parser (not a stand-in) wires the confirmation pair everywhere."""
+        parser = cli.build_parser(dict(cli.DEFAULT_CFG))
+        order = parser.parse_args(
+            ["order", "AAPL", "--action", "SELL", "--qty", "1",
+             "--intent", "int-123", "--delivery-evidence", "/path/ev.json"])
+        self.assertEqual(order.intent, "int-123")
+        self.assertEqual(order.delivery_evidence, "/path/ev.json")
+        for cmd in (["strat", "AAPL", "--preset", "cash-put", "--expiry", "20261218", "--k1", "40"],
+                    ["run", "--file", "plan.json"]):
+            for sub in (["--intent", "int-123"], ["--delivery-evidence", "/path/ev.json"]):
+                parsed = parser.parse_args(cmd + sub)
+                expected = "int-123" if sub[0] == "--intent" else "/path/ev.json"
+                attribute = sub[0].lstrip("-").replace("-", "_")
+                self.assertEqual(getattr(parsed, attribute), expected)
 
     def test_cli_subcommands_support_intent_and_delivery_evidence(self):
-        """Test CLI parser flags directly by invoking the argument parser in main."""
-        with patch.object(cli, "load_cfg", return_value=cli.DEFAULT_CFG), \
-             patch.object(cli, "CFG_PATH", Path("dummy.json")), \
-             patch("sys.exit"):
-            # Import or inspect argument parser construction in main
-            import inspect
-            src = inspect.getsource(cli.main)
-            self.assertIn('--intent', src)
-            self.assertIn('--delivery-evidence', src)
+        """Every order-placing subcommand routes to a handler through the real parser."""
+        parser = cli.build_parser(dict(cli.DEFAULT_CFG))
+        self.assertEqual(parser.parse_args(
+            ["order", "AAPL", "--action", "BUY", "--qty", "1"]).func, cli.cmd_order)
+        self.assertEqual(parser.parse_args(
+            ["strat", "AAPL", "--preset", "cash-put", "--expiry", "20261218",
+             "--k1", "40"]).func, cli.cmd_combo)
+        self.assertEqual(parser.parse_args(
+            ["run", "--file", "plan.json"]).func, cli.cmd_run)
+        self.assertEqual(parser.parse_args(["roll-plan", "--con-id", "1", "--qty", "1"]).func,
+                         cli.cmd_roll_plan)
+        # `combo` is an alias of `strat`, not a second implementation.
+        self.assertEqual(parser.parse_args(
+            ["combo", "AAPL", "--preset", "cash-put", "--expiry", "20261218",
+             "--k1", "40"]).func, cli.cmd_combo)
 
     def test_pre_network_guard_rejects_mismatched_intent_and_code(self):
         """Pre-network guard must exit before connect is ever called."""

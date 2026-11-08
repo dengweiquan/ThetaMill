@@ -935,7 +935,6 @@ class PlanCLITests(unittest.TestCase):
 
     def test_readonly_connect(self):
         with tempfile.TemporaryDirectory() as d:
-            qi = {"AAA": inst("AAA")}
             out = Path(d) / "p.json"
             with patch.object(cli, "connect", return_value=MagicMock()) as conn, \
                  patch.object(cli, "resolve_port", return_value=(4002, "paper")), \

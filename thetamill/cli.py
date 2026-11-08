@@ -20,7 +20,7 @@ import os
 import socket
 import sys
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from pathlib import Path
 
 
@@ -103,8 +103,8 @@ except ImportError:
         errorEvent = []
         def disconnect(self):
             pass
-from .universe import (load_universe, universe_allowed, universe_gate,  # noqa: E402
-                       validate, meta)
+from .universe import (universe_allowed, universe_gate,  # noqa: E402
+                       validate)
 
 
 DEFAULT_CFG = {
@@ -2175,8 +2175,13 @@ def _global_flags(parser, hidden=False):
     parser.add_argument("--account", help=h or "明确选择账户；多账户会话必填", **kw)
 
 
-def main():
-    cfg = load_cfg(required=False)
+def build_parser(cfg: dict | None = None) -> argparse.ArgumentParser:
+    """Build the argument parser without reading config or connecting.
+
+    Exposed so tests exercise the REAL production parser (flag names,
+    defaults, subcommand wiring) rather than a hand-rolled stand-in.
+    """
+    cfg = DEFAULT_CFG if cfg is None else cfg
     p = argparse.ArgumentParser(
         prog="thetamill",
         description="ThetaMill — 低频期权卖方工具箱（IBKR / TWS API），实盘下单需复核码",
@@ -2304,8 +2309,12 @@ def main():
         if id(sp) not in seen:
             _global_flags(sp, hidden=True)
             seen.add(id(sp))
+    return p
 
-    args = p.parse_args()
+
+def main():
+    cfg = load_cfg(required=False)
+    args = build_parser(cfg).parse_args()
     sys.exit(args.func(cfg, args))
 
 

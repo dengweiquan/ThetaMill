@@ -5,7 +5,6 @@ Tests are completely offline and mocked without requiring IB Gateway connections
 from __future__ import annotations
 
 import argparse
-import hashlib
 import io
 import json
 import tempfile

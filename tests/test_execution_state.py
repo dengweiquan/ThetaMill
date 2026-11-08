@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from thetamill import risk, state
+from thetamill import state
 from thetamill.broker_state import Instrument, Position, Snapshot, WorkingOrder
 from thetamill.execution import (
     BrokerReceipt, ConfirmResult, ExecutionEngine, ExecutionError,

@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 from thetamill.broker_state import Instrument, Position, Snapshot
 from thetamill import roll, roll_cli
 from thetamill.roll_cli import DELIVERABLES_SCHEMA, DeliverableEvidenceError
-from thetamill.roll import Quote, SCHEMA as ROLL_SCHEMA
+from thetamill.roll import SCHEMA as ROLL_SCHEMA
 
 NOW = datetime(2026, 11, 7, 20, 0, tzinfo=timezone.utc)
 OLD_EXPIRY = "20261218"      # 41 DTE from NOW

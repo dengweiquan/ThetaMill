@@ -143,10 +143,11 @@ class Snapshot:
                 if not isinstance(quote, expected) or key != (
                         quote.con_id if name == "price_quotes" else quote.currency):
                     raise SnapshotError("Quote mapping identity mismatch")
-        for field in ("cash", "fx", "price_quotes", "fx_quotes"):
-            object.__setattr__(self, field, MappingProxyType(dict(getattr(self, field))))
-        for field in ("positions", "orders", "issues"):
-            object.__setattr__(self, field, tuple(getattr(self, field)))
+        for attribute in ("cash", "fx", "price_quotes", "fx_quotes"):
+            object.__setattr__(self, attribute, MappingProxyType(
+                dict(getattr(self, attribute))))
+        for attribute in ("positions", "orders", "issues"):
+            object.__setattr__(self, attribute, tuple(getattr(self, attribute)))
 
 
 def _optional_price(value) -> Decimal | None:

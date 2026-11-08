@@ -579,7 +579,6 @@ def assess_plan(snapshot: Snapshot, requests: Sequence[OrderRequest],
     seen: set[int] = set()
     for index, request in enumerate(request_list):
         inst = request.instrument
-        item_reasons: list[str] = []
 
         if inst.con_id in seen:
             items.append(PlannedOrder(

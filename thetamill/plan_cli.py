@@ -657,7 +657,7 @@ def cmd_plan(cfg, args, now: datetime | None = None) -> int:
 
         # ---- per-OPTION-conId delivery evidence (shared with roll_cli) ------ #
         try:
-            from .roll_cli import load_delivery_evidence, DeliverableEvidenceError
+            from .roll_cli import load_delivery_evidence
             confirmed = load_delivery_evidence(
                 getattr(args, "delivery_evidence", None),
                 [m["instrument"] for m in metas], current_now)
