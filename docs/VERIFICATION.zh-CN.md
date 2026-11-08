@@ -25,7 +25,9 @@
 
 以下为 2026-11-07 记录的可追溯离线检查点，不覆盖其后 2026-11-08 的真实网关验收，也不代表 A–F 已全部完成。
 
-> **CI 状态说明（2026-11-08 核实）**：`.github/workflows/offline.yml` 自加入起 6 次 Actions 运行全部在 0 秒内失败且未创建任何 job——job 级 `env` 使用了 `runner` 上下文，而该上下文只在 step 级可用（`actionlint` 报 `context "runner" is not allowed here`）。因此上表所有"双环境通过"结论均来自**本地实跑**，不是 CI 通过。工作流已改为用 `github.workspace` 派生临时路径，`actionlint` 通过；本地已按该流程完整复现 Python 3.10.20 与 3.13.13（ib_async 2.1.0）各 778 项全绿、wheel 隔离安装与 16 个子命令帮助。CI 绿需以修复后的实际运行记录为准，此前不得宣称 CI 门禁生效。
+> **CI 状态说明（2026-11-08 核实）**：`.github/workflows/offline.yml` 自加入起 6 次 Actions 运行全部在 0 秒内失败且未创建任何 job——job 级 `env` 使用了 `runner` 上下文，而该上下文只在 step 级可用（`actionlint` 报 `context "runner" is not allowed here`）。因此上表所有"双环境通过"结论均来自**本地实跑**，不是 CI 通过。
+>
+> **CI 首次真实运行（2026-11-08 02:51 UTC，main `4e4de60`）**：修复后 Actions 运行 `42440262402` 成功，两个矩阵 job 均创建并通过——`offline (3.10)` 与 `offline (3.13)` 各 8 个步骤全绿（构建 wheel、源码测试、ruff E9/F 基线、空白/冲突标记、安装包测试与 16 个子命令帮助）。这是本仓库**第一条**真实 CI 通过记录，此前 6 次的 0 秒失败不应被引用为门禁通过。
 
 > **静态检查基线（2026-11-08）**：`ruff check --select E9,F thetamill tests` 返回 `All checks passed!`（此前 tests/ 有 11 项 F401/F841 未处理）。该检查已作为独立步骤接入 `.github/workflows/offline.yml`，`pyproject.toml` 的 `dev` extra 固定了同一版本（`ruff==0.17.4`），本地与 CI 是同一个检查。基线建成后应要求变更不新增 E9/F 问题；这不等于 ruff 全规则（如 E501、I、B）通过，那些规则尚未启用。
 
