@@ -17,7 +17,6 @@ These tests pin the ONLY sanctioned escape hatches:
 """
 import io
 import tempfile
-import types
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import dataclass
@@ -27,7 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from thetamill import cli, execution, state
+from thetamill import cli, state
 from thetamill import resolve as resolve_mod
 from thetamill.broker_state import Instrument, Snapshot, WorkingOrder
 
@@ -107,20 +106,21 @@ class LedgerCase(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.ledger = state.SubmissionLedger(self.root / "state.sqlite3", "UTC")
 
-    def grant_day_budget(self, limit=100):
+    def grant_day_budget(self, limit=100, *, account=ACCOUNT, environment=ENV):
         """An established day row; a fresh ledger is otherwise frozen."""
-        self.ledger.set_daily_limit(account=ACCOUNT, environment=ENV,
+        self.ledger.set_daily_limit(account=account, environment=environment,
                                     day_key=DAY, limit_count=limit)
 
     def seed(self, *, leg_state="unknown", action="SELL", con_id=937548729,
-             slots=1, instrument=None):
+             slots=1, instrument=None, account=ACCOUNT, environment=ENV,
+             order_ref="ref-1"):
         instrument = instrument or opt_instrument(con_id=con_id)
-        self.grant_day_budget()
-        self.ledger.set_resource(account=ACCOUNT, environment=ENV,
+        self.grant_day_budget(account=account, environment=environment)
+        self.ledger.set_resource(account=account, environment=environment,
                                  currency="USD", resource_key="cash_base",
                                  amount=Decimal("1000000"))
         intent = self.ledger.create_intent(
-            account=ACCOUNT, environment=ENV,
+            account=account, environment=environment,
             payload={"kind": "prepared_legs",
                      "legs": [{"instrument": {
                          "con_id": instrument.con_id,
@@ -137,19 +137,20 @@ class LedgerCase(unittest.TestCase):
                      }, "action": action, "quantity": "1", "order_type": "LMT",
                          "limit_price": "1.00"}]},
             config={"a": 1}, ttl_seconds=3600, now=NOW)
-        self.ledger.claim_intent(account=ACCOUNT, environment=ENV,
+        self.ledger.claim_intent(account=account, environment=environment,
                                  intent_id=intent["intent_id"],
                                  full_digest=intent["full_digest"],
                                  code=intent["approval_code"], now=NOW)
         rid = self.ledger.reserve(
-            account=ACCOUNT, environment=ENV, intent_id=intent["intent_id"],
+            account=account, environment=environment,
+            intent_id=intent["intent_id"],
             day_key=DAY,
             items=[state.RiskReservationSpec("USD", "cash_base", "1000")],
             day_submission_slots=slots, now=NOW)
         refs = self.ledger.record_legs(
             intent_id=intent["intent_id"], reservation_id=rid, now=NOW,
             legs=[{"contract_id": str(con_id), "action": action,
-                   "quantity": "1", "order_ref": "ref-1"}])
+                   "quantity": "1", "order_ref": order_ref}])
         self.ledger.begin_leg_attempt(refs[0], now=ATTEMPT)
         if leg_state != "submitting":
             self.ledger.record_leg_result(refs[0], state=leg_state, now=NOW)
@@ -357,7 +358,14 @@ class ReleasedStateTests(LedgerCase):
 class CliResolveTests(LedgerCase):
     """The CLI command itself: no evidence => no release, ever."""
 
-    def _run(self, *argv, ledger=None, fills=(), snapshot=None):
+    def _run(self, *argv, ledger=None, fills=(), snapshot=None, account=ACCOUNT,
+             port=(4002, "paper")):
+        """Drive the real parser; the port is pinned so no test probes a socket.
+
+        A test that let ``resolve_port`` auto-detect would pass on a machine
+        with an IB gateway listening and fail on a clean runner — the same
+        local/CI split that produced the false "没有未决预留" all-clear.
+        """
         ledger = ledger or self.ledger
         args = cli.build_parser(dict(cli.DEFAULT_CFG)).parse_args(list(argv))
         buf = io.StringIO()
@@ -366,7 +374,8 @@ class CliResolveTests(LedgerCase):
         with patch.object(cli, "_data_dir", return_value=self.root), \
              patch("thetamill.resolve.open_ledger", return_value=ledger), \
              patch.object(cli, "connect"), patch.object(cli, "finish"), \
-             patch.object(cli, "_selected_account", return_value=ACCOUNT), \
+             patch.object(cli, "resolve_port", return_value=port), \
+             patch.object(cli, "_selected_account", return_value=account), \
              patch.object(cli, "_risk_snapshot",
                           side_effect=RuntimeError("no gateway in this test")), \
              patch("thetamill.resolve.live_observations",
@@ -391,6 +400,65 @@ class CliResolveTests(LedgerCase):
         self.assertEqual(rc, 0)
         self.assertIn("1 个未决预留", out)
         self.assertIn(rid, out)
+
+    def test_list_finds_a_paper_reservation_with_no_gateway_running(self):
+        """A port probe must never decide which environment is inspected.
+
+        Reported bug: with nothing listening on 4001/4002, ``resolve_port``
+        falls back to "live", so a paper reservation was answered with
+        "账户 DU…（live）没有未决预留" — a false all-clear on the single command
+        that is supposed to be the account's only escape.  The ledger knows.
+        """
+        rid, _ = self.seed(leg_state="unknown")
+        rc, out = self._run("resolve", "--list", "--account", ACCOUNT,
+                            port=(4001, "实盘(Live)"))
+        self.assertEqual(rc, 0)
+        self.assertIn("1 个未决预留", out, out)
+        self.assertIn(rid, out)
+        self.assertNotIn("没有未决预留", out)
+
+    def test_list_reports_every_environment_when_none_is_specified(self):
+        paper_rid, _ = self.seed(leg_state="unknown", order_ref="ref-paper")
+        live_rid, _ = self.seed(leg_state="unknown", environment="live",
+                                order_ref="ref-live")
+        rc, out = self._run("resolve", "--list", "--account", ACCOUNT,
+                            port=(4001, "实盘(Live)"))
+        self.assertEqual(rc, 0)
+        self.assertIn("2 个未决预留", out, out)
+        self.assertIn(paper_rid, out)
+        self.assertIn(live_rid, out)
+        self.assertIn("paper", out)
+        self.assertIn("live", out)
+
+    def test_list_narrowed_by_paper_only_reports_paper(self):
+        paper_rid, _ = self.seed(leg_state="unknown", order_ref="ref-paper")
+        self.seed(leg_state="unknown", environment="live", order_ref="ref-live")
+        rc, out = self._run("resolve", "--list", "--account", ACCOUNT,
+                            "--paper")
+        self.assertEqual(rc, 0)
+        self.assertIn(paper_rid, out)
+        self.assertNotIn("ref-live", out)
+
+    def test_confirmed_refuses_when_the_reservation_belongs_to_another_scope(self):
+        """Searching the wrong environment looks exactly like 'no execution'."""
+        rid, _ = self.seed(leg_state="unknown")          # a paper reservation
+        rc, out = self._run("resolve", "--reservation", rid,
+                            "--state", "confirmed", fills=[raw_fill()],
+                            port=(4001, "实盘(Live)"))
+        self.assertEqual(rc, 2)
+        self.assertIn("paper", out)
+        self.assertTrue(self.ledger.has_unresolved_submissions(
+            account=ACCOUNT, environment=ENV))
+
+    def test_confirmed_refuses_when_the_connected_account_differs(self):
+        rid, _ = self.seed(leg_state="unknown")
+        rc, out = self._run("resolve", "--reservation", rid,
+                            "--state", "confirmed", fills=[raw_fill()],
+                            account="DU9999999")
+        self.assertEqual(rc, 2)
+        self.assertIn("DU9999999", out)
+        self.assertTrue(self.ledger.has_unresolved_submissions(
+            account=ACCOUNT, environment=ENV))
 
     def test_release_without_evidence_is_refused(self):
         rid, _ = self.seed(leg_state="unknown")

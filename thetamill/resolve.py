@@ -39,7 +39,7 @@ create or migrate a database.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Optional, Sequence, Tuple
@@ -76,6 +76,8 @@ class BlockedReservation:
     day_key: str
     state: str
     legs: Tuple[Tuple[str, str, str, str], ...]  # (order_ref, action, qty, state)
+    account: str = ""
+    environment: str = ""
 
     @property
     def states(self) -> Tuple[str, ...]:
@@ -109,18 +111,35 @@ class ResolutionOutcome:
 # --------------------------------------------------------------------------- #
 
 def unresolved_summary(ledger: Any, *, account: str,
-                       environment: str) -> list[BlockedReservation]:
-    """Every reservation for this scope that still holds risk, with its legs."""
-    legs_by_res: dict[str, list[tuple[str, str, str, str]]] = {}
-    for leg in ledger.list_legs(account=account, environment=environment):
-        legs_by_res.setdefault(leg.reservation_id, []).append(
-            (leg.order_ref, leg.action, leg.quantity, leg.state))
-    return [BlockedReservation(
-        reservation_id=res.reservation_id, intent_id=res.intent_id,
-        day_key=res.day_key, state=res.state,
-        legs=tuple(legs_by_res.get(res.reservation_id, ())))
-        for res in ledger.outstanding_reservations(
-            account=account, environment=environment)]
+                       environment: Optional[str] = None) -> list[BlockedReservation]:
+    """Every reservation for this scope that still holds risk, with its legs.
+
+    ``environment`` is optional HERE ONLY: an operator inventory must be able to
+    ask "what is blocking this account" without first proving which gateway is
+    up.  Passing ``None`` reports every environment's outstanding reservations
+    and tags each row with its scope; a specific value keeps the original
+    strictly-scoped behaviour.
+    """
+    blocked: list[BlockedReservation] = []
+    if environment is None:
+        scopes = [scope for scope in ledger.list_outstanding_scopes()
+                  if scope[0] == account]
+    else:
+        scopes = [(account, environment)]
+    for scope_account, scope_environment in scopes:
+        legs_by_res: dict[str, list[tuple[str, str, str, str]]] = {}
+        for leg in ledger.list_legs(account=scope_account,
+                                    environment=scope_environment):
+            legs_by_res.setdefault(leg.reservation_id, []).append(
+                (leg.order_ref, leg.action, leg.quantity, leg.state))
+        for res in ledger.outstanding_reservations(account=scope_account,
+                                                   environment=scope_environment):
+            blocked.append(BlockedReservation(
+                reservation_id=res.reservation_id, intent_id=res.intent_id,
+                day_key=res.day_key, state=res.state,
+                legs=tuple(legs_by_res.get(res.reservation_id, ())),
+                account=scope_account, environment=scope_environment))
+    return blocked
 
 
 def never_sent_provable(ledger: Any, reservation_id: str, *, account: str,

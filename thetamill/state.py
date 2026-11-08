@@ -1623,6 +1623,29 @@ class SubmissionLedger:
                 "ORDER BY i.account, i.environment").fetchall()
             return [(str(r[0]), str(r[1])) for r in rows]
 
+    def list_outstanding_scopes(self, *, states: Optional[Iterable[str]] = None
+                                ) -> List[Tuple[str, str]]:
+        """Scopes that still hold risk, as ``(account, environment)``, sorted.
+
+        Discovery for read-only inventories (``thetamill resolve --list``): the
+        answer to "is anything blocking this account" must come from the ledger
+        itself, never from guessing which environment the operator meant.  A
+        port probe reports "nothing blocked" whenever no gateway is running,
+        which is precisely when an unresolved send is most likely.
+        """
+        wanted = (tuple(states) if states is not None
+                  else tuple(sorted(_RISK_OUTSTANDING_STATES)))
+        if not wanted:
+            return []
+        placeholders = ",".join("?" for _ in wanted)
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT i.account, i.environment FROM reservations r "
+                "JOIN intents i ON i.intent_id=r.intent_id "
+                f"WHERE r.state IN ({placeholders}) "
+                "ORDER BY i.account, i.environment", wanted).fetchall()
+            return [(str(r[0]), str(r[1])) for r in rows]
+
     def list_legs(self, *, account: str, environment: str,
                   intent_id: Optional[str] = None) -> List[LegView]:
         """List per-leg records (optionally for one intent), account-scoped."""

@@ -275,10 +275,10 @@ def _compare_canonical_instrument(inst: Mapping[str, Any],
     if str(inst.get("underlying_id")) != str(observed["underlying_id"]):
         raise ExecutionError(
             f"{label} underlying_id does not match the approved canonical instrument")
-    for field in ("symbol", "sec_type", "currency", "exchange", "right"):
-        if str(inst.get(field, "")).upper() != str(observed[field]).upper():
+    for name in ("symbol", "sec_type", "currency", "exchange", "right"):
+        if str(inst.get(name, "")).upper() != str(observed[name]).upper():
             raise ExecutionError(
-                f"{label} {field} does not match the approved canonical instrument")
+                f"{label} {name} does not match the approved canonical instrument")
     approved_mult = handoff_decimal(inst.get("multiplier", "1"),
                                     "approved multiplier")
     observed_mult = handoff_decimal(observed["multiplier"], "observed multiplier")
@@ -290,10 +290,10 @@ def _compare_canonical_instrument(inst: Mapping[str, Any],
     if approved_strike != observed_strike:
         raise ExecutionError(
             f"{label} strike does not match the approved canonical instrument")
-    for field in ("expiry", "trading_class"):
-        if str(inst.get(field, "")) != str(observed[field]):
+    for name in ("expiry", "trading_class"):
+        if str(inst.get(name, "")) != str(observed[name]):
             raise ExecutionError(
-                f"{label} {field} does not match the approved canonical instrument")
+                f"{label} {name} does not match the approved canonical instrument")
 
 
 def verify_observed_working_order(*, order_ref: str, account: str,

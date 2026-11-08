@@ -417,9 +417,17 @@ run         → 复核码 180EE04B → 提交 #104 PreSubmitted → 撤单归 0
 - 缺陷：`ExecutionEngine.reconcile_positive` 与 `SubmissionLedger.resolve_unknown` 在生产路径上零调用者。任何一笔回执不明的委托都会让 `has_unresolved_submissions` 永久为真，`confirm` 之后一律抛错，而文档给出的补救（对账、勿删库）无法执行。
 - 新增 `thetamill/resolve.py`：`unresolved_summary` / `resolve_reservation` / `release_never_sent` / `fill_from_row` / `live_observations` / `open_ledger`。`confirmed` 要求每一条未决腿都有正向结构化证据——新鲜且严格同账户/环境的 `Snapshot` 活动挂单，或券商成交流水中同一 `orderRef` 的成交行；身份校验复用 `execution.py` 的同一套函数（`verify_observed_working_order`、`verify_fill_against_approved`、`approved_leg_canonical`），没有第二份实现。
 - 新增 `ExecutionEngine.reconcile_filled` 与 `execution.PositiveFill`：Filled 单没有活动挂单，此前根本无法被正向交接；现在由执行行（账户、conId、方向、**精确**成交数量、时间）逐项核对后放行，部分成交仍拒绝。
-- 新增 CLI `thetamill resolve --list / --reservation <id> [--state confirmed|released] [--why ...]`：只读打开账本进行列举与取证，只有真正解除时才以可写方式打开；环境判定不做端口探测。
+- 新增 CLI `thetamill resolve --list / --reservation <id> [--state confirmed|released] [--why ...]`：只读打开账本进行列举与取证，只有真正解除时才以可写方式打开。
 - `thetamill cancel` 不再静默 `except: pass`：撤单成功但账本更新失败时会明确提示账户可能仍被拦并指向 `resolve --list`。
 - 回归：`tests/test_resolve.py` 22 项（含「仅不在挂单中不构成证据」「他账户/他 ref/他 conId 不解除」「两条成交视为歧义拒绝」「快照过期/范围不符/issues 拒绝」「解除不返还已消耗提交次数」）。
+
+### 1b. 回归缺陷：`resolve --list` 的假放行（CI 暴露）
+
+- 现象：`682b6aa` 在 GitHub Actions 的 3.10 与 3.13 两个矩阵均失败于 `test_list_reports_the_blocked_reservation`，实际输出是「账户 DU1234567（live）没有未决预留。」，而账本里有一笔 `paper` 未决预留。本地能通过，是因为本机 4002 端口恰好开着——`resolve_port` 探到纸账户端口就返回 `paper`；干净 runner 上两个端口都关，于是回落到 `live`。
+- 定性：这不是 flaky 测试，而是产品缺陷。`resolve --list` 是账户锁的唯一出口，「没有未决预留」在任何情况下都是最高风险的输出；它却由「哪个网关在跑」来推断「该查哪个环境」，在最需要看见预留的离线/断线场景下给出假放行。同一根因还会让 `--state confirmed` 连错环境，把「查错了账户」呈现成「没有成交」。
+- 修复：`--list` 的账户范围改为**来自账本**——新增 `state.SubmissionLedger.list_outstanding_scopes()`，`resolve.unresolved_summary` 的 `environment` 改为可选，`None` 表示列出该账户全部环境的未决预留并在每行标注环境；只有显式 `--paper`/`--port` 才收窄。`BlockedReservation` 增加 `account`/`environment` 字段。`--state confirmed` 先从预留的 `scope` 取出账户与环境，与将要连接的端口环境和实际账户逐一比对，不符直接返回 2，不再去错误的环境里查询成交。
+- 回归：`tests/test_resolve.py` 新增 5 项——无网关时仍能找到 paper 预留、未指定环境时两个环境都列出、`--paper` 只收窄到 paper、环境不符时拒绝、账户不符时拒绝；测试夹具固定 `resolve_port` 返回值，避免测试再次依赖本机是否开着网关。已确认这 5 项在 `682b6aa` 上为**真红**（其中一项的错误文本与 CI 日志逐字一致）。
+- 顺带修复 CI 另外两步在 `682b6aa` 上本会失败的问题（此前这两步从未真正执行，因为测试步先失败就把它们跳过了）：`ruff check --select E9,F` 报 4 项（`tests/test_resolve.py` 两个未使用导入、`thetamill/resolve.py` 未使用的 `field`、`thetamill/execution.py` 两处循环变量遮蔽 `dataclasses.field` 的 F402）；已全部修掉，现为 `All checks passed!`。
 
 ### 2. 审计断流
 
@@ -433,5 +441,6 @@ run         → 复核码 180EE04B → 提交 #104 PreSubmitted → 撤单归 0
 
 ### 3. 门禁
 
-- 全量离线：`python -m unittest discover -s tests` → **819 项通过**（Python 3.10 / ib_async 2.1.0）。
+- 全量离线：`python -m unittest discover -s tests` → **824 项通过**（Python 3.10 `.venv`，ib_async 2.1.0；Python 3.13 独立环境同样 824 项通过）。
+- 其余 CI 步骤已在本地逐步复现通过：`ruff check --select E9,F thetamill tests`（`All checks passed!`）、`git diff --check`、冲突标记扫描、构建 wheel 后在无配置的干净 venv 中从 site-packages 运行 824 项测试，以及 `thetamill --help` / `python -I -m thetamill --help` / 17 个子命令 `--help` 全部 rc 0。推送后仍以 GitHub Actions 实际结果为准。
 - 仍未验证：任何真实券商证据。上述解除路径只经过 mock 与临时 SQLite 账本验证；真实账户上仍需单独授权后按只读 → 纸账户提交/撤单分层验收。

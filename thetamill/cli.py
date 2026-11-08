@@ -2142,15 +2142,6 @@ def cmd_resolve(cfg, args):
     if not path.exists():
         sys.exit("没有本地提交账本；不会创建空库或推断历史为零")
     day_tz = (cfg.get("risk") or {}).get("day_timezone", "UTC")
-    # An explicit --paper / --port never probes the network; only an ambiguous
-    # invocation auto-detects, so `--list` can stay strictly read-only.
-    if getattr(args, "port", None):
-        port = args.port
-    elif getattr(args, "paper", False):
-        port = cfg["paper_port"]
-    else:
-        port, _ = resolve_port(cfg, args)
-    environment = "live" if _is_live_env(cfg, args, port) else "paper"
 
     def _open(writable):
         try:
@@ -2163,15 +2154,30 @@ def cmd_resolve(cfg, args):
         account = getattr(args, "account", None) or cfg.get("account")
         if not account:
             sys.exit("⛔ --list 需要 --account 或在配置里指定账户")
+        # NEVER auto-detect the environment here.  `resolve_port` probes TCP
+        # ports, so with no gateway running (exactly when an unresolved send is
+        # most likely) it falls back to live and a paper reservation disappears
+        # behind a cheerful "没有未决预留".  Only an explicit --paper/--port
+        # narrows the search; otherwise both environments are reported.
+        if getattr(args, "port", None):
+            environment = ("live" if _is_live_env(cfg, args, args.port)
+                           else "paper")
+        elif getattr(args, "paper", False):
+            environment = "paper"
+        else:
+            environment = None
         blocked = resolve_mod.unresolved_summary(
             ledger, account=account, environment=environment)
+        scope_text = environment or "全部环境"
         if not blocked:
-            print(f"账户 {account}（{environment}）没有未决预留。")
+            print(f"账户 {account}（{scope_text}）没有未决预留。")
             return 0
-        print(f"账户 {account}（{environment}）有 {len(blocked)} 个未决预留，"
+        print(f"账户 {account}（{scope_text}）有 {len(blocked)} 个未决预留，"
               "新增风险已被阻断：")
         for item in blocked:
-            print(f"  {item.reservation_id}  状态={item.state}  日={item.day_key}")
+            where = "" if environment else f"  [{item.environment}]"
+            print(f"  {item.reservation_id}  状态={item.state}  日={item.day_key}"
+                  f"{where}")
             for ref, action, qty, leg_state in item.legs:
                 print(f"     {ref}  {action} {qty}  {leg_state}")
         print("\n用 `thetamill resolve --reservation <id>` 抓取实时券商证据核对。")
@@ -2199,13 +2205,43 @@ def cmd_resolve(cfg, args):
         return 0
 
     # confirmed: 必须拿到实时只读券商证据
+    reservation = ledger.get_reservation(args.reservation)
+    if reservation is None:
+        print(f"⛔ 未释放：账本里没有预留 {args.reservation}")
+        return 2
+    try:
+        scope_account, scope_environment = resolve_mod.scope_parts(reservation.scope)
+    except resolve_mod.ResolveError as exc:
+        print(f"⛔ 未释放：{exc}")
+        return 2
+    # Connect to the environment the RESERVATION belongs to, and check it before
+    # reading anything.  Auto-detection answers "which gateway is up", not "which
+    # environment this reservation is in"; a mismatch would otherwise search the
+    # wrong account and report "no execution", which reads like proof of no-send.
+    if getattr(args, "port", None):
+        port = args.port
+    elif getattr(args, "paper", False):
+        port = cfg["paper_port"]
+    else:
+        port, _ = resolve_port(cfg, args)
+    connection_environment = "live" if _is_live_env(cfg, args, port) else "paper"
+    if connection_environment != scope_environment:
+        hint = ("请加 --paper 或 --port <纸账户端口>" if scope_environment == "paper"
+                else "请改用实盘端口")
+        print(f"⛔ 未释放：预留 {args.reservation} 属于 {scope_environment} 环境，"
+              f"但当前会连接 {connection_environment}（端口 {port}）。{hint}")
+        return 2
     ib = connect(cfg, port, readonly=True, args=args)
     try:
         account = _selected_account(ib, cfg, args)
+        if str(account) != scope_account:
+            print(f"⛔ 未释放：预留 {args.reservation} 属于账户 {scope_account}，"
+                  f"当前连接的是 {account}。")
+            return 2
         observations = resolve_mod.live_observations(ib, account=account)
         snapshot = None
         try:
-            candidate = _risk_snapshot(ib, cfg, args, environment)
+            candidate = _risk_snapshot(ib, cfg, args, scope_environment)
         except Exception as exc:
             print(f"  ⚠️ 无法采集账户快照（{exc}）；仅用成交记录核对。")
         else:
