@@ -442,5 +442,6 @@ run         → 复核码 180EE04B → 提交 #104 PreSubmitted → 撤单归 0
 ### 3. 门禁
 
 - 全量离线：`python -m unittest discover -s tests` → **824 项通过**（Python 3.10 `.venv`，ib_async 2.1.0；Python 3.13 独立环境同样 824 项通过）。
-- 其余 CI 步骤已在本地逐步复现通过：`ruff check --select E9,F thetamill tests`（`All checks passed!`）、`git diff --check`、冲突标记扫描、构建 wheel 后在无配置的干净 venv 中从 site-packages 运行 824 项测试，以及 `thetamill --help` / `python -I -m thetamill --help` / 17 个子命令 `--help` 全部 rc 0。推送后仍以 GitHub Actions 实际结果为准。
+- 其余 CI 步骤已在本地逐步复现通过：`ruff check --select E9,F thetamill tests`（`All checks passed!`）、`git diff --check`、冲突标记扫描、构建 wheel 后在无配置的干净 venv 中从 site-packages 运行 824 项测试，以及 `thetamill --help` / `python -I -m thetamill --help` / 17 个子命令 `--help` 全部 rc 0。
+- 推送后 GitHub Actions 实际结果：run `42451022518`（提交 `fd90768`）在 3.10 与 3.13 两个矩阵**全部 8 步通过**。此前 `682b6aa` 的两个矩阵均在「Source regression tests」失败，后续两步被跳过从未执行——即静态检查与安装包门禁在本仓库**首次真正跑通**。
 - 仍未验证：任何真实券商证据。上述解除路径只经过 mock 与临时 SQLite 账本验证；真实账户上仍需单独授权后按只读 → 纸账户提交/撤单分层验收。
