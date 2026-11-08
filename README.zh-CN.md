@@ -92,6 +92,9 @@ thetamill --paper audit --today
 | `chain` | 期权链、报价、Greeks、DTE | 只读 |
 | `plan` | 当日建议（DTE 窗口 + OTM 选价 + 成本价下限） | 只读 |
 | `audit` | 审计日志 | 只读 |
+| `report` | 盘中风险快照（终端 / JSON / Markdown） | 只读 |
+| `reconcile` | 只读券商对账；不重发、不撤单、不自动解除未知预留 | 只读 |
+| `roll-plan` | 展期建议；独立 schema，`run` 拒绝执行 | 只读 |
 | `order` | 股票/期权单腿下单 | 需复核码 |
 | `strat`（别名 `combo`） | 三种策略；备兑正股与期权腿顺序执行 | 需复核码 |
 | `run` | 执行 `plan` 生成的建议 | 需复核码 |
@@ -122,9 +125,11 @@ thetamill --paper audit --today
 
 需要券商连接的只读命令使用 `ib_async` 的 `readonly=True` 参数；这不是服务端订单权限或 ACL，不能据此宣称服务端拒绝该会话发单。这些命令自身不主动提交委托；Gateway/TWS 的 Read-Only API 配置是另一个控制。
 
-本地复核码消费记录与 JSONL 审计不是原子提交账本；并发进程、提交前后崩溃与回执不明仍有局限。账户级原子预留与对账属于后续路线图。旧计划应重新运行 `plan` 生成，不能手改补齐缺失或不兼容的合约身份。
+B 阶段已落地权威本地 SQLite 账本（`thetamill/state.py`），每次 `BEGIN IMMEDIATE` 事务原子完成 intent 认领、风险预留与状态迁移；`thetamill/execution.py` 在发单前刷新券商状态并复核有效期/配额/合约身份，网络发送前持久化 `submitting` 与稳定 `orderRef`，回执不明进入 `unknown` 交由 `reconcile` 只读对账而非重发。账户与环境范围是账本键的一部分。
 
-离线 Mock、离线真实 `ib_async` 合约对象、Gateway 只读、纸账户提交撤单、成交是不同证据等级。历史 76 项测试通过不代表 100% 覆盖率或当前版本验收通过；A 批离线工作不代表新增券商验证，详见[验证记录](docs/VERIFICATION.zh-CN.md)。
+仍需注意的边界：该账本只协调同一主机、同一账本的本工具进程，不控制人工 TWS、其他机器或第三方客户端，也不提供券商端 exactly-once 语义。`readonly=True` 是 `ib_async` 客户端参数，不是服务端订单 ACL。旧 JSON 复核码消费记录仅作兼容保留，不再承担并发与配额职责。旧计划应重新运行 `plan` 生成，不能手改补齐缺失或不兼容的合约身份。
+
+离线 Mock、离线真实 `ib_async` 合约对象、Gateway 只读、纸账户提交撤单、成交是不同证据等级。历史 76 项测试通过不代表 100% 覆盖率或当前版本验收通过；B–F 离线套件不代表新增券商验证，2026-11-08 纸账户实跑仅覆盖提交与撤单，不含成交。详见[验证记录](docs/VERIFICATION.zh-CN.md)。
 
 ---
 

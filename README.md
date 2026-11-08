@@ -92,6 +92,9 @@ thetamill --paper audit --today
 | `chain` | Option chain, quotes, Greeks, DTE | read-only |
 | `plan` | Today's recommendations (DTE window + OTM strike + cost-basis floor) | read-only |
 | `audit` | Order audit log | read-only |
+| `report` | Intraday risk snapshot (terminal / JSON / Markdown) | read-only |
+| `reconcile` | Read-only broker reconciliation; never resends, cancels, or frees unknown reservations | read-only |
+| `roll-plan` | Roll recommendation; separate schema that `run` refuses to execute | read-only |
 | `order` | Single-leg stock or option order | approval code |
 | `strat` (`combo` alias) | One of the three strategies; covered-call legs execute sequentially | approval code |
 | `run` | Execute a plan item | approval code |
@@ -122,9 +125,11 @@ Plus coverage checks and contract identity binding that make the three strategie
 
 Broker-connected read-only commands request `ib_async` connections with `readonly=True`; this client parameter is not a server-side order permission or ACL. These commands do not intentionally submit orders. Gateway/TWS Read-Only API configuration is a separate control.
 
-The local consumed-code record and JSONL audit are not an atomic submission ledger: concurrent processes and a crash around submission remain limitations. Account-scoped atomic reservation/reconciliation belongs to the later roadmap. Regenerate old plan files with `plan`; missing or incompatible contract identity must not be patched by hand.
+Stage B adds an authoritative local SQLite ledger (`thetamill/state.py`) that atoms an intent claim, risk reservation and state transition per `BEGIN IMMEDIATE` transaction; `thetamill/execution.py` refreshes broker state, re-checks expiry/quota/contract identity, persists `submitting` plus a stable `orderRef` before the network send, and parks unknown receipts in `unknown` for `reconcile` instead of resending. Account and environment scoping is part of the ledger key.
 
-Verification is layered: offline Mock tests, offline real `ib_async` contract objects, Gateway read-only checks, paper submission/cancellation, and fills are distinct evidence. Historical 76-test results do not establish 100% coverage or acceptance of this revision. No new broker verification is implied by Stage A offline work; see [verification records](docs/VERIFICATION.zh-CN.md).
+Remaining limits: this ledger coordinates only this tool's processes on the same host with the same database — not manual TWS, other machines, or third-party clients — and gives no broker-side exactly-once guarantee. `readonly=True` is an `ib_async` client parameter, not a server-side order ACL. The legacy JSON code-consumption file is kept only for compatibility and no longer carries concurrency or quota duty. Regenerate old plan files with `plan`; missing or incompatible contract identity must not be patched by hand.
+
+Verification is layered: offline Mock tests, offline real `ib_async` contract objects, Gateway read-only checks, paper submission/cancellation, and fills are distinct evidence. Historical 76-test results do not establish 100% coverage or acceptance of this revision. Stage B–F offline suites do not imply new broker verification; the 2026-11-08 paper run covered submission and cancellation only, not fills. See [verification records](docs/VERIFICATION.zh-CN.md).
 
 ---
 

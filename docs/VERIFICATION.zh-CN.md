@@ -25,6 +25,12 @@
 
 以下为 2026-11-07 记录的可追溯离线检查点，不覆盖其后 2026-11-08 的真实网关验收，也不代表 A–F 已全部完成。
 
+> **CI 状态说明（2026-11-08 核实）**：`.github/workflows/offline.yml` 自加入起 6 次 Actions 运行全部在 0 秒内失败且未创建任何 job——job 级 `env` 使用了 `runner` 上下文，而该上下文只在 step 级可用（`actionlint` 报 `context "runner" is not allowed here`）。因此上表所有"双环境通过"结论均来自**本地实跑**，不是 CI 通过。工作流已改为用 `github.workspace` 派生临时路径，`actionlint` 通过；本地已按该流程完整复现 Python 3.10.20 与 3.13.13（ib_async 2.1.0）各 778 项全绿、wheel 隔离安装与 16 个子命令帮助。CI 绿需以修复后的实际运行记录为准，此前不得宣称 CI 门禁生效。
+
+> **静态检查基线（2026-11-08）**：`ruff check --select E9,F thetamill tests` 返回 `All checks passed!`（此前 tests/ 有 11 项 F401/F841 未处理）。该检查已作为独立步骤接入 `.github/workflows/offline.yml`，`pyproject.toml` 的 `dev` extra 固定了同一版本（`ruff==0.17.4`），本地与 CI 是同一个检查。基线建成后应要求变更不新增 E9/F 问题；这不等于 ruff 全规则（如 E501、I、B）通过，那些规则尚未启用。
+
+> **语句覆盖率（2026-11-08 本地实测，非 CI 门禁）**：在隔离 venv（Python 3.10 + `ib_async` 2.1.0）用 `coverage run --source=thetamill -m unittest discover -s tests` 测得语句覆盖率 **83%（6993 条语句，未覆盖 1208 条）**；分模块：`report` 97%、`roll` 94%、`broker_state` 92%、`risk` 90%、`state` 89%、`planning` 89%、`plan_cli` 87%、`universe` 87%、`roll_cli` 86%、`execution` 82%、`submission_cli` 77%、`cli` 72%。这是**语句**覆盖率，不含分支覆盖率；仓库尚未配置覆盖率门禁或 CI 覆盖率上传，因此该数字不能替代逐入口的风险规则核对，也不能据此宣称任何交易场景已被完整覆盖。
+
 | 固定候选 | 验证范围 | 实际结果 | 限制 |
 |---|---|---|---|
 | `834f1e60491c9bf62dbff8be246759404b0e7966` | A 合约身份、真实乘数、覆盖/资金及执行安全；全新浅 clone | Python 3.10.20 / 3.13.12 各 111 项源码测试及 111 项安装 wheel 测试通过；确认从 site-packages 导入 | 仅离线；PR #1 尚未合并，不是 main 上线或券商验收 |
@@ -39,15 +45,15 @@
 - `test_cli_logic.py` (38)
 - `test_contract_identity.py` (25)
 - `test_execution_safety.py` (34)
-- `test_execution_state.py` (59)
+- `test_execution_state.py` (68)
 - `test_plan_cli.py` (59)
 - `test_planning.py` (60)
 - `test_report.py` (31)
 - `test_risk_limits.py` (78)
 - `test_roll.py` (88)
 - `test_roll_cli.py` (67)
-- `test_state.py` (59)
-- `test_submission_cli.py` (100)
+- `test_state.py` (56)
+- `test_submission_cli.py` (105)
 - `test_submission_integration.py` (8)
 - `test_universe.py` (14)
 所有公共执行路径（`cmd_order`、`cmd_combo`、`cmd_run`）已完全统一代理至 `submission_cli.execute_prepared`，旧 `_code` 回退与直接 `ib.placeOrder` 完全移除；正向 handoff 严格核验 11 项规范合约身份字段；全新账本净减风险例外保留迁移冻结门禁。
