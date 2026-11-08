@@ -876,6 +876,18 @@ def cmd_cancel(cfg, args):
         ib.cancelOrder(t.order)
         ib.sleep(1.5)
         print(f"已请求撤单 #{args.order_id} → 状态 {t.orderStatus.status}")
+        order_ref = str(getattr(t.order, "orderRef", "") or "")
+        if order_ref and t.orderStatus.status in ("Cancelled", "ApiCancelled"):
+            try:
+                from .state import SubmissionLedger
+                path = _data_dir() / "state.sqlite3"
+                if path.exists():
+                    ledger = SubmissionLedger(path, cfg.get("risk", {}).get("day_timezone", "UTC"))
+                    ledger.confirm_leg(order_ref, broker_status=t.orderStatus.status,
+                                       perm_id=getattr(t.order, "permId", None),
+                                       order_id=getattr(t.order, "orderId", None))
+            except Exception:
+                pass
         return 0
     finally:
         finish(ib)
