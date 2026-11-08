@@ -2,6 +2,7 @@
 config.json
 .env
 *.local.json
+delivery_evidence.json
 
 # 运行时数据（审计日志含真实委托记录）
 logs/

@@ -1,0 +1,24 @@
+{
+  "schema": "thetamill.deliverables.v1",
+  "records": [
+    {
+      "instrument": {
+        "con_id": 937548729,
+        "underlying_id": 265598,
+        "symbol": "AAPL",
+        "currency": "USD",
+        "sec_type": "OPT",
+        "exchange": "SMART",
+        "multiplier": "100",
+        "right": "P",
+        "strike": "350.0",
+        "expiry": "20261204",
+        "trading_class": "AAPL"
+      },
+      "stock_only": true,
+      "source": "IB contract details verified stock deliverable",
+      "verified_at": "2026-11-08T00:00:00+00:00",
+      "expires_at": "2026-11-15T00:00:00+00:00"
+    }
+  ]
+}
