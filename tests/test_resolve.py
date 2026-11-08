@@ -355,6 +355,370 @@ class ReleasedStateTests(LedgerCase):
             self.ledger, rid, account=ACCOUNT, environment=ENV))
 
 
+class NeverSentReleaseTests(LedgerCase):
+    """``released`` is the provable-no-send exit and nothing else."""
+
+    def _reserved_only(self):
+        """A reservation whose legs were recorded but never attempted."""
+        self.grant_day_budget()
+        self.ledger.set_resource(account=ACCOUNT, environment=ENV,
+                                 currency="USD", resource_key="cash_base",
+                                 amount=Decimal("1000000"))
+        intent = self.ledger.create_intent(
+            account=ACCOUNT, environment=ENV, payload={"kind": "x", "legs": [{}]},
+            config={}, ttl_seconds=600, now=NOW)
+        self.ledger.claim_intent(account=ACCOUNT, environment=ENV,
+                                 intent_id=intent["intent_id"],
+                                 full_digest=intent["full_digest"],
+                                 code=intent["approval_code"], now=NOW)
+        rid = self.ledger.reserve(
+            account=ACCOUNT, environment=ENV, intent_id=intent["intent_id"],
+            day_key=DAY, items=[state.RiskReservationSpec("USD", "cash_base", "1")],
+            day_submission_slots=1, now=NOW)
+        self.ledger.record_legs(
+            intent_id=intent["intent_id"], reservation_id=rid, now=NOW,
+            legs=[{"contract_id": "1", "action": "SELL", "quantity": "1",
+                   "order_ref": "ref-never-sent"}])
+        return rid
+
+    def test_release_requires_a_written_reason(self):
+        rid = self._reserved_only()
+        for why in ("", "   ", None, 0):
+            with self.assertRaises(resolve_mod.ResolveError):
+                resolve_mod.release_never_sent(self.ledger, rid, why=why)
+        # Nothing was released by the refused attempts.
+        reservation = self.ledger.get_reservation(rid)
+        self.assertEqual(reservation.state, "reserved")
+
+    def test_release_refuses_an_unknown_reservation(self):
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.release_never_sent(self.ledger, "res-nope",
+                                           why="never sent")
+        self.assertIn("unknown reservation", str(cm.exception))
+
+    def test_release_frees_a_provably_unsent_reservation(self):
+        rid = self._reserved_only()
+        outcome = resolve_mod.release_never_sent(self.ledger, rid,
+                                                 why="operator never sent it")
+        self.assertEqual(outcome.status, "released")
+        self.assertEqual(outcome.released, ())
+        self.assertEqual(self.ledger.get_reservation(rid).state, "aborted")
+
+    def test_never_sent_provable_refuses_an_unknown_reservation(self):
+        with self.assertRaises(resolve_mod.ResolveError):
+            resolve_mod.never_sent_provable(self.ledger, "res-nope",
+                                            account=ACCOUNT, environment=ENV)
+
+    def test_never_sent_provable_refuses_a_terminal_reservation(self):
+        rid, _ = self.seed(leg_state="unknown")
+        self.ledger.resolve_unknown(rid, state="confirmed", now=NOW)
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.never_sent_provable(self.ledger, rid,
+                                            account=ACCOUNT, environment=ENV)
+        self.assertIn("not outstanding", str(cm.exception))
+
+
+class ResolutionGuardTests(LedgerCase):
+    """Every guard is fail-closed: a rejection never releases anything."""
+
+    def test_naive_now_is_refused(self):
+        rid, _ = self.seed(leg_state="unknown")
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.resolve_reservation(
+                self.ledger, rid, executions=fills_provider([raw_fill()]),
+                now=datetime(2026, 11, 8, 12, 0, 0))   # naive on purpose
+        self.assertIn("aware datetime", str(cm.exception))
+
+    def test_unknown_reservation_is_refused(self):
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.resolve_reservation(
+                self.ledger, "res-nope", executions=fills_provider([]), now=NOW)
+        self.assertIn("unknown reservation", str(cm.exception))
+
+    def test_already_resolved_reservation_is_refused(self):
+        rid, _ = self.seed(leg_state="unknown")
+        self.ledger.resolve_unknown(rid, state="confirmed", now=NOW)
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.resolve_reservation(
+                self.ledger, rid, executions=fills_provider([raw_fill()]), now=NOW)
+        self.assertIn("not unresolved", str(cm.exception))
+
+    def test_missing_execution_observation_is_refused(self):
+        rid, _ = self.seed(leg_state="unknown")
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.resolve_reservation(
+                self.ledger, rid, executions=None, now=NOW)
+        self.assertIn("no broker execution observation", str(cm.exception))
+
+    def test_non_list_execution_observation_is_refused(self):
+        rid, _ = self.seed(leg_state="unknown")
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.resolve_reservation(
+                self.ledger, rid, executions=lambda **_: (r for r in ()),
+                now=NOW)
+        self.assertIn("not a list", str(cm.exception))
+
+    def test_future_execution_is_refused(self):
+        """A broker row stamped after 'now' is clock skew, not evidence."""
+        rid, _ = self.seed(leg_state="unknown")
+        fill = raw_fill()
+        fill.execution.time = NOW + timedelta(minutes=5)
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.resolve_reservation(
+                self.ledger, rid, executions=fills_provider([fill]), now=NOW)
+        self.assertIn("future", str(cm.exception))
+
+    def test_stale_execution_is_refused(self):
+        rid, _ = self.seed(leg_state="unknown")
+        fill = raw_fill()
+        fill.execution.time = NOW - timedelta(hours=2)
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.resolve_reservation(
+                self.ledger, rid, executions=fills_provider([fill]), now=NOW)
+        self.assertIn("stale", str(cm.exception))
+
+    def test_reservation_without_legs_is_refused(self):
+        """A reservation whose legs vanished must never be released."""
+        rid, _ = self.seed(leg_state="unknown")
+        real = self.ledger
+
+        class _Stub:
+            def get_reservation(self, reservation_id):
+                return real.get_reservation(reservation_id)
+
+            def list_legs(self, **kwargs):
+                return []
+
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.resolve_reservation(_Stub(), rid,
+                                            executions=fills_provider([]), now=NOW)
+        self.assertIn("no recorded legs", str(cm.exception))
+        self.assertEqual(real.get_reservation(rid).state, "unknown")
+
+    def test_reservation_with_no_unresolved_leg_is_refused(self):
+        """Derivation normally prevents it, but the guard must still hold."""
+        rid, _ = self.seed(leg_state="unknown")
+        real = self.ledger
+        legs = [real.get_leg("ref-1", account=ACCOUNT, environment=ENV)]
+
+        class _Stub:
+            def get_reservation(self, reservation_id):
+                # Claim "unknown" while every recorded leg is already terminal.
+                return SimpleNamespace(reservation_id=reservation_id,
+                                       state="unknown",
+                                       scope=real.get_reservation(
+                                           reservation_id).scope)
+
+            def list_legs(self, **kwargs):
+                return [SimpleNamespace(order_ref=leg.order_ref,
+                                        action=leg.action,
+                                        quantity=leg.quantity,
+                                        state="confirmed",
+                                        reservation_id=rid,
+                                        intent_id=leg.intent_id,
+                                        leg_index=leg.leg_index)
+                        for leg in legs]
+
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.resolve_reservation(_Stub(), rid,
+                                            executions=fills_provider([]), now=NOW)
+        self.assertIn("no unresolved legs", str(cm.exception))
+        self.assertEqual(real.get_reservation(rid).state, "unknown")
+
+
+class FillRowAdapterTests(unittest.TestCase):
+    """A partially-understood execution row is never evidence."""
+
+    def test_unusable_value_shapes_become_none(self):
+        self.assertIsNone(resolve_mod._decimal_or_none(None))
+        self.assertIsNone(resolve_mod._decimal_or_none(True))     # bool, not 1
+        self.assertIsNone(resolve_mod._decimal_or_none(1.5))      # float: lossy
+        self.assertIsNone(resolve_mod._decimal_or_none(object()))  # unparseable
+        self.assertIsNone(resolve_mod._decimal_or_none("NaN"))
+        self.assertIsNone(resolve_mod._decimal_or_none("Infinity"))
+        self.assertEqual(resolve_mod._decimal_or_none("2.5"), Decimal("2.5"))
+
+    def test_execution_without_a_usable_exec_id_is_none(self):
+        for exec_id in ("", "   ", None, 17):
+            with self.subTest(exec_id=exec_id):
+                row = raw_fill()
+                row.execution.execId = exec_id
+                self.assertIsNone(resolve_mod.fill_from_row(row, account=ACCOUNT))
+
+    def test_foreign_account_or_missing_order_ref_is_none(self):
+        row = raw_fill()
+        row.execution.orderRef = ""
+        self.assertIsNone(resolve_mod.fill_from_row(row, account=ACCOUNT))
+        row = raw_fill()
+        row.execution.acctNumber = "DU0000000"
+        self.assertIsNone(resolve_mod.fill_from_row(row, account=ACCOUNT))
+
+    def test_con_id_must_come_from_somewhere_consistent(self):
+        # (a) no contract conId, an int execution conId: the execution wins.
+        row = raw_fill()
+        row.contract = SimpleNamespace()
+        fill = resolve_mod.fill_from_row(row, account=ACCOUNT)
+        self.assertIsNotNone(fill)
+        self.assertEqual(fill.con_id, 937548729)
+        # (b) contract and execution disagree: never evidence.
+        row = raw_fill()
+        row.execution.conId = 111111
+        self.assertIsNone(resolve_mod.fill_from_row(row, account=ACCOUNT))
+        # (c) neither side carries a usable int conId.
+        row = raw_fill()
+        row.contract = SimpleNamespace(conId="937548729")   # a str, not an int
+        row.execution.conId = None
+        self.assertIsNone(resolve_mod.fill_from_row(row, account=ACCOUNT))
+
+    def test_unreadable_economics_are_none(self):
+        cases = {
+            "side": lambda r: setattr(r.execution, "side", 1),
+            "shares": lambda r: setattr(r.execution, "shares", float("nan")),
+            "price": lambda r: setattr(r.execution, "price", None),
+            "cumQty": lambda r: setattr(r.execution, "cumQty", "lots"),
+            "naive time": lambda r: setattr(
+                r.execution, "time", datetime(2026, 11, 8, 12, 0, 0)),
+            "no time": lambda r: setattr(r.execution, "time", "2026-11-08"),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                row = raw_fill()
+                mutate(row)
+                self.assertIsNone(
+                    resolve_mod.fill_from_row(row, account=ACCOUNT))
+
+    def test_missing_cum_qty_falls_back_to_shares(self):
+        row = raw_fill(shares=1)
+        row.execution.cumQty = None
+        fill = resolve_mod.fill_from_row(row, account=ACCOUNT)
+        self.assertIsNotNone(fill)
+        self.assertEqual(fill.cum_qty, Decimal(1))
+
+    def test_non_int_broker_ids_are_dropped_not_guessed(self):
+        row = raw_fill()
+        row.execution.permId = "11"
+        row.execution.orderId = 140.0
+        fill = resolve_mod.fill_from_row(row, account=ACCOUNT)
+        self.assertIsNone(fill.perm_id)
+        self.assertIsNone(fill.order_id)
+
+
+class ScopeAndLedgerHandleTests(unittest.TestCase):
+
+    def test_malformed_scope_is_refused(self):
+        for scope in ("onlyone", "a\x1fb\x1fc", "\x1fpaper", "DU1\x1f  "):
+            with self.subTest(scope=scope):
+                with self.assertRaises(resolve_mod.ResolveError):
+                    resolve_mod.scope_parts(scope)
+
+    def test_open_ledger_wraps_a_broken_ledger_as_a_resolve_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(resolve_mod.ResolveError) as cm:
+                resolve_mod.open_ledger(Path(tmp) / "absent.sqlite3", "UTC",
+                                        writable=False)
+            self.assertIn("cannot open the submission ledger", str(cm.exception))
+            # A read-only open must never create the file it failed on.
+            self.assertFalse((Path(tmp) / "absent.sqlite3").exists())
+
+    def test_open_ledger_read_only_is_the_default_for_inspection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+            writable = resolve_mod.open_ledger(path, "UTC", writable=True)
+            writable.set_resource(account=ACCOUNT, environment=ENV,
+                                  currency="USD", resource_key="cash_base",
+                                  amount=Decimal("1"))
+            opened = resolve_mod.open_ledger(path, "UTC", writable=False)
+            self.assertTrue(opened.read_only)
+            self.assertEqual(opened.list_legs(account=ACCOUNT,
+                                              environment=ENV), [])
+
+
+class LiveObservationTests(unittest.TestCase):
+    """``live_observations`` merges ib_async fills + executions, deduped."""
+
+    class _Broker:
+        def __init__(self, *, fills=None, executions=None):
+            self._fills = fills
+            self._executions = executions
+            self.calls = 0
+
+        def fills(self):
+            self.calls += 1
+            if isinstance(self._fills, Exception):
+                raise self._fills
+            return self._fills
+
+        def executions(self):
+            self.calls += 1
+            if isinstance(self._executions, Exception):
+                raise self._executions
+            return self._executions
+
+    def test_merges_both_sources(self):
+        first, second = raw_fill(), raw_fill(perm=12, oid=141)
+        second.execution.execId = "0002"
+        broker = self._Broker(fills=[first], executions=(second,))
+        rows = resolve_mod.live_observations(broker, account=ACCOUNT).executions(
+            account=ACCOUNT)
+        self.assertEqual(list(rows), [first, second])
+
+    def test_deduplicates_by_exec_id_across_sources(self):
+        """ib_async reports the same execution through both calls."""
+        row = raw_fill()
+        broker = self._Broker(fills=[row], executions=[row])
+        rows = resolve_mod.live_observations(broker, account=ACCOUNT).executions(
+            account=ACCOUNT)
+        self.assertEqual(list(rows), [row])
+
+    def test_rows_without_an_exec_id_are_all_kept(self):
+        a, b = raw_fill(), raw_fill()
+        a.execution.execId = ""
+        b.execution.execId = None
+        broker = self._Broker(fills=[a], executions=[b])
+        rows = resolve_mod.live_observations(broker, account=ACCOUNT).executions(
+            account=ACCOUNT)
+        self.assertEqual(list(rows), [a, b])
+
+    def test_a_raw_execution_row_needs_no_wrapper(self):
+        class _Bare:
+            def fills(self):
+                return [raw_fill().execution]
+
+        rows = resolve_mod.live_observations(_Bare(), account=ACCOUNT).executions(
+            account=ACCOUNT)
+        self.assertEqual(len(list(rows)), 1)
+
+    def test_missing_getters_are_skipped(self):
+        class _Bare:
+            def fills(self):
+                return [raw_fill()]
+
+        rows = resolve_mod.live_observations(_Bare(), account=ACCOUNT).executions(
+            account=ACCOUNT)
+        self.assertEqual(len(list(rows)), 1)
+
+    def test_a_none_payload_is_refused_not_read_as_no_executions(self):
+        """``None`` from a getter is a broken adapter, not "nothing traded"."""
+        broker = self._Broker(fills=None, executions=[])
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.live_observations(broker, account=ACCOUNT)
+        self.assertIn("not a list", str(cm.exception))
+
+    def test_broker_failure_never_becomes_an_empty_observation(self):
+        """Silently returning nothing would read as 'the order never filled'."""
+        broker = self._Broker(fills=RuntimeError("gateway dropped"),
+                              executions=[])
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.live_observations(broker, account=ACCOUNT)
+        self.assertIn("cannot read broker executions", str(cm.exception))
+
+    def test_a_non_list_payload_is_refused(self):
+        broker = self._Broker(fills={"0001": raw_fill()}, executions=[])
+        with self.assertRaises(resolve_mod.ResolveError) as cm:
+            resolve_mod.live_observations(broker, account=ACCOUNT)
+        self.assertIn("not a list", str(cm.exception))
+
+
 class CliResolveTests(LedgerCase):
     """The CLI command itself: no evidence => no release, ever."""
 

@@ -29,4 +29,7 @@ venv/
 
 # 覆盖率测量产物
 .coverage
+coverage.json
 htmlcov/
+# CI 临时目录（THETAMILL_DATA / 覆盖率报告）
+.ci/

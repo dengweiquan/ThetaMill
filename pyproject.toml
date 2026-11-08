@@ -21,7 +21,7 @@ classifiers = [
 dependencies = ["ib_async>=2.0"]
 
 [project.optional-dependencies]
-dev = ["ruff==0.17.4"]
+dev = ["ruff==0.17.4", "coverage[toml]==7.16.2"]
 
 [project.urls]
 Homepage = "https://github.com/dengweiquan/ThetaMill"
@@ -31,3 +31,21 @@ thetamill = "thetamill.cli:main"
 
 [tool.setuptools]
 packages = ["thetamill"]
+
+[tool.coverage.run]
+# Only the shipped package counts.  Tests are the instrument, not the subject.
+source = ["thetamill"]
+
+[tool.coverage.report]
+# A FLOOR, not a target: raising it as tests are added is fine, lowering it is a
+# deliberate decision that must be argued in the commit message.  Pinned at the
+# measured value so a change that removes coverage fails CI instead of quietly
+# eroding the safety net around the risk/money code.
+fail_under = 83
+show_missing = true
+skip_covered = false
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+]

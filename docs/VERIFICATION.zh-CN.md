@@ -439,9 +439,20 @@ run         → 复核码 180EE04B → 提交 #104 PreSubmitted → 撤单归 0
 - 回归：`tests/test_audit.py` 19 项（真实提交写且只写一条、预检/冻结不写、mock 字段被丢弃且文件里不出现 `MagicMock`、合成行不与真实行混淆、账本独有条目可见、mock 行不占用复核码）。
 - 对真实数据只做了只读 smoke：`thetamill audit --account DUR339329` 显示隐藏 94 条合成记录、仅 2 条真实条目（#133 `PreSubmitted`、#140），并标注两条都只存在于账本。历史日志文件未修改、未删除。
 
-### 3. 门禁
+### 3. 覆盖率门禁（P2）
 
-- 全量离线：`python -m unittest discover -s tests` → **824 项通过**（Python 3.10 `.venv`，ib_async 2.1.0；Python 3.13 独立环境同样 824 项通过）。
-- 其余 CI 步骤已在本地逐步复现通过：`ruff check --select E9,F thetamill tests`（`All checks passed!`）、`git diff --check`、冲突标记扫描、构建 wheel 后在无配置的干净 venv 中从 site-packages 运行 824 项测试，以及 `thetamill --help` / `python -I -m thetamill --help` / 17 个子命令 `--help` 全部 rc 0。
+- 动因：此前「测试全绿」只有一个总数，无法区分「风控/账本被测到多少」和「帮助文本被测到多少」。800+ 项测试对齐的是流程，不是每次改动后的覆盖面。
+- 新增 `scripts/coverage_gate.py`：一个全局下限（83%）加 9 个按**资金/风险影响**挑选的模块下限（`execution`/`submission_cli`/`resolve`/`state`/`risk`/`audit`/`broker_state`/`planning`/`cli`）。每个下限都是**当前实测值**的回归保护，不是目标值；下调必须在提交说明里论证。报告文件缺失时返回 2，不会被读成「没有覆盖率问题」。
+- `pyproject.toml` 增加 `[tool.coverage.*]`，`dev` 依赖改为 `coverage[toml]==7.16.2`——7.17.x 要求 Python ≥3.11，而本项目支持 3.10，固定 7.17.2 会让 3.10 矩阵装不上。
+- CI 新增「Coverage floors for the money-path modules」一步：`coverage run` 跑全量 → `coverage json` → 跑门禁脚本。`ruff --select E9,F` 的扫描范围同时扩到 `scripts`。
+- 补测的两个空白：`resolve.py` 从 74% → **100%**（新增 32 项：`live_observations` 的 fills/executions 合并与 `execId` 去重、券商读取异常绝不退化成「没有成交」、非 list 载荷拒绝、`fill_from_row` 的每一种不可读字段、`open_ledger` 的只读/状态错误包装、malformed scope、`release_never_sent` 的全部拒绝分支）；函数级（只算函数体内语句）`freshness_gate` 91.1%、`_independent_requirements` 97.0%，分别比补测前的 49.4% 与 66.2% 大幅提高。
+- 门禁本身已证明会失败，并且这个结论被固化成回归：新增 `tests/test_coverage_gate.py` 11 项，通过真实 `main()` 覆盖每条失败路径——模块跌破下限返回 1、恰好等于下限返回 0、全局总数不足返回 1、被守护模块从报告里消失返回 1、报告缺失/JSON 损坏/JSON 形状不对返回 2、条目没有百分比返回 1、缺少参数返回 2，另有一项断言每个下限指向的文件仍然存在（文件被改名或删除时下限不该静默失效）。手工复核同样成立：把报告里 `resolve.py` 改成 50% → rc 1 并打印 `thetamill/resolve.py 50.0% < 90%`；删掉 `state.py` 条目 → rc 1 并标注 `not measured`。
+- 实测（Python 3.10.20 / 3.13.13 各自独立 venv + ib_async 2.1.0）：全局 **84.1%**，`resolve` 100%、`broker_state` 91.7%、`audit` 90.4%、`risk` 89.6%、`planning` 89.3%、`state` 89.1%、`execution` 82.0%、`submission_cli` 82.0%、`cli` 72.7%，两个版本都是 `COVERAGE GATE PASSED`。
+- 覆盖率不等于正确性：它只保证「这些行至少被执行过」，不保证断言有意义，也不覆盖任何一条真实券商交互路径。
+
+### 4. 门禁
+
+- 全量离线：`python -m unittest discover -s tests` → **884 项通过**（Python 3.10 `.venv`、3.10 独立 venv、Python 3.13 独立环境三处均为 884/884）。
+- 其余 CI 步骤已在本地逐步复现通过：`ruff check --select E9,F thetamill tests scripts`（`All checks passed!`）、`git diff --check`、冲突标记扫描、构建 wheel 后在无配置的干净 venv 中从 site-packages 运行全量测试，以及 `thetamill --help` / `python -I -m thetamill --help` / 17 个子命令 `--help` 全部 rc 0。
 - 推送后 GitHub Actions 实际结果：run `42451022518`（提交 `fd90768`）在 3.10 与 3.13 两个矩阵**全部 8 步通过**。此前 `682b6aa` 的两个矩阵均在「Source regression tests」失败，后续两步被跳过从未执行——即静态检查与安装包门禁在本仓库**首次真正跑通**。
 - 仍未验证：任何真实券商证据。上述解除路径只经过 mock 与临时 SQLite 账本验证；真实账户上仍需单独授权后按只读 → 纸账户提交/撤单分层验收。

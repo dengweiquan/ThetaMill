@@ -106,3 +106,13 @@ thetamill resolve --reservation <id> --state released --why "<书面理由>"
 ## 验收与授权
 
 离线测试、真实 ib_async 对象离线测试、Gateway 只读、纸账户提交/撤单、真实成交是不同证据等级。本轮 A 冷验证未进行新的账户操作。后续 Gateway 连接和任何纸账户委托/撤单仍须单独授权，不以工程 commit/push/PR 授权替代。
+
+本地跑覆盖率门禁（需要 `pip install -e '.[dev]'`，`coverage[toml]` 固定 7.16.2 以兼容 Python 3.10）：
+
+```
+coverage run -m unittest discover -s tests
+coverage json -o coverage.json
+python scripts/coverage_gate.py coverage.json
+```
+
+输出会逐模块打印实测值与下限。返回 0 才算通过；返回 1 表示某个模块跌破下限，返回 2 表示报告文件不存在（不会被当成「没有问题」）。下限是回归保护而不是目标：新代码应尽量把这些数字往上推，确实需要下调时在提交说明里写清理由。

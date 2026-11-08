@@ -797,6 +797,216 @@ class FreshnessGateTests(AdapterTestCase):
         self.assertIsNone(self.limits.max_snapshot_age_seconds)
         self.assertEqual(sc.DEFAULT_MAX_DATA_AGE_SECONDS, 30)
 
+    # -- quote-override handling: every unreadable override must BLOCK ---------
+    #
+    # A quote override is how the caller proves "this number is fresh and
+    # sourced".  A malformed override must never be treated as "no override,
+    # fall back to the snapshot's untimestamped value": that would let an
+    # operator-supplied bad quote silently degrade into stale data passing.
+
+    def test_fx_override_of_none_withdraws_the_snapshot_quote(self):
+        """``None`` means 'I have no evidence', not 'keep what the snapshot had'."""
+        fq = {"EUR": bs.FxQuote("EUR", Decimal("1.1"),
+                                NOW - timedelta(seconds=2), GOOD_SOURCE)}
+        snap = make_snapshot(base="USD", fx={"USD": Decimal(1), "EUR": Decimal("1.1")},
+                             cash_map={"USD": Decimal("100000"),
+                                       "EUR": Decimal("5000")}, fx_quotes=fq)
+        self.assertEqual(sc.freshness_gate(snap, self.legs, self.limits, now=NOW), [])
+        reasons = sc.freshness_gate(snap, self.legs, self.limits,
+                                    fx_quotes={"EUR": None}, now=NOW)
+        self.assertTrue(any("EUR" in r for r in reasons), reasons)
+
+    def test_fx_override_key_is_normalised_and_identity_checked(self):
+        snap = self._eur_snapshot()
+        # Lower-case key, quote naming the same currency -> accepted.
+        self.assertEqual(sc.freshness_gate(snap, self.legs, self.limits,
+                                           fx_quotes={"eur": self._quote("1.1")},
+                                           now=NOW), [])
+        # Quote claims a DIFFERENT currency than the key it is filed under.
+        wrong = sc.MarketQuote(Decimal("1.1"), NOW - timedelta(seconds=1),
+                               GOOD_SOURCE, currency="GBP")
+        reasons = sc.freshness_gate(snap, self.legs, self.limits,
+                                    fx_quotes={"EUR": wrong}, now=NOW)
+        self.assertTrue(any("identity mismatch" in r for r in reasons), reasons)
+
+    def test_fx_override_as_fxquote_with_wrong_currency_is_blocked(self):
+        snap = self._eur_snapshot()
+        wrong = bs.FxQuote("GBP", Decimal("1.1"), NOW - timedelta(seconds=1),
+                           GOOD_SOURCE)
+        reasons = sc.freshness_gate(snap, self.legs, self.limits,
+                                    fx_quotes={"EUR": wrong}, now=NOW)
+        self.assertTrue(any("identity mismatch" in r for r in reasons), reasons)
+
+    def test_fx_override_duck_typed_and_unusable_shapes_are_blocked(self):
+        snap = self._eur_snapshot()
+        # A duck-typed quote with a usable rate/timestamp is converted.
+        class DuckFx:
+            currency = "EUR"
+            rate = Decimal("1.1")
+            as_of = NOW - timedelta(seconds=1)
+            source = GOOD_SOURCE
+        self.assertEqual(sc.freshness_gate(snap, self.legs, self.limits,
+                                           fx_quotes={"EUR": DuckFx()}, now=NOW), [])
+        # ... but the same shape without a timestamp is unusable.
+        class NoStamp:
+            currency = "EUR"
+            price = Decimal("1.1")
+            source = GOOD_SOURCE
+        reasons = sc.freshness_gate(snap, self.legs, self.limits,
+                                    fx_quotes={"EUR": NoStamp()}, now=NOW)
+        self.assertTrue(any("unusable" in r for r in reasons), reasons)
+        # ... or carrying a non-finite rate.
+        class BadRate:
+            currency = "EUR"
+            rate = float("nan")
+            as_of = NOW - timedelta(seconds=1)
+            source = GOOD_SOURCE
+        reasons = sc.freshness_gate(snap, self.legs, self.limits,
+                                    fx_quotes={"EUR": BadRate()}, now=NOW)
+        self.assertTrue(any("unusable" in r for r in reasons), reasons)
+        # ... or naming yet another currency.
+        class OtherCur:
+            currency = "GBP"
+            rate = Decimal("1.1")
+            as_of = NOW - timedelta(seconds=1)
+            source = GOOD_SOURCE
+        reasons = sc.freshness_gate(snap, self.legs, self.limits,
+                                    fx_quotes={"EUR": OtherCur()}, now=NOW)
+        self.assertTrue(any("identity mismatch" in r for r in reasons), reasons)
+
+    def test_price_override_of_none_withdraws_the_snapshot_quote(self):
+        inst = stock_instrument(1001)
+        pos = Position(inst, Decimal(100), Decimal("180"))
+        pq = {1001: bs.PriceQuote(1001, Decimal("180"),
+                                  NOW - timedelta(seconds=2), GOOD_SOURCE)}
+        snap = make_snapshot(positions=(pos,), price_quotes=pq)
+        self.assertEqual(sc.freshness_gate(snap, self.legs, self.caps, now=NOW), [])
+        reasons = sc.freshness_gate(snap, self.legs, self.caps,
+                                    price_quotes={1001: None}, now=NOW)
+        self.assertTrue(any("1001" in r for r in reasons), reasons)
+
+    def test_price_override_with_a_non_numeric_conid_is_blocked(self):
+        """A quote filed under an unparseable key cannot back any position."""
+        inst = stock_instrument(1001)
+        pos = Position(inst, Decimal(100), Decimal("180"))
+        snap = make_snapshot(positions=(pos,))
+        reasons = sc.freshness_gate(snap, self.legs, self.caps,
+                                    price_quotes={"1001x": self._quote("180")},
+                                    now=NOW)
+        self.assertTrue(any("invalid conId" in r for r in reasons), reasons)
+
+    def test_price_quote_identity_and_unusable_shapes_are_blocked(self):
+        inst = stock_instrument(1001)
+        pos = Position(inst, Decimal(100), Decimal("180"))
+        snap = make_snapshot(positions=(pos,))
+        # Quote says conId 1002 but is filed under 1001.
+        wrong_id = bs.PriceQuote(1002, Decimal("180"),
+                                 NOW - timedelta(seconds=1), GOOD_SOURCE)
+        reasons = sc.freshness_gate(snap, self.legs, self.caps,
+                                    price_quotes={1001: wrong_id}, now=NOW)
+        self.assertTrue(any("identity mismatch" in r for r in reasons), reasons)
+        # MarketQuote binding to a different conId.
+        wrong_mq = sc.MarketQuote(Decimal("180"), NOW - timedelta(seconds=1),
+                                  GOOD_SOURCE, con_id=1002)
+        reasons = sc.freshness_gate(snap, self.legs, self.caps,
+                                    price_quotes={1001: wrong_mq}, now=NOW)
+        self.assertTrue(any("identity mismatch" in r for r in reasons), reasons)
+        # Duck-typed with no timestamp / no price.
+        class NoStamp:
+            con_id = 1001
+            price = Decimal("180")
+            source = GOOD_SOURCE
+        reasons = sc.freshness_gate(snap, self.legs, self.caps,
+                                    price_quotes={1001: NoStamp()}, now=NOW)
+        self.assertTrue(any("unusable" in r for r in reasons), reasons)
+
+    def test_typed_price_quotes_that_match_are_accepted(self):
+        """The two ACCEPT paths: an already-typed PriceQuote, and a MarketQuote.
+
+        Without these the only exercised price paths are rejections, so a
+        regression that rejected everything would still look green.
+        """
+        inst = stock_instrument(1001)
+        pos = Position(inst, Decimal(100), Decimal("180"))
+        snap = make_snapshot(positions=(pos,))
+        pq = {1001: bs.PriceQuote(1001, Decimal("180"),
+                                  NOW - timedelta(seconds=1), GOOD_SOURCE)}
+        self.assertEqual(sc.freshness_gate(snap, self.legs, self.caps,
+                                           price_quotes=pq, now=NOW), [])
+        mq = {1001: sc.MarketQuote(Decimal("180"), NOW - timedelta(seconds=1),
+                                   GOOD_SOURCE, con_id=1001)}
+        self.assertEqual(sc.freshness_gate(snap, self.legs, self.caps,
+                                           price_quotes=mq, now=NOW), [])
+
+    def test_typed_fx_quote_that_matches_is_accepted(self):
+        snap = self._eur_snapshot()
+        fq = {"EUR": bs.FxQuote("EUR", Decimal("1.1"), NOW - timedelta(seconds=1),
+                                GOOD_SOURCE)}
+        self.assertEqual(sc.freshness_gate(snap, self.legs, self.limits,
+                                           fx_quotes=fq, now=NOW), [])
+
+    def test_duck_typed_price_quote_that_matches_is_accepted(self):
+        inst = stock_instrument(1001)
+        pos = Position(inst, Decimal(100), Decimal("180"))
+        snap = make_snapshot(positions=(pos,))
+
+        class Duck:
+            con_id = 1001
+            price = Decimal("180")
+            as_of = NOW - timedelta(seconds=1)
+            source = GOOD_SOURCE
+        self.assertEqual(sc.freshness_gate(snap, self.legs, self.caps,
+                                           price_quotes={1001: Duck()}, now=NOW), [])
+
+    def test_market_quote_with_null_currency_is_filed_under_the_key(self):
+        """``MarketQuote.currency is None`` means 'the key identifies it'."""
+        snap = self._eur_snapshot()
+        q = sc.MarketQuote(Decimal("1.1"), NOW - timedelta(seconds=1), GOOD_SOURCE)
+        self.assertIsNone(q.currency)
+        self.assertEqual(sc.freshness_gate(snap, self.legs, self.limits,
+                                           fx_quotes={"EUR": q}, now=NOW), [])
+
+    def test_price_quote_rejected_by_the_quote_type_blocks_instead_of_crashing(self):
+        """A quote the PriceQuote constructor refuses becomes a reason."""
+        inst = stock_instrument(1001)
+        pos = Position(inst, Decimal(100), Decimal("180"))
+        snap = make_snapshot(positions=(pos,))
+        # Non-finite price: PriceQuote.price validates positive/finite, so the
+        # conversion raises and the gate must report rather than propagate.
+        bad = sc.MarketQuote(Decimal("0"), NOW - timedelta(seconds=1),
+                             GOOD_SOURCE, con_id=1001)
+        reasons = sc.freshness_gate(snap, self.legs, self.caps,
+                                    price_quotes={1001: bad}, now=NOW)
+        self.assertTrue(any("invalid" in r for r in reasons), reasons)
+
+    def test_max_age_override_applies_to_the_snapshot_but_never_to_quote_freshness(self):
+        """``max_age_seconds`` widens the SNAPSHOT window and nothing else.
+
+        Quote freshness is a fixed 30s policy: letting a caller-supplied window
+        relax it would turn "this price is proof" into "this price is old but I
+        said it was fine", which is exactly the inference the gate exists to
+        prevent.
+        """
+        snap = self._eur_snapshot()
+        q = {"EUR": self._quote("1.1", age=45)}
+        # 45s quote is blocked under the default 30s policy...
+        self.assertTrue(sc.freshness_gate(snap, self.legs, self.limits,
+                                          fx_quotes=q, now=NOW))
+        # ... and stays blocked even with a wider snapshot window.
+        reasons = sc.freshness_gate(snap, self.legs, self.limits,
+                                    fx_quotes=q, now=NOW, max_age_seconds=600)
+        self.assertTrue(any("stale" in r for r in reasons), reasons)
+
+        # A 90s-old SNAPSHOT with a fresh quote: blocked by default, and the
+        # explicit override is what lets it through.
+        old = self._eur_snapshot(captured_at=NOW - timedelta(seconds=90))
+        fresh = {"EUR": self._quote("1.1", age=1)}
+        self.assertTrue(sc.freshness_gate(old, self.legs, self.limits,
+                                          fx_quotes=fresh, now=NOW))
+        self.assertEqual(sc.freshness_gate(old, self.legs, self.limits,
+                                           fx_quotes=fresh, now=NOW,
+                                           max_age_seconds=300), [])
+
     def test_freshness_gate_blocks_confirm_via_resource_plan(self):
         # End-to-end: non-base currency with no actual FX quote -> confirm is
         # BLOCKED (freshness gate raises inside resource_plan), no send.

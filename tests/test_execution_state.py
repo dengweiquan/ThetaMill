@@ -6,6 +6,7 @@ All state lives in temporary directories.  Broker-like objects, snapshot
 providers, resource plans, order builders and fill proofs are MOCKS: no real
 account, network, ``ib_async`` import or CLI import is performed.
 """
+import dataclasses
 import multiprocessing as mp
 import tempfile
 import unittest
@@ -1488,6 +1489,122 @@ class TestIndependentRequirementsAndQuotaException(EngineTestCase):
         req_two = _independent_requirements(two_buys, snap)
         self.assertEqual(req_two[("USD", "close:2001")], Decimal("2"))
         self.assertEqual(req_two[("USD", "cash_base")], Decimal("400"))
+
+    def test_unverifiable_obligations_get_a_sentinel_that_no_plan_can_satisfy(self):
+        """Every unprovable leg must fail closed, not silently reserve nothing.
+
+        These are the branches that decide "can this package be reserved at
+        all".  If any returned an EMPTY dict instead of the sentinel, a package
+        containing that leg would look fully covered and reach ``placeOrder``
+        with no collateral behind it.
+        """
+        from thetamill.execution import _independent_requirements
+        snap = _snapshot(cash="100000")  # USD only, no EUR rate
+
+        def sentinel(reqs, con_id):
+            return reqs.get(("__unverifiable__", str(con_id)))
+
+        # (a) STK BUY at market: no bounded amount.
+        mkt_buy = _leg(action="BUY", order_type="MKT", limit_price=None)
+        self.assertEqual(sentinel(_independent_requirements([mkt_buy], snap), 1001),
+                         Decimal("1"))
+
+        # (b) STK BUY in a currency with no FX rate: the amount is unbounded.
+        eur_buy = _leg(action="BUY", limit_price=Decimal("180"),
+                       instrument=_stock(currency="EUR"))
+        self.assertEqual(sentinel(_independent_requirements([eur_buy], snap), 1001),
+                         Decimal("1"))
+
+        # (c) OPT SELL without a usable multiplier: 100 must never be assumed.
+        for bad in (None, Decimal("0"), Decimal("-100"), Decimal("NaN"),
+                    Decimal("Infinity"), "not-a-number"):
+            with self.subTest(multiplier=bad):
+                put = _opt_leg(con_id=2002, action="SELL", right="P", mult=bad)
+                self.assertEqual(
+                    sentinel(_independent_requirements([put], snap), 2002),
+                    Decimal("1"))
+
+        # (d) OPT SELL PUT in a currency with no FX rate: collateral unbounded.
+        eur_put = _opt_leg(con_id=2004, action="SELL", right="P", currency="EUR")
+        self.assertEqual(sentinel(_independent_requirements([eur_put], snap), 2004),
+                         Decimal("1"))
+
+        # (e) An option right that is neither P nor C.
+        odd = _opt_leg(con_id=2005, action="SELL", right="X")
+        self.assertEqual(sentinel(_independent_requirements([odd], snap), 2005),
+                         Decimal("1"))
+
+        # (f) OPT BUY (buy-to-close) at market, without price, without FX rate,
+        #     and without a multiplier — all four are mandatory here.
+        mkt_close = _opt_leg(con_id=2006, action="BUY", order_type="MKT",
+                             price=None)
+        self.assertEqual(sentinel(_independent_requirements([mkt_close], snap), 2006),
+                         Decimal("1"))
+        no_price = _opt_leg(con_id=2007, action="BUY", price=None)
+        self.assertEqual(sentinel(_independent_requirements([no_price], snap), 2007),
+                         Decimal("1"))
+        eur_close = _opt_leg(con_id=2008, action="BUY", currency="EUR")
+        self.assertEqual(sentinel(_independent_requirements([eur_close], snap), 2008),
+                         Decimal("1"))
+        nomult_close = _opt_leg(con_id=2009, action="BUY", mult=None)
+        self.assertEqual(
+            sentinel(_independent_requirements([nomult_close], snap), 2009),
+            Decimal("1"))
+
+        # (g) An instrument / action the engine does not understand.
+        fut = _leg(action="BUY", instrument=Instrument(
+            con_id=3001, symbol="ES", currency="USD", sec_type="FUT",
+            exchange="CME", underlying_id=3001))
+        self.assertEqual(sentinel(_independent_requirements([fut], snap), 3001),
+                         Decimal("1"))
+        hold = _leg(action="HOLD")
+        self.assertEqual(sentinel(_independent_requirements([hold], snap), 1001),
+                         Decimal("1"))
+
+    def test_one_unverifiable_leg_poisons_a_package_that_otherwise_balances(self):
+        """A covered leg cannot buy credibility for an uncovered one."""
+        from thetamill.execution import _independent_requirements
+        snap = _snapshot(cash="100000")
+        good = _opt_leg(con_id=2001, action="BUY", price=Decimal("2"))
+        bad = _leg(action="BUY", order_type="MKT", limit_price=None)
+        reqs = _independent_requirements([good, bad], snap)
+        self.assertIn(("__unverifiable__", "1001"), reqs)
+        # The real requirements are still derived (they are not replaced).
+        self.assertEqual(reqs[("USD", "close:2001")], Decimal("1"))
+
+    def test_zero_quantity_derives_no_requirement(self):
+        """``add`` ignores non-positive amounts; a zero-qty leg reserves nothing.
+
+        Pinned deliberately: this helper does not reject a zero quantity — the
+        adapter's input validation (``whole-contract`` check) is what refuses
+        `qty=0` before the engine is reached.  If that validation ever moves,
+        this test is the tripwire that says the engine would reserve nothing.
+        """
+        from thetamill.execution import _independent_requirements
+        snap = _snapshot(cash="100000")
+        self.assertEqual(
+            _independent_requirements([_leg(action="BUY", quantity=Decimal("0"))], snap),
+            {})
+        self.assertEqual(
+            _independent_requirements([_leg(action="BUY", quantity=Decimal("-1"))], snap),
+            {})
+
+    def test_money_is_fx_converted_to_base_while_counts_are_not(self):
+        """EUR collateral becomes USD cash; share counts stay dimensionless."""
+        from thetamill.execution import _independent_requirements
+        snap = _snapshot(cash="100000")
+        snap = dataclasses.replace(snap, fx={"USD": Decimal(1),
+                                             "EUR": Decimal("1.10")})
+        put = _opt_leg(con_id=2010, action="SELL", right="P",
+                       strike=Decimal("100"), mult=Decimal("200"),
+                       currency="EUR")
+        reqs = _independent_requirements([put], snap)
+        # 100 strike * 200 multiplier * 1.1 FX = 22000 USD
+        self.assertEqual(reqs[("USD", "cash_base")], Decimal("22000"))
+        sell = _leg(action="SELL", quantity=Decimal("3"),
+                    instrument=_stock(currency="EUR"))
+        self.assertEqual(_independent_requirements([sell], snap),
+                         {("EUR", "shares:1001:EUR"): Decimal("3")})
 
     def test_handoff_quote_independent_cap_and_future_tolerance(self):
         engine = self._engine()
