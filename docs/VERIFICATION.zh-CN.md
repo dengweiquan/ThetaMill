@@ -50,7 +50,7 @@
 
 **真实网关验证**：`connect()` 后实测 `RequestTimeout = 30.0`（原为 `0`）；对不可路由空壳的请求 **20.0 秒**结束并记录 `market data request failed (TimeoutError)`；调用结束后 `RequestTimeout` 恢复为 `30.0`；同一会话内的正常正股请求仍在 5.5 秒内正常返回（`marketDataType=3`），说明上限没有破坏正常路径。
 
-**回归**：`tests/test_account_scope.py::RequestTimeoutTests` 共 4 项（`connect()` 会设上限、配置值被尊重、十种不可用取值均回落默认、设上限不产生任何 `placeOrder`/`cancelOrder`）。全量离线 893 项通过；覆盖率门禁 `rc=0`（全局 84.1%，9 个模块全部达标）。
+**回归**：`tests/test_account_scope.py::RequestTimeoutTests` 共 4 项（`connect()` 会设上限、配置值被尊重、十种不可用取值均回落默认、设上限不产生任何 `placeOrder`/`cancelOrder`）。全量离线 893 项通过；覆盖率门禁 `rc=0`（全局 84.1%，9 个模块全部达标）。CI 运行 `42466726888`（commit `95f03b3`）在 Python 3.10 与 3.13 两条矩阵上 **9/9 步骤全绿**。
 
 **边界**：本次只修复「不可路由合约 + 无上限等待」这一挂起路径，未证明延迟行情可用于现金估算——`_build_quotes` 仍拒收 `marketDataType != 1`，因此无实时订阅的账户上 `roll-plan` 只会给出「行情缺失」的阻塞结论。这与既有设计一致，不是本次修复放宽的项。
 
