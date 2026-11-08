@@ -44,6 +44,7 @@ def _data_dir() -> Path:
 
 CFG_PATH = _cfg_path()
 ORDER_LOG = _data_dir() / "orders.jsonl"
+_DEFAULT_ORDER_LOG = ORDER_LOG
 
 logging.getLogger("ib_async").setLevel(logging.CRITICAL)
 logging.getLogger("ib_insync").setLevel(logging.CRITICAL)
@@ -150,21 +151,12 @@ def _is_code_consumed(code: str) -> bool:
                 return True
         except Exception:
             pass
-    if ORDER_LOG.exists():
-        try:
-            for line in ORDER_LOG.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    if rec.get("code") == code:
-                        return True
-                except Exception:
-                    continue
-        except Exception:
-            pass
-    return False
+    from . import audit as audit_mod
+    # A synthetic (mock) row is not a consumed code: importing it as history
+    # would refuse a review code the operator never actually used.
+    return any(rec.get("code") == code
+               and not audit_mod.is_synthetic_record(rec)
+               for rec in audit_mod.read_records(audit_log_path()))
 
 
 def _consume_code(code: str) -> None:
@@ -875,19 +867,33 @@ def cmd_cancel(cfg, args):
             sys.exit("拒绝撤销其他客户端或归属未知的订单；请在原客户端/TWS 核对处理。")
         ib.cancelOrder(t.order)
         ib.sleep(1.5)
-        print(f"已请求撤单 #{args.order_id} → 状态 {t.orderStatus.status}")
+        status = t.orderStatus.status
+        print(f"已请求撤单 #{args.order_id} → 状态 {status}")
         order_ref = str(getattr(t.order, "orderRef", "") or "")
-        if order_ref and t.orderStatus.status in ("Cancelled", "ApiCancelled"):
-            try:
-                from .state import SubmissionLedger
-                path = _data_dir() / "state.sqlite3"
-                if path.exists():
-                    ledger = SubmissionLedger(path, cfg.get("risk", {}).get("day_timezone", "UTC"))
-                    ledger.confirm_leg(order_ref, broker_status=t.orderStatus.status,
-                                       perm_id=getattr(t.order, "permId", None),
-                                       order_id=getattr(t.order, "orderId", None))
-            except Exception:
-                pass
+        # 撤单成功是「这条腿已被券商看到」的正向证据，可以解除该腿的预留。
+        # 但解除失败绝不能被静默吞掉：账户会继续被锁住，用户必须知道原因
+        # （也不能手工删库）。非终态（如 PendingCancel）不算正向证据。
+        if order_ref and status in ("Cancelled", "ApiCancelled"):
+            from .state import SubmissionLedger, StateError
+            path = _data_dir() / "state.sqlite3"
+            if not path.exists():
+                print(f"  ⚠️ 撤单成功，但本地没有提交账本（{path}），无可解除的预留。")
+            else:
+                try:
+                    ledger = SubmissionLedger(
+                        path, (cfg.get("risk") or {}).get("day_timezone", "UTC"))
+                    ledger.confirm_leg(
+                        order_ref, broker_status=status,
+                        perm_id=getattr(t.order, "permId", None),
+                        order_id=getattr(t.order, "orderId", None))
+                    print(f"  ✅ 已按券商撤单回执解除该腿预留（{order_ref}）。")
+                except StateError as exc:
+                    print(f"  ⚠️ 撤单成功但解除预留失败：{exc}")
+                    print("     账户可能仍被拦；请运行 "
+                          "`thetamill resolve --list` 查看，勿手工删库。")
+                except OSError as exc:
+                    print(f"  ⚠️ 撤单成功但本地账本不可写：{exc}")
+                    print("     账户可能仍被拦；请运行 `thetamill resolve --list` 查看。")
         return 0
     finally:
         finish(ib)
@@ -1084,17 +1090,20 @@ def cmd_order(cfg, args):
         finish(ib)
 
 
-def _write_audit(env, port, preset, data):
-    """审计日志：每笔真实提交的委托落一份，写不进去不影响已发出的单"""
-    try:
-        ORDER_LOG.parent.mkdir(parents=True, exist_ok=True)
-        rec = {"ts": datetime.now().isoformat(timespec="seconds"), "env": env, "port": port,
-               "kind": "strat", "preset": preset}
-        rec.update(data)
-        with ORDER_LOG.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
-    except OSError as e:
-        print(f"  ⚠️ 审计日志写入失败（订单已发出，不影响成交）：{e}")
+def audit_log_path() -> Path:
+    """Resolve the audit file at CALL time so a redirected data dir is honoured.
+
+    ``ORDER_LOG`` stays the module attribute (embedded callers / tests rebind
+    it); when it has been rebound that explicit target wins, otherwise the
+    current ``_data_dir()`` is used instead of the import-time snapshot.
+
+    The single WRITER is :func:`thetamill.submission_cli.execute_prepared`, via
+    :func:`thetamill.audit.append_record`; there is deliberately no second
+    ``_write_audit`` helper in this module to drift out of sync with it.
+    """
+    if ORDER_LOG != _DEFAULT_ORDER_LOG:
+        return Path(ORDER_LOG)
+    return _data_dir() / "orders.jsonl"
 
 
 # ---------------------------------------------------------------- 三大卖方策略
@@ -1904,21 +1913,69 @@ def cmd_run(cfg, args):
     return cmd_combo(cfg, ns)
 
 
-def cmd_audit(cfg, args):
-    if not ORDER_LOG.exists():
-        print(f"暂无审计记录 —— 日志路径 {ORDER_LOG}")
-        return 0
+def _ledger_audit_rows(selected):
+    """Orders the SQLite ledger knows about, as audit-shaped rows (read-only).
+
+    The ledger — not ``orders.jsonl`` — is authoritative for what was actually
+    sent, so an order that reached the broker but whose audit append failed
+    (or predates the append) still shows up here.  A missing/foreign/corrupt
+    ledger is reported, never created, and never treated as "no history".
+    """
+    path = _data_dir() / "state.sqlite3"
+    if not path.is_file():
+        return [], None
+    from . import audit as audit_mod
+    from .state import SubmissionLedger, StateError
+
+    try:
+        ledger = SubmissionLedger(path, "UTC", read_only=True)
+        scopes = ledger.list_scopes()
+    except StateError as exc:
+        return [], f"提交账本无法只读打开：{exc}"
     rows = []
-    for line in ORDER_LOG.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
+    for account, environment in scopes:
+        if selected is not None and account != selected:
             continue
         try:
-            row = json.loads(line)
-            if isinstance(row, dict):
-                rows.append(row)
-        except json.JSONDecodeError:
-            continue
+            legs = ledger.list_legs(account=account, environment=environment)
+            observed = ledger.list_reconciliations(account=account,
+                                                   environment=environment)
+        except StateError as exc:
+            return [], f"提交账本读取失败：{exc}"
+        # A reconciliation observation carries the broker status the ledger
+        # could actually prove ("Submitted"/"Filled"/"Cancelled"); the bare leg
+        # state ("confirmed") no longer says HOW it resolved.
+        evidence = {}
+        for rec in observed:
+            if rec.broker_status:
+                evidence[rec.order_ref] = rec.broker_status
+        for leg in legs:
+            rows.append({
+                "ts": leg.updated_at, "account": account, "env": environment,
+                "kind": "leg", "preset": "ledger", "strategy": "ledger",
+                "orderId": leg.order_id, "permId": leg.perm_id,
+                "status": evidence.get(leg.order_ref, leg.state),
+                "orderRef": leg.order_ref, "qty": leg.quantity,
+                "action": leg.action, "contract_id": leg.contract_id,
+                "source": "ledger",
+            })
+    return [row for row in rows if audit_mod.is_real_record(row)], None
+
+
+def cmd_audit(cfg, args):
+    """Show the audit trail: real broker orders only, plus ledger records.
+
+    Synthetic rows (a leaked unit-test ``MagicMock`` repr written by the old
+    ``default=str`` writer) are counted and hidden — printing them as orders is
+    worse than printing nothing — and the SQLite ledger is merged in, because
+    the ledger, not this file, is authoritative for what was actually sent.
+    """
+    from . import audit as audit_mod
+
+    path = audit_log_path()
+    parsed = audit_mod.read_records(path)
+    rows = [row for row in parsed if audit_mod.is_real_record(row)]
+    hidden = len(parsed) - len(rows)
     selected = getattr(args, "account", None) or cfg.get("account")
     known_accounts = {r["account"] for r in rows
                       if isinstance(r.get("account"), str) and r["account"].strip()}
@@ -1928,23 +1985,42 @@ def cmd_audit(cfg, args):
         selected = next(iter(known_accounts))
     unknown_count = sum(not isinstance(r.get("account"), str) or not r["account"].strip()
                         for r in rows)
+    ledger_rows, ledger_error = _ledger_audit_rows(selected)
     if selected is not None:
         rows = [r for r in rows if r.get("account") == selected]
         from .report import mask_account
         print(f"审计账户：{mask_account(selected)}；排除 {unknown_count} 条未知账户旧记录")
     elif unknown_count:
         print("旧审计记录账户归属未知；不用于配额或风险额度计算。")
+    if hidden:
+        print(f"已隐藏 {hidden} 条非真实审计记录（单元测试遗留的 mock 值，不是券商订单）")
+    if ledger_error:
+        print(f"⚠️ {ledger_error}")
+
+    # Merge the ledger's view: a real order with no (or lost) JSONL line is
+    # still an order.  One row per (orderRef, orderId); the log wins on detail.
+    seen = {(str(r.get("orderRef", "")), str(r.get("orderId", "")))
+            for r in rows if r.get("orderRef")}
+    only_ledger = [r for r in ledger_rows
+                   if (str(r.get("orderRef", "")), str(r.get("orderId", ""))) not in seen]
+    combined = sorted(rows + only_ledger, key=lambda r: str(r.get("ts", "")))
     if args.today:
         today = datetime.now().strftime("%Y-%m-%d")
-        rows = [r for r in rows if str(r.get("ts", "")).startswith(today)]
-    rows = rows[-max(args.limit, 1):]
-    print(f"审计日志 {ORDER_LOG}")
-    print(f"  {'时间':<20}{'策略':<14}{'单号':>7}  {'状态':<14}{'成交':>6}  {'环境':<12}")
-    for r in rows:
+        combined = [r for r in combined if str(r.get("ts", "")).startswith(today)]
+    combined = combined[-max(args.limit, 1):]
+    if not combined and not hidden:
+        print(f"暂无审计记录 —— 日志路径 {path}")
+        return 0
+    print(f"审计日志 {path}")
+    print(f"  {'时间':<20}{'策略':<14}{'单号':>7}  {'状态':<14}{'成交':>6}  {'环境':<12}来源")
+    for r in combined:
         print(f"  {str(r.get('ts', ''))[:19]:<20}{str(r.get('preset') or r.get('label') or '-'):<14}"
               f"{str(r.get('orderId', '-')):>7}  {str(r.get('status', '-'))[:13]:<14}"
-              f"{fmt(r.get('filled'), 0):>6}  {str(r.get('env', '-'))[:11]:<12}")
-    print(f"\n  共 {len(rows)} 条（含纸账户与实盘，看「环境」列区分）")
+              f"{fmt(r.get('filled'), 0):>6}  {str(r.get('env', '-'))[:11]:<12}"
+              f"{'账本' if r.get('source') == 'ledger' else '日志'}")
+    print(f"\n  共 {len(combined)} 条（含纸账户与实盘，看「环境」列区分）")
+    if only_ledger:
+        print(f"  其中 {len(only_ledger)} 条只存在于提交账本（审计日志未写入或已丢失）")
     return 0
 
 
@@ -2048,6 +2124,111 @@ def _private_broker_diagnostics():
     with open(os.devnull, "w", encoding="utf-8") as sink:
         with redirect_stdout(sink), redirect_stderr(sink):
             yield
+
+
+def cmd_resolve(cfg, args):
+    """解除未决预留 —— 只认券商正向证据，绝不因「没看到挂单」就放行。
+
+    账户一旦有 submitting/submitted/unknown 的腿，所有新增风险都会被拦
+    （见 execution.confirm）。本命令是唯一出口：
+      --list                   只读列出当前阻塞账户的预留
+      --reservation <id>       用实时只读券商证据核对并逐腿解除
+                               （挂单一致，或成交执行记录一致）
+      --state released         仅当【没有任何腿被尝试发送】时释放
+    证据不足一律拒绝，预留继续保留；已消耗的当日提交次数永不退还。
+    """
+    from . import resolve as resolve_mod
+    path = _data_dir() / "state.sqlite3"
+    if not path.exists():
+        sys.exit("没有本地提交账本；不会创建空库或推断历史为零")
+    day_tz = (cfg.get("risk") or {}).get("day_timezone", "UTC")
+    # An explicit --paper / --port never probes the network; only an ambiguous
+    # invocation auto-detects, so `--list` can stay strictly read-only.
+    if getattr(args, "port", None):
+        port = args.port
+    elif getattr(args, "paper", False):
+        port = cfg["paper_port"]
+    else:
+        port, _ = resolve_port(cfg, args)
+    environment = "live" if _is_live_env(cfg, args, port) else "paper"
+
+    def _open(writable):
+        try:
+            return resolve_mod.open_ledger(path, day_tz, writable=writable)
+        except resolve_mod.ResolveError as exc:
+            sys.exit(f"⛔ {exc}")
+
+    if args.list:
+        ledger = _open(False)
+        account = getattr(args, "account", None) or cfg.get("account")
+        if not account:
+            sys.exit("⛔ --list 需要 --account 或在配置里指定账户")
+        blocked = resolve_mod.unresolved_summary(
+            ledger, account=account, environment=environment)
+        if not blocked:
+            print(f"账户 {account}（{environment}）没有未决预留。")
+            return 0
+        print(f"账户 {account}（{environment}）有 {len(blocked)} 个未决预留，"
+              "新增风险已被阻断：")
+        for item in blocked:
+            print(f"  {item.reservation_id}  状态={item.state}  日={item.day_key}")
+            for ref, action, qty, leg_state in item.legs:
+                print(f"     {ref}  {action} {qty}  {leg_state}")
+        print("\n用 `thetamill resolve --reservation <id>` 抓取实时券商证据核对。")
+        return 0
+
+    if not args.reservation:
+        print("请指定 --list 或 --reservation <id>")
+        return 2
+    if args.state not in ("confirmed", "released"):
+        print("--state 只能是 confirmed 或 released")
+        return 2
+    ledger = _open(True)
+
+    if args.state == "released":
+        if not args.why:
+            print("⛔ --state released 必须用 --why 写明为何能证明从未发出")
+            return 2
+        try:
+            outcome = resolve_mod.release_never_sent(
+                ledger, args.reservation, why=args.why)
+        except resolve_mod.ResolveError as exc:
+            print(f"⛔ 未释放：{exc}")
+            return 2
+        print(f"✅ 预留 {outcome.reservation_id} 已释放（证明从未发送）。")
+        return 0
+
+    # confirmed: 必须拿到实时只读券商证据
+    ib = connect(cfg, port, readonly=True, args=args)
+    try:
+        account = _selected_account(ib, cfg, args)
+        observations = resolve_mod.live_observations(ib, account=account)
+        snapshot = None
+        try:
+            candidate = _risk_snapshot(ib, cfg, args, environment)
+        except Exception as exc:
+            print(f"  ⚠️ 无法采集账户快照（{exc}）；仅用成交记录核对。")
+        else:
+            if candidate.issues:
+                print("  ⚠️ 账户快照存在数据质量问题；仅用成交记录核对："
+                      + "; ".join(candidate.issues))
+            else:
+                snapshot = candidate
+        try:
+            outcome = resolve_mod.resolve_reservation(
+                ledger, args.reservation,
+                executions=observations.executions,
+                snapshot_provider=(lambda: snapshot) if snapshot else None)
+        except resolve_mod.ResolveError as exc:
+            print(f"⛔ 未释放：{exc}")
+            return 2
+    finally:
+        finish(ib)
+    print(f"✅ 预留 {outcome.reservation_id} 已按券商正向证据逐腿解除：")
+    for reason in outcome.evidence:
+        print(f"   - {reason}")
+    print("   注意：当日已消耗的提交次数不会退还；账户现在可以进行新的风控评估。")
+    return 0
 
 
 def cmd_report(cfg, args):
@@ -2289,6 +2470,14 @@ def build_parser(cfg: dict | None = None) -> argparse.ArgumentParser:
     roll.add_argument("--output", help="创建本地建议文件，拒绝覆盖")
 
     sub.add_parser("reconcile", help="只读券商对账；不重发、不撤单、不自动解除未知预留").set_defaults(func=cmd_reconcile)
+
+    rs = sub.add_parser("resolve", help="按券商正向证据解除未决预留（账户锁的唯一出口）")
+    rs.set_defaults(func=cmd_resolve)
+    rs.add_argument("--list", action="store_true", help="只读列出当前阻塞账户的未决预留")
+    rs.add_argument("--reservation", help="要核对的预留 ID")
+    rs.add_argument("--state", choices=["confirmed", "released"], default="confirmed",
+                    help="confirmed=用券商证据解除；released=仅限证明从未发送")
+    rs.add_argument("--why", default="", help="--state released 时必填的书面理由")
 
     report = sub.add_parser("report", help="只读风险快照（缺失数据明确标记未知）")
     report.set_defaults(func=cmd_report)

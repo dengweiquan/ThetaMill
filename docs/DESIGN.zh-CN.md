@@ -96,9 +96,9 @@ Go 的优势（单二进制、静态链接、并发模型）在本项目场景�
 另有两层：
 
 4. **覆盖校验**：无股不卖 Call、现金不足不卖 Put、已有足够股不再重复买。
-5. **审计**：提交后尽力写入 `orders.jsonl`，记录可获得的复核码、回执状态与成交数量；写入失败或进程崩溃可能留下缺口，不能作为权威配额账本。
+5. **审计**：只要一笔委托可能已经发出（腿状态为 attempting/submitting/submitted/unknown），`thetamill/submission_cli.py` 就在 `execute_prepared` 返回前尽力写入一条 `orders.jsonl`（`thetamill/audit.py`），记录账户、环境、intent、各腿状态与可获得的 `orderId`/`permId`；预检、迁移冻结与发单前拒绝不写，因此日志里出现券商单号即意味着确实联系过券商。字段严格按类型净化：非 JSON 安全的对象（泄漏进来的 `MagicMock`、ib_async 对象）逐字段丢弃并记入 `dropped_fields`，绝不用 `default=str` 把 mock 的 repr 写成看似真实的一行。写入失败或进程崩溃仍可能留下缺口，因此它不是权威配额账本——`audit` 会同时并入 SQLite 账本（`source=ledger`，状态取 `confirm_leg` 记录的券商正向状态），账本里存在而日志缺失的单会被明确标注。
 
-查询类命令不主动提交委托；其中需要连接券商的命令使用 `ib_async` 的 `readonly=True` 参数。该参数不是服务端订单 ACL，服务端 Read-Only API 配置须单独核实。`audit` 读取本地日志。
+查询类命令不主动提交委托；其中需要连接券商的命令使用 `ib_async` 的 `readonly=True` 参数。该参数不是服务端订单 ACL，服务端 Read-Only API 配置须单独核实。`audit` 以只读方式同时读取本地日志与提交账本，并隐藏任何带 mock repr 的合成记录（旧版 `default=str` 写入器会留下这类行），只显示可核对为真实委托的条目。
 
 当前 B 阶段已落地：权威 SQLite 提交账本 `thetamill/state.py` 用 `BEGIN IMMEDIATE` 事务完成 intent 认领、资源预留与状态迁移，`thetamill/execution.py` 在发单前刷新券商状态、校验有效期/配额/合约身份后预留，发单前持久化 `submitting` 与稳定 `orderRef`，回执不明进入 `unknown` 并由 `reconcile` 只读对账。账户/环境范围贯穿账本键。
 

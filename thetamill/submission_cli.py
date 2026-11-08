@@ -13,6 +13,10 @@ Design boundaries (deliberate, do not weaken)
   ``ib.placeOrder`` directly: the engine's ``place_order`` callback (supplied
   here as :func:`_broker_submit`) is the ONLY network boundary, and the engine
   persists a stable ``orderRef`` BEFORE that callback runs.
+* It is the ONLY writer of ``orders.jsonl`` (via :mod:`.audit`), and only for an
+  attempt where a send may have happened.  A preflight, a migration freeze or a
+  pre-send refusal writes nothing; values are strictly typed so a leaked mock
+  object can never be recorded as if it were a broker order.
 * Confirmation requires BOTH an explicit ``--intent`` and ``--code``.  Neither
   alone does anything; with neither, a fresh ``preflight`` is produced.  There
   is no ``--force`` and no fabricated ``verified_prior_submissions``.
@@ -1109,19 +1113,14 @@ def _ledger(cfg, account: str, environment: str, ib=None) -> "state.SubmissionLe
     log = data_dir / "orders.jsonl"
     records = []
     if log.exists():
-        try:
-            for line in log.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    if isinstance(rec, dict) and rec.get("code"):
-                        records.append(rec)
-                except ValueError:
-                    continue
-        except OSError:
-            records = []
+        # A record whose values are unit-test mock reprs is an ARTEFACT of a
+        # patched broker, not a consumed review code.  Importing it would burn a
+        # code the operator never used (and, for the synthetic 12345678 rows,
+        # poison a real code).  Genuine legacy rows without a status/orderId are
+        # still imported: dropping real history is the worse failure.
+        from . import audit as audit_mod
+        records = [rec for rec in audit_mod.read_records(log)
+                   if rec.get("code") and not audit_mod.is_synthetic_record(rec)]
     try:
         if consumed:
             ledger.import_legacy_codes(account=account, environment=environment,
@@ -1441,6 +1440,13 @@ def execute_prepared(ib, cfg, args, *, pairs: Sequence[tuple],
             out = AdapterResult(rc=RC_PREFLIGHT, outcome="BLOCKED", account=account,
                                 environment=environment, intent_id=intent_id,
                                 approval_code="", details=tuple(details))
+        if out.outcome == "UNKNOWN":
+            # No leg outcome survived the interruption, so the trail carries the
+            # intent and the refusal reason: it is the ONLY durable pointer left
+            # if the process dies here.
+            _audit_submission(account=account, environment=environment, port=port,
+                              strategy=strategy, intent_id=intent_id,
+                              outcome=out.outcome, reason=message)
         for line in out.lines():
             print(line)
         return out
@@ -1477,9 +1483,46 @@ def execute_prepared(ib, cfg, args, *, pairs: Sequence[tuple],
     out = AdapterResult(rc=rc, outcome=outcome, account=account,
                         environment=environment, intent_id=intent_id,
                         approval_code="", details=tuple(details))
+    if any(o.state in _MAY_HAVE_SENT_LEG_STATES for o in result.legs):
+        _audit_submission(account=account, environment=environment, port=port,
+                          strategy=strategy, intent_id=intent_id,
+                          outcome=outcome, legs=result.legs,
+                          decision=result.decision, day_key=result.day_key)
     for line in out.lines():
         print(line)
     return out
+
+
+def _audit_submission(*, account: str, environment: str, port: Any,
+                      strategy: str, intent_id: str, outcome: str,
+                      legs: Iterable[Any] = (), decision: str = "",
+                      day_key: str = "", reason: str = "") -> Optional[dict]:
+    """Append ONE audit record for a submission that MAY have reached the broker.
+
+    ``orders.jsonl`` is a human trail, not the authority (``state.sqlite3`` is),
+    but a send that leaves no line at all is indistinguishable from a tool that
+    never ran — that was the P0 defect.  Best effort by construction: a failed
+    append prints a warning and never changes the adapter's result.
+
+    Callers gate on "a send may have happened" (a leg in attempting /
+    submitting / submitted / unknown).  A preflight, a migration freeze or a
+    pre-send refusal writes nothing, so a broker order id in this file always
+    means the broker was actually contacted.
+    """
+    from . import audit as audit_mod
+
+    try:
+        fields = audit_mod.submission_fields(
+            environment=environment, port=port, strategy=strategy,
+            account=account, intent_id=intent_id, outcome=outcome,
+            legs=legs, decision=decision, day_key=day_key, reason=reason)
+    except (TypeError, ValueError):
+        return None
+
+    def warn(message):
+        print(f"  ⚠️ 审计记录未写入（订单可能已发出，不影响成交）：{message}")
+
+    return audit_mod.append_record(cli.audit_log_path(), fields, warn=warn)
 
 
 def _mask_account_text(text: str, account: str) -> str:

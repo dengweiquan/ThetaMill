@@ -1362,6 +1362,26 @@ class SubmissionLedger:
             self._bind_ids(conn, order_ref, order_id, perm_id, stamp)
             conn.execute("UPDATE legs SET state='confirmed', updated_at=? "
                          "WHERE order_ref=?", (stamp, order_ref))
+            # Record WHICH broker status justified the release.  The leg state
+            # alone ("confirmed") loses that: a later audit/report cannot tell
+            # a Submitted handoff from a Filled one, and #133/#140 were exactly
+            # that case.  Same idempotency rule as :meth:`reconcile`.
+            ref = leg["order_ref"]
+            perm_text = None if perm_id is None else str(perm_id)
+            order_text = None if order_id is None else str(order_id)
+            note = "confirm_leg positive broker handoff"
+            existing = conn.execute(
+                "SELECT observation_id FROM reconciliation WHERE order_ref=? AND "
+                "COALESCE(perm_id,'')=COALESCE(?,'') AND COALESCE(order_id,'')=COALESCE(?,'') "
+                "AND status='confirmed' AND COALESCE(broker_status,'')=COALESCE(?,'') "
+                "AND note=?", (ref, perm_text, order_text, broker_status, note)).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO reconciliation(observation_id,intent_id,order_ref,"
+                    "perm_id,order_id,status,broker_status,note,observed_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (_new_id("obs"), leg["intent_id"], ref, perm_text, order_text,
+                     "confirmed", broker_status, note, stamp))
             return self._refresh_reservation(conn, leg["reservation_id"], stamp,
                                              terminal_at=True)
 
@@ -1588,6 +1608,20 @@ class SubmissionLedger:
                 "SELECT l.* FROM legs l JOIN intents i ON i.intent_id=l.intent_id "
                 "WHERE l.order_ref=? AND i.scope=?", (order_ref, scope)).fetchone()
             return _leg_view(row) if row is not None else None
+
+    def list_scopes(self) -> List[Tuple[str, str]]:
+        """Every ``(account, environment)`` scope that owns a leg, sorted.
+
+        Read-only discovery for reporting an audit trail whose account was not
+        pre-selected; it derives the scope ONLY from recorded intents, so an
+        empty ledger reports nothing rather than a fabricated zero account.
+        """
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT i.account, i.environment FROM legs l "
+                "JOIN intents i ON i.intent_id=l.intent_id "
+                "ORDER BY i.account, i.environment").fetchall()
+            return [(str(r[0]), str(r[1])) for r in rows]
 
     def list_legs(self, *, account: str, environment: str,
                   intent_id: Optional[str] = None) -> List[LegView]:

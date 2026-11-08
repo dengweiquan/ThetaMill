@@ -81,7 +81,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from thetamill import risk, state
-from thetamill.broker_state import Instrument, Snapshot
+from thetamill.broker_state import Instrument, Snapshot, WorkingOrder
 from thetamill.risk import Decision, OrderRequest, RiskLimits
 from thetamill.state import RiskReservationSpec, SubmissionLedger
 
@@ -134,6 +134,32 @@ class FillProof:
 
 
 @dataclass(frozen=True)
+class PositiveFill:
+    """STRUCTURED proof that ONE execution row belongs to an APPROVED leg.
+
+    A ``Filled`` status string is NOT enough, and neither is a fresh position:
+    attribution has to come from a broker EXECUTION row that names the SAME
+    stable ``order_ref``.  Every field below is re-verified against the approved
+    stored leg by :func:`verify_fill_against_approved`; nothing the adapter
+    promises is trusted on its own.  ``shares``/``cum_qty`` must be finite
+    Decimals EXACTLY equal to the approved quantity (a partial fill can never
+    release the whole reserved obligation).
+    """
+
+    exec_id: str
+    account: str
+    order_ref: str
+    con_id: int
+    side: str            # normalised to BUY / SELL
+    shares: Decimal
+    price: Decimal
+    cum_qty: Decimal
+    as_of: datetime
+    perm_id: Optional[int] = None
+    order_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
 class PositiveHandoff:
     """STRUCTURED, positively-observed broker-snapshot handoff evidence.
 
@@ -177,6 +203,288 @@ class ResourcePlan:
     resources: Mapping[Any, Any] = field(default_factory=dict)
     items: Sequence[RiskReservationSpec] = ()
     overrides: Mapping[Any, Any] = field(default_factory=dict)
+
+
+def handoff_decimal(value: Any, label: str) -> Optional[Decimal]:
+    """Strict finite non-negative Decimal for a handoff numeric field.
+    Bools / floats / NaN / non-Decimal strings are refused (fail closed).
+    """
+    if value is None or isinstance(value, bool) or isinstance(value, float):
+        return None
+    if not isinstance(value, (Decimal, int, str)):
+        return None
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if not result.is_finite() or result < 0:
+        return None
+    return result
+
+
+def check_observed_scope(snapshot: Any, account: str, environment: str,
+                         label: str) -> Snapshot:
+    """STRICTLY validate an observed snapshot's account/env + data quality.
+
+    EVERY refreshed snapshot (initial, deferred, and any handoff/resolve
+    evidence) must pass this check: an OTHER/live snapshot must never authorise
+    a paper release, and a low-quality snapshot must never pass.
+    """
+    if not isinstance(snapshot, Snapshot):
+        raise ExecutionError(f"{label} must be a fresh Snapshot")
+    if snapshot.account != account or snapshot.environment != environment:
+        raise ExecutionError(
+            f"{label} account/environment mismatch "
+            f"({snapshot.account}/{snapshot.environment} != "
+            f"{account}/{environment})")
+    if snapshot.issues:
+        raise ExecutionError(
+            f"{label} has unresolved data-quality issues: "
+            + "; ".join(snapshot.issues))
+    return snapshot
+
+
+def approved_leg_canonical(ledger: Any, intent_id: str,
+                           leg_index: int) -> Mapping[str, Any]:
+    """Read the APPROVED canonical leg terms from the stored intent payload.
+
+    The approved terms are the AUTHORITATIVE comparison target for any positive
+    evidence — never the caller's freshly-constructed objects.  A missing /
+    malformed / out-of-range stored leg fails closed.
+    """
+    row = ledger.get_intent(intent_id)
+    if row is None:
+        raise ExecutionError("handoff: approved intent is missing")
+    payload = json.loads(row["payload"])
+    legs = payload.get("legs")
+    if not isinstance(legs, list) or not (0 <= leg_index < len(legs)):
+        raise ExecutionError("handoff: approved leg is missing from the intent")
+    canonical = legs[leg_index]
+    if not isinstance(canonical, Mapping):
+        raise ExecutionError("handoff: approved leg canonical is malformed")
+    return canonical
+
+
+def _compare_canonical_instrument(inst: Mapping[str, Any],
+                                  observed: Mapping[str, Any],
+                                  label: str) -> None:
+    """FULL canonical Instrument comparison (no partial-identity shortcut)."""
+    if str(inst.get("con_id")) != str(observed["con_id"]):
+        raise ExecutionError(
+            f"{label} conId does not match the approved canonical instrument")
+    if str(inst.get("underlying_id")) != str(observed["underlying_id"]):
+        raise ExecutionError(
+            f"{label} underlying_id does not match the approved canonical instrument")
+    for field in ("symbol", "sec_type", "currency", "exchange", "right"):
+        if str(inst.get(field, "")).upper() != str(observed[field]).upper():
+            raise ExecutionError(
+                f"{label} {field} does not match the approved canonical instrument")
+    approved_mult = handoff_decimal(inst.get("multiplier", "1"),
+                                    "approved multiplier")
+    observed_mult = handoff_decimal(observed["multiplier"], "observed multiplier")
+    if approved_mult != observed_mult:
+        raise ExecutionError(
+            f"{label} multiplier does not match the approved canonical instrument")
+    approved_strike = handoff_decimal(inst.get("strike", "0"), "approved strike")
+    observed_strike = handoff_decimal(observed["strike"], "observed strike")
+    if approved_strike != observed_strike:
+        raise ExecutionError(
+            f"{label} strike does not match the approved canonical instrument")
+    for field in ("expiry", "trading_class"):
+        if str(inst.get(field, "")) != str(observed[field]):
+            raise ExecutionError(
+                f"{label} {field} does not match the approved canonical instrument")
+
+
+def verify_observed_working_order(*, order_ref: str, account: str,
+                                  environment: str, leg: state.LegView,
+                                  approved: Mapping[str, Any],
+                                  snapshot: Any, now: datetime,
+                                  max_snapshot_age_seconds: Optional[int] = None,
+                                  con_id: Optional[int] = None,
+                                  perm_id: Any = None,
+                                  order_id: Any = None) -> WorkingOrder:
+    """MECHANICALLY map ONE stable orderRef to EXACTLY ONE real working order.
+
+    Shared by :meth:`ExecutionEngine.reconcile_positive` and the operator
+    ``resolve`` entry point so there is ONE identity implementation.  Every
+    check here is a refusal: the caller never gets a "best guess" order.
+    """
+    snap = check_observed_scope(snapshot, account, environment,
+                                "handoff observed snapshot")
+    # (1) FRESH relative to the IN-LOCK clock, not merely "newer than the
+    #     attempt": a day-old capture cannot prove a live working obligation.
+    if snap.captured_at.tzinfo is None or snap.captured_at.utcoffset() is None:
+        raise ExecutionError(
+            "handoff observed snapshot captured_at must be an aware datetime")
+    age = (now - snap.captured_at).total_seconds()
+    cap = max_snapshot_age_seconds
+    max_age = _HANDOFF_MAX_SNAPSHOT_AGE_SECONDS if cap is None \
+        else min(_HANDOFF_MAX_SNAPSHOT_AGE_SECONDS, cap)
+    if age < -_HANDOFF_MAX_FUTURE_SECONDS:
+        raise ExecutionError(
+            "handoff observed snapshot is in the future (clock skew); "
+            "refusing to release risk")
+    if age > max_age:
+        raise ExecutionError(
+            f"handoff observed snapshot is not fresh ({age:.0f}s old > "
+            f"{max_age}s); a stale snapshot cannot prove the specific "
+            "order is a current working obligation")
+    # The observed snapshot must ALSO be captured AFTER the attempt.
+    attempt_iso = leg.submitted_at
+    if attempt_iso:
+        attempt_dt = datetime.fromisoformat(attempt_iso.replace("Z", "+00:00"))
+        if snap.captured_at <= attempt_dt:
+            raise ExecutionError(
+                "handoff observed snapshot is not newer than the attempt")
+    # (4) MECHANICALLY map the SAME ref to EXACTLY ONE working order.
+    #     Duplicate rows with the same ref are an AMBIGUOUS mapping: never
+    #     pick the first and release a whole leg.
+    matched = [o for o in snap.orders if o.order_ref == order_ref]
+    if not matched:
+        raise ExecutionError(
+            "handoff observed snapshot has no working order matching "
+            "the stable orderRef; refusing to release risk")
+    if len(matched) != 1:
+        raise ExecutionError(
+            "handoff observed snapshot has multiple working orders with "
+            "the same stable orderRef; refusing an ambiguous/non-unique "
+            "mapping")
+    order = matched[0]
+    oid = None if order_id is None else str(order_id)
+    pid = None if perm_id is None else str(perm_id)
+    if oid is not None and str(order.order_id) != oid:
+        raise ExecutionError("handoff working order orderId mismatch")
+    if pid is not None and str(order.perm_id) != pid:
+        raise ExecutionError("handoff working order permId mismatch")
+    if leg.order_id not in (None, "") and str(order.order_id) != leg.order_id:
+        raise ExecutionError("handoff working order contradicts bound orderId")
+    if leg.perm_id not in (None, "") and str(order.perm_id) != leg.perm_id:
+        raise ExecutionError("handoff working order contradicts bound permId")
+    if con_id is not None and con_id != order.instrument.con_id:
+        raise ExecutionError("handoff conId does not match the working order")
+    if str(order.instrument.con_id) != leg.contract_id:
+        raise ExecutionError(
+            "handoff working order conId does not match the approved leg")
+    if order.action.upper() != leg.action.upper():
+        raise ExecutionError(
+            "handoff working order action does not match the approved leg")
+    if not isinstance(order.instrument, Instrument):
+        raise ExecutionError("handoff working order instrument is invalid")
+    # (2)(3) FULL economic identity against the APPROVED stored leg, never
+    #       against caller-supplied objects.  A different limit price / order
+    #       type, or a partial/filled remaining, cannot release the whole
+    #       reserved obligation.
+    _compare_canonical_instrument(approved.get("instrument") or {},
+                                  canonical_instrument(order.instrument),
+                                  "handoff working order")
+    if str(approved.get("action", "")).upper() != order.action.upper():
+        raise ExecutionError(
+            "handoff working order action does not match the approved canonical leg")
+    approved_order_type = str(approved.get("order_type", "")).upper()
+    observed_order_type = str(order.order_type or "").upper()
+    # A bounded LMT order is REQUIRED: a MKT / unbounded working order cannot
+    # be reconciled to a reserved, bounded obligation.
+    if approved_order_type != "LMT" or observed_order_type != "LMT":
+        raise ExecutionError(
+            "handoff requires a bounded LMT working order; refusing "
+            "an unbounded/order-type mismatch")
+    approved_limit = handoff_decimal(approved.get("limit_price"),
+                                     "approved limit price")
+    observed_limit = handoff_decimal(order.limit_price,
+                                     "working order limit price")
+    if approved_limit is None or observed_limit is None:
+        raise ExecutionError(
+            "handoff requires a bounded limit price on both the "
+            "approved leg and the working order")
+    if approved_limit != observed_limit:
+        raise ExecutionError(
+            "handoff working order limit price does not match the "
+            "approved leg (economic identity mismatch)")
+    approved_qty = handoff_decimal(approved.get("quantity"), "approved quantity")
+    remaining = handoff_decimal(order.remaining, "working remaining")
+    if approved_qty is None or remaining is None:
+        raise ExecutionError(
+            "handoff has a non-finite/negative quantity; refusing")
+    if remaining <= 0:
+        raise ExecutionError(
+            "handoff working order has no remaining quantity; cannot "
+            "positively map an outstanding obligation")
+    # remaining MUST be the EXACT approved full quantity: a partial fill (or
+    # any over/under remaining) is conservatively UNSUPPORTED.
+    if remaining != approved_qty:
+        raise ExecutionError(
+            "handoff working order remaining does not EXACTLY equal "
+            "the approved full quantity; partial/filled handoff is "
+            "unsupported (no fill/position bridge evidence)")
+    return order
+
+
+_FILL_SIDE = {"BOT": "BUY", "BUY": "BUY", "SLD": "SELL", "SELL": "SELL"}
+
+
+def verify_fill_against_approved(*, fill: Any, leg: state.LegView,
+                                 approved: Mapping[str, Any],
+                                 account: str, environment: str) -> None:
+    """Prove ONE execution row belongs to the APPROVED leg (fill bridge).
+
+    A filled order has no working order, so :func:`verify_observed_working_order`
+    can never release it — and "it is gone from open orders" is not proof of
+    anything.  The only sound bridge is the broker's own EXECUTION record naming
+    the SAME stable ``orderRef``.  Every field is re-verified here against the
+    approved stored leg; a partial fill (shares != approved quantity) refuses,
+    because it cannot discharge the whole reserved obligation.
+    """
+    if not isinstance(fill, PositiveFill):
+        raise ExecutionError(
+            "fill evidence must be a structured PositiveFill (a bare status "
+            "string or a position delta is not proof)")
+    if fill.account != account:
+        raise ExecutionError(
+            "fill evidence account does not match the reservation scope")
+    if fill.order_ref != leg.order_ref:
+        raise ExecutionError("fill evidence orderRef does not match the approved leg")
+    if not isinstance(fill.exec_id, str) or not fill.exec_id.strip():
+        raise ExecutionError("fill evidence has no execution id")
+    if type(fill.con_id) is not int or fill.con_id != int(leg.contract_id):
+        raise ExecutionError("fill conId does not match the approved leg conId")
+    observed_inst = approved.get("instrument") or {}
+    if str(observed_inst.get("con_id")) != str(fill.con_id):
+        raise ExecutionError(
+            "fill conId does not match the approved canonical instrument")
+    side = _FILL_SIDE.get(str(fill.side).upper()) if isinstance(fill.side, str) else None
+    if side is None:
+        raise ExecutionError("fill side is not a recognised BUY/SELL")
+    if side != str(leg.action).upper() or side != str(approved.get("action", "")).upper():
+        raise ExecutionError("fill side does not match the approved leg action")
+    qty = fill.shares
+    if isinstance(qty, bool) or isinstance(qty, float) or not isinstance(qty, Decimal) \
+            or not qty.is_finite() or qty <= 0:
+        raise ExecutionError(
+            "fill shares must be a positive finite Decimal")
+    cum = fill.cum_qty
+    if isinstance(cum, bool) or isinstance(cum, float) or not isinstance(cum, Decimal) \
+            or not cum.is_finite() or cum <= 0:
+        raise ExecutionError("fill cumulative quantity must be a positive finite Decimal")
+    approved_qty = handoff_decimal(approved.get("quantity"), "approved quantity")
+    if approved_qty is None:
+        raise ExecutionError("approved leg has no usable quantity")
+    if qty != approved_qty or cum != qty:
+        raise ExecutionError(
+            "fill quantity does not EXACTLY equal the approved full quantity; "
+            "a partial fill cannot release the whole reserved obligation")
+    price = fill.price
+    if isinstance(price, bool) or isinstance(price, float) or not isinstance(price, Decimal) \
+            or not price.is_finite() or price <= 0:
+        raise ExecutionError("fill price must be a positive finite Decimal")
+    if not isinstance(fill.as_of, datetime) or fill.as_of.tzinfo is None \
+            or fill.as_of.utcoffset() is None:
+        raise ExecutionError("fill execution time must be an aware datetime")
+    if leg.submitted_at:
+        attempt_dt = datetime.fromisoformat(leg.submitted_at.replace("Z", "+00:00"))
+        if fill.as_of < attempt_dt:
+            raise ExecutionError(
+                "fill execution time predates this attempt; refusing to attribute it")
 
 
 def canonical_instrument(inst: Instrument) -> Mapping[str, Any]:
@@ -1025,18 +1333,7 @@ class ExecutionEngine:
         must pass this check: an OTHER/live snapshot must never authorise a
         paper submission, and a low-quality snapshot must never pass.
         """
-        if not isinstance(snapshot, Snapshot):
-            raise ExecutionError(f"{label} must be a fresh Snapshot")
-        if snapshot.account != account or snapshot.environment != environment:
-            raise ExecutionError(
-                f"{label} account/environment mismatch "
-                f"({snapshot.account}/{snapshot.environment} != "
-                f"{account}/{environment})")
-        if snapshot.issues:
-            raise ExecutionError(
-                f"{label} has unresolved data-quality issues: "
-                + "; ".join(snapshot.issues))
-        return snapshot
+        return check_observed_scope(snapshot, account, environment, label)
 
     def _leg_increments(self, legs: Sequence[PreparedLeg],
                         snapshot: Snapshot) -> list[Mapping[str, Any]]:
@@ -1111,17 +1408,7 @@ class ExecutionEngine:
         positive handoff — never the caller's freshly-constructed objects.  A
         missing / malformed / out-of-range stored leg fails closed.
         """
-        row = self.ledger.get_intent(intent_id)
-        if row is None:
-            raise ExecutionError("handoff: approved intent is missing")
-        payload = json.loads(row["payload"])
-        legs = payload.get("legs")
-        if not isinstance(legs, list) or not (0 <= leg_index < len(legs)):
-            raise ExecutionError("handoff: approved leg is missing from the intent")
-        canonical = legs[leg_index]
-        if not isinstance(canonical, Mapping):
-            raise ExecutionError("handoff: approved leg canonical is malformed")
-        return canonical
+        return approved_leg_canonical(self.ledger, intent_id, leg_index)
 
     def _recheck_send_time(self, *, intent_id: str, code: str,
                            account: str, environment: str,
@@ -1215,181 +1502,70 @@ class ExecutionEngine:
                         and str(supplied) != bound:
                     raise ExecutionError(
                         f"handoff {label} conflicts with the ledger's bound id")
-            snap = self._observed_scope(
-                evidence.observed_snapshot, account, environment,
-                "handoff observed snapshot")
-            # (1) The observed snapshot must be FRESH relative to the IN-LOCK
-            #     clock, not merely "newer than the attempt": a day-old capture
-            #     cannot prove the order is currently a live working obligation.
-            now = self._now()
-            if snap.captured_at.tzinfo is None or snap.captured_at.utcoffset() is None:
-                raise ExecutionError("handoff observed snapshot captured_at must be an aware datetime")
-            age = (now - snap.captured_at).total_seconds()
-            cap = self.limits.max_snapshot_age_seconds
-            max_age = _HANDOFF_MAX_SNAPSHOT_AGE_SECONDS if cap is None \
-                else min(_HANDOFF_MAX_SNAPSHOT_AGE_SECONDS, cap)
-            if age < -_HANDOFF_MAX_FUTURE_SECONDS:
-                raise ExecutionError(
-                    "handoff observed snapshot is in the future (clock skew); "
-                    "refusing to release risk")
-            if age > max_age:
-                raise ExecutionError(
-                    f"handoff observed snapshot is not fresh ({age:.0f}s old > "
-                    f"{max_age}s); a stale snapshot cannot prove the specific "
-                    "order is a current working obligation")
-            # The observed snapshot must ALSO be captured AFTER the attempt.
-            attempt_iso = leg.submitted_at
-            if attempt_iso:
-                attempt_dt = datetime.fromisoformat(
-                    attempt_iso.replace("Z", "+00:00"))
-                if snap.captured_at <= attempt_dt:
-                    raise ExecutionError(
-                        "handoff observed snapshot is not newer than the attempt")
-            # (4) MECHANICALLY map the SAME ref to EXACTLY ONE working order.
-            #     Duplicate rows with the same ref are an AMBIGUOUS mapping:
-            #     never pick the first and release a whole leg.
-            matched = [o for o in snap.orders
-                       if o.order_ref == order_ref]
-            if not matched:
-                raise ExecutionError(
-                    "handoff observed snapshot has no working order matching "
-                    "the stable orderRef; refusing to release risk")
-            if len(matched) != 1:
-                raise ExecutionError(
-                    "handoff observed snapshot has multiple working orders with "
-                    "the same stable orderRef; refusing an ambiguous/non-unique "
-                    "mapping")
-            order = matched[0]
-            oid = None if order_id is None else str(order_id)
-            pid = None if perm_id is None else str(perm_id)
-            if oid is not None and str(order.order_id) != oid:
-                raise ExecutionError("handoff working order orderId mismatch")
-            if pid is not None and str(order.perm_id) != pid:
-                raise ExecutionError("handoff working order permId mismatch")
-            if leg.order_id not in (None, "") and str(order.order_id) != leg.order_id:
-                raise ExecutionError("handoff working order contradicts bound orderId")
-            if leg.perm_id not in (None, "") and str(order.perm_id) != leg.perm_id:
-                raise ExecutionError("handoff working order contradicts bound permId")
-            if evidence.con_id is not None \
-                    and evidence.con_id != order.instrument.con_id:
-                raise ExecutionError("handoff conId does not match the working order")
-            if str(order.instrument.con_id) != leg.contract_id:
-                raise ExecutionError(
-                    "handoff working order conId does not match the approved leg")
-            if order.action.upper() != leg.action.upper():
-                raise ExecutionError(
-                    "handoff working order action does not match the approved leg")
-            # (2)(3) FULL economic identity against the APPROVED stored leg,
-            #       never against caller-supplied objects.  A working order with
-            #       a different limit price / order type, or a partial/filled
-            #       remaining, can NOT release the whole reserved obligation.
-            approved = self._stored_leg_canonical(leg.intent_id, leg.leg_index)
-            inst = approved.get("instrument") or {}
-            if not isinstance(order.instrument, Instrument):
-                raise ExecutionError("handoff working order instrument is invalid")
-            observed_inst = canonical_instrument(order.instrument)
-
-            # FULL canonical Instrument comparison:
-            # underlying, symbol, sec_type, currency, exchange, multiplier,
-            # right, strike, expiry, trading_class, con_id
-            if str(inst.get("con_id")) != str(observed_inst["con_id"]):
-                raise ExecutionError(
-                    "handoff working order conId does not match the approved canonical instrument")
-            if str(inst.get("underlying_id")) != str(observed_inst["underlying_id"]):
-                raise ExecutionError(
-                    "handoff working order underlying_id does not match the approved canonical instrument")
-            if str(inst.get("symbol", "")).upper() != str(observed_inst["symbol"]).upper():
-                raise ExecutionError(
-                    "handoff working order symbol does not match the approved canonical instrument")
-            if str(inst.get("sec_type", "")).upper() != str(observed_inst["sec_type"]).upper():
-                raise ExecutionError(
-                    "handoff working order sec_type does not match the approved canonical instrument")
-            if str(inst.get("currency", "")).upper() != str(observed_inst["currency"]).upper():
-                raise ExecutionError(
-                    "handoff working order currency does not match the approved canonical instrument")
-            if str(inst.get("exchange", "")).upper() != str(observed_inst["exchange"]).upper():
-                raise ExecutionError(
-                    "handoff working order exchange does not match the approved canonical instrument")
-            approved_mult = self._handoff_decimal(inst.get("multiplier", "1"), "approved multiplier")
-            observed_mult = self._handoff_decimal(observed_inst["multiplier"], "observed multiplier")
-            if approved_mult != observed_mult:
-                raise ExecutionError(
-                    "handoff working order multiplier does not match the approved canonical instrument")
-            if str(inst.get("right", "")).upper() != str(observed_inst["right"]).upper():
-                raise ExecutionError(
-                    "handoff working order right does not match the approved canonical instrument")
-            approved_strike = self._handoff_decimal(inst.get("strike", "0"), "approved strike")
-            observed_strike = self._handoff_decimal(observed_inst["strike"], "observed strike")
-            if approved_strike != observed_strike:
-                raise ExecutionError(
-                    "handoff working order strike does not match the approved canonical instrument")
-            if str(inst.get("expiry", "")) != str(observed_inst["expiry"]):
-                raise ExecutionError(
-                    "handoff working order expiry does not match the approved canonical instrument")
-            if str(inst.get("trading_class", "")) != str(observed_inst["trading_class"]):
-                raise ExecutionError(
-                    "handoff working order trading_class does not match the approved canonical instrument")
-            if str(approved.get("action", "")).upper() != order.action.upper():
-                raise ExecutionError(
-                    "handoff working order action does not match the approved canonical leg")
-            approved_order_type = str(approved.get("order_type", "")).upper()
-            observed_order_type = str(order.order_type or "").upper()
-            # A bounded LMT order is REQUIRED: a MKT / unbounded working order
-            # cannot be reconciled to a reserved, bounded obligation.
-            if approved_order_type != "LMT" or observed_order_type != "LMT":
-                raise ExecutionError(
-                    "handoff requires a bounded LMT working order; refusing "
-                    "an unbounded/order-type mismatch")
-            approved_limit = self._handoff_decimal(
-                approved.get("limit_price"), "approved limit price")
-            observed_limit = self._handoff_decimal(
-                order.limit_price, "working order limit price")
-            if approved_limit is None or observed_limit is None:
-                raise ExecutionError(
-                    "handoff requires a bounded limit price on both the "
-                    "approved leg and the working order")
-            if approved_limit != observed_limit:
-                raise ExecutionError(
-                    "handoff working order limit price does not match the "
-                    "approved leg (economic identity mismatch)")
-            approved_qty = self._handoff_decimal(
-                approved.get("quantity"), "approved quantity")
-            remaining = self._handoff_decimal(order.remaining, "working remaining")
-            if approved_qty is None or remaining is None:
-                raise ExecutionError(
-                    "handoff has a non-finite/negative quantity; refusing")
-            if remaining <= 0:
-                raise ExecutionError(
-                    "handoff working order has no remaining quantity; cannot "
-                    "positively map an outstanding obligation")
-            # remaining MUST be the EXACT approved full quantity: a partial
-            # fill (or any over/under remaining) is conservatively UNSUPPORTED.
-            if remaining != approved_qty:
-                raise ExecutionError(
-                    "handoff working order remaining does not EXACTLY equal "
-                    "the approved full quantity; partial/filled handoff is "
-                    "unsupported (no fill/position bridge evidence)")
+            approved = approved_leg_canonical(
+                self.ledger, leg.intent_id, leg.leg_index)
+            order = verify_observed_working_order(
+                order_ref=order_ref, account=account, environment=environment,
+                leg=leg, approved=approved, snapshot=evidence.observed_snapshot,
+                now=self._now(),
+                max_snapshot_age_seconds=self.limits.max_snapshot_age_seconds,
+                con_id=evidence.con_id, perm_id=perm_id, order_id=order_id)
             return self.ledger.confirm_leg(
                 order_ref, broker_status=evidence.broker_status,
-                perm_id=perm_id if pid is not None else order.perm_id,
-                order_id=order_id if oid is not None else order.order_id)
+                perm_id=perm_id if perm_id is not None else order.perm_id,
+                order_id=order_id if order_id is not None else order.order_id)
+
+    def reconcile_filled(self, *, account: str, environment: str,
+                         order_ref: str, fill: Any,
+                         perm_id: Any = None, order_id: Any = None) -> str:
+        """Release ONE leg using a broker EXECUTION record (the fill bridge).
+
+        :meth:`reconcile_positive` deliberately refuses a Filled/terminal order
+        because no WORKING order exists to map.  Without this path a filled leg
+        leaves the account blocked forever (the P0 lock).  The bridge is not a
+        shortcut: ``fill`` must be a :class:`PositiveFill` derived from a real
+        ``Execution`` row naming the SAME stable ``orderRef``, and every field
+        (account / conId / side / shares / cumQty / execution time) is verified
+        against the APPROVED stored leg.  Partial fills, foreign accounts, other
+        refs and pre-attempt executions all refuse.  Runs under the same
+        account lock and is PER-LEG; the day submission count is retained.
+        """
+        if not isinstance(fill, PositiveFill):
+            raise ExecutionError(
+                "fill reconciliation requires structured PositiveFill evidence "
+                "(a bare status or a position delta is not proof)")
+        with state.account_scope(self.lock_dir, account, environment):
+            leg = self.ledger.get_leg(order_ref, account=account,
+                                      environment=environment)
+            if leg is None:
+                raise ExecutionError(
+                    "fill orderRef is unknown or belongs to a different "
+                    "account/environment (scope mismatch)")
+            if leg.state not in ("submitted", "submitting", "unknown"):
+                raise ExecutionError(
+                    f"leg {order_ref!r} is not in a releasable state "
+                    f"({leg.state})")
+            for label, supplied, bound in (
+                    ("orderId", order_id, leg.order_id),
+                    ("permId", perm_id, leg.perm_id)):
+                if supplied is not None and bound not in (None, "") \
+                        and str(supplied) != bound:
+                    raise ExecutionError(
+                        f"fill {label} conflicts with the ledger's bound id")
+            approved = approved_leg_canonical(
+                self.ledger, leg.intent_id, leg.leg_index)
+            verify_fill_against_approved(fill=fill, leg=leg, approved=approved,
+                                         account=account,
+                                         environment=environment)
+            return self.ledger.confirm_leg(
+                order_ref, broker_status="Filled",
+                perm_id=perm_id if perm_id is not None else fill.perm_id,
+                order_id=order_id if order_id is not None else fill.order_id)
 
     @staticmethod
     def _handoff_decimal(value: Any, label: str) -> Optional[Decimal]:
-        """Strict finite non-negative Decimal for a handoff numeric field.
-        Bools / floats / NaN / non-Decimal strings are refused (fail closed).
-        """
-        if value is None or isinstance(value, bool) or isinstance(value, float):
-            return None
-        if not isinstance(value, (Decimal, int, str)):
-            return None
-        try:
-            result = Decimal(str(value))
-        except (InvalidOperation, ValueError, TypeError):
-            return None
-        if not result.is_finite() or result < 0:
-            return None
-        return result
+        """Backwards-compatible alias of :func:`handoff_decimal`."""
+        return handoff_decimal(value, label)
 
     def confirm(self, *, intent_id: str, code: str,
                 legs: Sequence[PreparedLeg], account: str,

@@ -43,6 +43,13 @@
 
 权威本地 SQLite 账本与兼容 JSONL 审计的职责不同：JSONL 写入成功不证明成交，写入失败也不证明没有发单。账本必须在网络发送之前保存 intent、资源预留和稳定 orderRef。
 
+`orders.jsonl` 的写入点只有一个：`submission_cli.execute_prepared` 在返回前调用 `thetamill/audit.py`。规则如下：
+
+- 只有某一腿处于 attempting/submitting/submitted/unknown（可能已发出）才写；预检、迁移冻结、发单前拒绝都不写。日志里出现券商单号即代表确实联系过券商。
+- 字段严格按类型净化。非 JSON 安全的对象（`MagicMock`、ib_async 对象、NaN/Inf）逐字段丢弃并记入 `dropped_fields`；如果关键字段全被丢弃，整条记录都不写。旧的 `default=str` 写法曾把单元测试的 mock repr 写成 94 行看似真实的审计记录，绝不能再出现。
+- `thetamill audit` 隐藏任何含 mock repr 的合成行并显示隐藏条数，同时以只读方式并入 SQLite 账本（`来源=账本`），状态取 `confirm_leg` 记录的券商正向状态（如 `PreSubmitted`）。账本有、日志无的委托会被明确标注为「只存在于提交账本」。
+- 旧复核码导入（`_ledger` 的 legacy import、`_is_code_consumed`）同样跳过合成行：一条 mock 记录不能占用一个真实复核码。
+
 - 回执不明先对账，不重发，不删除消费记录。
 - 当前挂单里没找到，可能代表已成交、已取消或历史不可见；不是未发送证明。
 - 未知订单占用跨自然日继续保留。跨日只切换每日配额，不清理资金和股数义务。
@@ -73,7 +80,22 @@ POSIX 账户锁和 SQLite 事务只协调同一主机、同一账本的本工具
 
 撤单不仅要求账户和 orderId 匹配，还要求订单属于当前 API clientId。不同客户端可能使用相同 orderId；其他客户端的订单须回原客户端或 TWS 核对处理，本工具不通过 ID 猜测绑定。
 
-`cancel` 在券商回执为 `Cancelled` / `ApiCancelled` 且该订单带有本工具写入的 `orderRef` 时，会把对应账本腿置为 `confirmed` 并释放其资源预留；非终态回执不释放。撤单失败或状态不明时，预留保持未决，须用 `reconcile` 核对，不能手工删库恢复额度。
+`cancel` 在券商回执为 `Cancelled` / `ApiCancelled` 且该订单带有本工具写入的 `orderRef` 时，会把对应账本腿置为 `confirmed` 并释放其资源预留；非终态回执不释放。撤单失败或状态不明时预留保持未决；撤单成功但账本无法更新时，命令会明确提示账户可能仍被拦并指向 `resolve --list`，不会再静默吞掉异常。
+
+## 未决预留的解除（账户锁的唯一出口）
+
+一笔委托只要可能已经发出（腿状态 `submitting`/`submitted`/`unknown`），整个账户就被保守拦住，`confirm` 会持续拒绝新增风险。这是正确的，但必须有一个可审计的出口：
+
+```
+thetamill resolve --list                 # 只读：列出当前阻塞账户的未决预留与各腿状态
+thetamill resolve --reservation <id>     # 依次用券商正向证据逐腿解除
+thetamill resolve --reservation <id> --state released --why "<书面理由>"
+```
+
+- `confirmed`（默认）要求**每一条**未决腿都有正向结构化证据：要么是新鲜、严格同账户/环境快照里 `orderRef` 完全相同且经济身份全部匹配的活动挂单，要么是券商成交流水中同一 `orderRef` 的成交行（账户、conId、方向、成交量、时间全部匹配）。「当前挂单里没有」永远不是证据。
+- `released` 仅适用于没有任何一腿被尝试过的预留（发送尝试在网络调用之前就已持久化），且必须给出书面理由；试图用理由绕过已尝试的腿会被拒绝。
+- 解除按腿走 `confirm_leg`，账本会记录是哪一个券商正向状态（`Submitted`/`Filled`/…）放行的；已消耗的当日提交次数不会因解除而返还。
+- 不得删除 `state.sqlite3`、清空消费记录或改目录来恢复交易能力。
 
 `reconcile` 只查询券商并写入本地观察记录，不重发、不撤单、不自动释放预留。匹配以 orderRef / permId 等稳定身份为依据；标识矛盾、未知账户范围或多个匹配均停止。仅知道 orderId 不能证明目标属于该 intent。
 

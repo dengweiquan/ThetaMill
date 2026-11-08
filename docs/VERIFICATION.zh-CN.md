@@ -407,3 +407,31 @@ run         → 复核码 180EE04B → 提交 #104 PreSubmitted → 撤单归 0
 - 备兑差额碎股不自动发出；股腿须有有限且不超批准量的成交证明，随后阻塞刷新账户与挂单、再核验覆盖才考虑期权腿。外部卖股占用和 NaN 成交值均停止第二腿。
 - `run` 对原始计划数量/行权价/权利金校验，不先把 bool、字符串或小数强转为整数。旧计划缺合约身份仍须重新生成。
 - 复核码原子认领、账户隔离、崩溃恢复与每日限额仍属 B/C；不能用本批测试通过宣称这些功能已上线。`readonly=True` 是库的启动同步选项，并非服务端订单 ACL。
+
+## 十六、P0 修复：未决账户出口与审计断流（2026-11-08，离线）
+
+本节与前文历史记录分开：**没有连接 Gateway，没有新增提交、撤单或成交证据**。
+
+### 1. 未决预留无法解除（账户锁死）
+
+- 缺陷：`ExecutionEngine.reconcile_positive` 与 `SubmissionLedger.resolve_unknown` 在生产路径上零调用者。任何一笔回执不明的委托都会让 `has_unresolved_submissions` 永久为真，`confirm` 之后一律抛错，而文档给出的补救（对账、勿删库）无法执行。
+- 新增 `thetamill/resolve.py`：`unresolved_summary` / `resolve_reservation` / `release_never_sent` / `fill_from_row` / `live_observations` / `open_ledger`。`confirmed` 要求每一条未决腿都有正向结构化证据——新鲜且严格同账户/环境的 `Snapshot` 活动挂单，或券商成交流水中同一 `orderRef` 的成交行；身份校验复用 `execution.py` 的同一套函数（`verify_observed_working_order`、`verify_fill_against_approved`、`approved_leg_canonical`），没有第二份实现。
+- 新增 `ExecutionEngine.reconcile_filled` 与 `execution.PositiveFill`：Filled 单没有活动挂单，此前根本无法被正向交接；现在由执行行（账户、conId、方向、**精确**成交数量、时间）逐项核对后放行，部分成交仍拒绝。
+- 新增 CLI `thetamill resolve --list / --reservation <id> [--state confirmed|released] [--why ...]`：只读打开账本进行列举与取证，只有真正解除时才以可写方式打开；环境判定不做端口探测。
+- `thetamill cancel` 不再静默 `except: pass`：撤单成功但账本更新失败时会明确提示账户可能仍被拦并指向 `resolve --list`。
+- 回归：`tests/test_resolve.py` 22 项（含「仅不在挂单中不构成证据」「他账户/他 ref/他 conId 不解除」「两条成交视为歧义拒绝」「快照过期/范围不符/issues 拒绝」「解除不返还已消耗提交次数」）。
+
+### 2. 审计断流
+
+- 缺陷：`cli._write_audit` 自 `04eb77e` 起零调用者，真实提交不再写入 `orders.jsonl`；同时旧单元测试路径用 `default=str` 把 `MagicMock` 的 repr 写进日志，`audit` 又把它们当作券商订单打印，而真正提交过的 #133/#140 只存在于 SQLite 账本中，一条都看不到。
+- 新增 `thetamill/audit.py`：`append_record` 严格按类型净化（丢弃非 JSON 安全值、NaN/Infinity、含 mock repr 的字符串，并记入 `dropped_fields`；关键字段全丢则整条不写），`is_real_record` / `is_synthetic_record` 供读取端判定。
+- `submission_cli.execute_prepared` 成为**唯一**写入点：仅当某腿处于 attempting/submitting/submitted/unknown（可能已发出）时写入；预检、迁移冻结、发单前拒绝均不写。`cli._write_audit` 已删除，避免出现第二个会漂移的实现。
+- `cmd_audit` 隐藏含 mock repr 的合成行并显示条数，同时以只读方式并入 SQLite 账本（`来源=账本`），状态优先取 `confirm_leg` 新记录的券商正向状态。旧复核码导入（`_ledger` 的 legacy import、`_is_code_consumed`）同样跳过合成行：一条 mock 记录不能占用真实复核码。
+- `SubmissionLedger.confirm_leg` 现在把「用哪个券商正向状态放行」写入 `reconciliation`（幂等），否则 `confirmed` 会掩盖 `Submitted` 与 `Filled` 的区别。
+- 回归：`tests/test_audit.py` 19 项（真实提交写且只写一条、预检/冻结不写、mock 字段被丢弃且文件里不出现 `MagicMock`、合成行不与真实行混淆、账本独有条目可见、mock 行不占用复核码）。
+- 对真实数据只做了只读 smoke：`thetamill audit --account DUR339329` 显示隐藏 94 条合成记录、仅 2 条真实条目（#133 `PreSubmitted`、#140），并标注两条都只存在于账本。历史日志文件未修改、未删除。
+
+### 3. 门禁
+
+- 全量离线：`python -m unittest discover -s tests` → **819 项通过**（Python 3.10 / ib_async 2.1.0）。
+- 仍未验证：任何真实券商证据。上述解除路径只经过 mock 与临时 SQLite 账本验证；真实账户上仍需单独授权后按只读 → 纸账户提交/撤单分层验收。

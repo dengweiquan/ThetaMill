@@ -54,6 +54,6 @@ jobs:
           python -I -m unittest discover -s "$GITHUB_WORKSPACE/tests" -v
           thetamill --help
           python -I -m thetamill --help
-          for cmd in status account positions orders quote chain order strat combo plan run report reconcile roll-plan audit cancel; do
+          for cmd in status account positions orders quote chain order strat combo plan run report reconcile roll-plan audit cancel resolve; do
             thetamill "$cmd" --help
           done
