@@ -20,6 +20,9 @@ classifiers = [
 ]
 dependencies = ["ib_async>=2.0"]
 
+[project.optional-dependencies]
+dev = ["ruff==0.17.4"]
+
 [project.urls]
 Homepage = "https://github.com/dengweiquan/ThetaMill"
 

@@ -14,9 +14,11 @@ jobs:
       fail-fast: false
       matrix:
         python: ['3.10', '3.13']
+    # NOTE: job-level env may only use github/inputs/matrix/needs/secrets/strategy/vars.
+    # `runner` is step-scoped only, so CI scratch paths are derived from github.workspace.
     env:
-      THETAMILL_DATA: ${{ runner.temp }}/thetamill-test-data
-      THETAMILL_CONFIG: ${{ runner.temp }}/no-broker-config.json
+      THETAMILL_DATA: ${{ github.workspace }}/.ci/data
+      THETAMILL_CONFIG: ${{ github.workspace }}/.ci/no-broker-config.json
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,21 +26,31 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Build wheel
         run: |
+          mkdir -p .ci
           python -m pip install --upgrade pip build
           python -m build --wheel
-          python -m pip install dist/*.whl
+          python -m pip install --force-reinstall dist/*.whl
       - name: Source regression tests (offline)
         run: python -m unittest discover -s tests -v
+      - name: Static check baseline (E9 syntax, F pyflakes)
+        run: |
+          python -m pip install "ruff==0.17.4"
+          ruff check --select E9,F thetamill tests
       - name: Whitespace and conflict markers
         run: |
-          git diff --check
+          # A fresh checkout has no working-tree diff, so compare the pushed
+          # commit against its first parent (skipped only for root commits).
+          if git rev-parse -q --verify HEAD^ >/dev/null; then
+            git diff --check HEAD^ HEAD
+          fi
           if grep -rnE '^(<<<<<<< |=======|>>>>>>> )' thetamill tests; then
             exit 1
           fi
       - name: Installed-wheel tests and CLI help without configuration
-        working-directory: ${{ runner.temp }}
+        # Run outside the checkout so `import thetamill` cannot resolve to the source tree.
+        working-directory: ${{ github.workspace }}/.ci
         run: |
-          python -I -c 'import thetamill; from pathlib import Path; p=Path(thetamill.__file__).resolve(); print(p); assert "site-packages" in str(p)'
+          python -I -c 'import thetamill; from pathlib import Path; p=Path(thetamill.__file__).resolve(); print(p); assert "site-packages" in str(p), p'
           python -I -m unittest discover -s "$GITHUB_WORKSPACE/tests" -v
           thetamill --help
           python -I -m thetamill --help

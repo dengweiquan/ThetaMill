@@ -26,3 +26,7 @@ venv/
 .idea/
 .vscode/
 *.swp
+
+# 覆盖率测量产物
+.coverage
+htmlcov/
