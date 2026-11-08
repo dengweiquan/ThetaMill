@@ -21,6 +21,30 @@
 
 **仍未验证**：成交（本轮委托均在同日休市时段、收盘前未撮合）、成交后持仓变动、实盘账户、非美元合约、非标/调整合约交割结构。`delivery_evidence.json` 中的交割证据仅对具体 conId `937548729` 有效，不代表其他合约已获授权。
 
+### 本轮新发现并修复：`roll-plan` 无限挂起（2026-11-08）
+
+**现象**：`roll-plan --con-id 937548354 --qty 1` 在纸账户上**永不返回**。faulthandler 在 60s 与 75s 两次抓栈都停在 `selectors.select → run_until_complete → ib.py:676 reqTickers → roll_cli.py _fetch_tickers`。
+
+**根因（三组只读探针分别证实）**：`_qualify_options()` 用 `reqContractDetails(Contract(conId=...))` 取得完整合约、完成身份与乘数校验后，**把校验过的详情合约丢弃**，只在传给 `reqTickers` 的表里保留了最初的 `Contract(conId=...)` 空壳。该空壳没有 `exchange`，IB 以错误 `[321] 原因 - Please enter exchange` 拒答且**不发送任何 tick**，快照 future 永不完成；而 `ib_async` 的 `IB.RequestTimeout` 默认值为 `0`（**永不超时**），于是整个进程阻塞。
+
+| 探针 | 请求内容 | 结果 |
+|---|---|---|
+| A | `Contract(conId=937548354)` | **20.0s 超时**（探针自设上限）；`[321] Please enter exchange` |
+| A | 详情派生的完整合约 | **0.3s** 返回 `marketDataType=1` |
+| B | `conId` / `conId+secType` | 均**挂起**；同一 `[321]` |
+| B | `conId+exchange` / `conId+secType+exchange` | 0.2–0.4s 返回 |
+
+**修复**（`thetamill/roll_cli.py`）：
+1. `_qualify_options()` 改为把**详情派生的合约**放进结果（`contracts[cid] = qualified`），空壳只用于最初的那次查找；若详情合约本身仍无 `exchange`，则该 conId 不予资格认定，而不是发出一个只可能阻塞的请求。
+2. `_fetch_tickers()` 给 `RequestTimeout` 加**有界上限** `SNAPSHOT_TIMEOUT_SECONDS = 20.0`，**仅在这一次调用期间生效并在 `finally` 中还原**调用方原有策略；超时按既有降级路径记录 `market data request failed (TimeoutError)`，行情一律视为缺失，绝不放宽任何报价门禁。
+
+**验证**：修复后同一命令在真实纸账户上 **3s 内返回** `rc=3`（无建议文档，非挂起），issues 明确写出 `ticker ... is DELAYED/FROZEN (marketDataType=3)`。另用不可路由空壳直连网关复验超时路径：**20.0s 返回**、`notes=['market data request failed (TimeoutError); all quotes treated as missing']`、`RequestTimeout` 调用前为 `0`、调用后仍为 `0`。
+
+**回归**：`tests/test_roll_cli.py::SnapshotContractTests` 共 5 项（发往 `reqTickers` 的必须是可路由的详情合约、空壳不得被复用、请求失败降级而非抛出、超时在调用期间生效且事后还原、超时被报告为缺失行情）。全量离线 889 项通过，覆盖率门禁 `rc=0`（全局 84.1%）。
+
+**边界**：本次只修复「不可路由合约 + 无上限等待」这一挂起路径，未证明延迟行情可用于现金估算——`_build_quotes` 仍拒收 `marketDataType != 1`，因此无实时订阅的账户上 `roll-plan` 只会给出「行情缺失」的阻塞结论。这与既有设计一致，不是本次修复放宽的项。
+
+
 ## 新一轮工程验收状态（2026-11-07）
 
 以下为 2026-11-07 记录的可追溯离线检查点，不覆盖其后 2026-11-08 的真实网关验收，也不代表 A–F 已全部完成。

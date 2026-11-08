@@ -51,6 +51,10 @@ from . import universe as uni
 # roll recommendation, and carries no order/executable fields.
 DELIVERABLES_SCHEMA = "thetamill.deliverables.v1"
 
+# Upper bound (seconds) on one snapshot request.  ib_async's own default of 0
+# means "never time out", which turns an unanswered request into a hang.
+SNAPSHOT_TIMEOUT_SECONDS = 20.0
+
 
 class DeliverableEvidenceError(ValueError):
     """Delivery evidence is missing, malformed, stale or contradicts identity."""
@@ -291,6 +295,12 @@ def _qualify_options(ib, con_ids: Sequence[int], notes: list[str]):
     ``reqContractDetails(Contract(conId=id))`` and converted with
     ``broker_state._instrument`` (which validates underConId uniqueness,
     multiplier fidelity and stock-only underlying).
+
+    The contracts returned for use in market-data requests are the
+    DETAILS-DERIVED ones, never the ``Contract(conId=...)`` lookup stubs.  IB
+    refuses a stub that carries no exchange (error 321, "Please enter
+    exchange") and answers with nothing at all, so a snapshot request built
+    from stubs never completes and the caller blocks forever.
     """
     from . import cli as _cli  # lazy: avoid a module-level circular import
 
@@ -329,16 +339,40 @@ def _qualify_options(ib, con_ids: Sequence[int], notes: list[str]):
         if any(x.con_id == cid for x in instruments):
             notes.append(f"duplicate candidate conId {cid}; ignored")
             continue
+        # Route the market-data request with the DETAILS contract.  The
+        # conId-only stub above has no exchange, which IB answers with error
+        # 321 and no reply at all -- a snapshot built from stubs never
+        # completes.  A details contract that still lacks a venue is not
+        # routable either, so refuse it rather than issue a request that can
+        # only block.
+        if not getattr(qualified, "exchange", ""):
+            notes.append(f"qualified conId {cid} has no exchange; quote request "
+                         "not possible; not qualified")
+            continue
         instruments.append(inst)
-        contracts[cid] = contract
+        contracts[cid] = qualified
     return instruments, contracts
 
 
 def _fetch_tickers(ib, contracts: Mapping[int, object], notes: list[str]):
-    """One reqTickers call; returns a raw ``{con_id: ticker}`` map."""
+    """One reqTickers call; returns a raw ``{con_id: ticker}`` map.
+
+    The request is BOUNDED.  ``ib_async`` defaults ``IB.RequestTimeout`` to 0,
+    which means "wait forever": a contract the gateway never answers (an
+    unroutable one, a dropped session, unsubscribed data) blocks the whole
+    process instead of degrading to "quote missing".  The timeout is applied
+    only around this call and restored afterwards so other requests keep
+    whatever policy the caller configured.
+    """
     raw: dict[int, object] = {}
     if not contracts:
         return raw
+    had_timeout = hasattr(ib, "RequestTimeout")
+    previous = getattr(ib, "RequestTimeout", None)
+    try:
+        ib.RequestTimeout = SNAPSHOT_TIMEOUT_SECONDS
+    except Exception:      # a strict/frozen stand-in: just run unbounded
+        had_timeout = False
     try:
         with _private_diagnostics():
             tickers = ib.reqTickers(*contracts.values())
@@ -346,6 +380,12 @@ def _fetch_tickers(ib, contracts: Mapping[int, object], notes: list[str]):
         notes.append(f"market data request failed ({type(exc).__name__}); "
                      "all quotes treated as missing")
         return raw
+    finally:
+        if had_timeout:
+            try:
+                ib.RequestTimeout = previous
+            except Exception:
+                pass
     for t in (tickers or ()):
         cid = getattr(getattr(t, "contract", None), "conId", None)
         if type(cid) is int and cid > 0 and cid not in raw:

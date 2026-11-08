@@ -910,5 +910,125 @@ class SharedEvidenceIntegrationTests(unittest.TestCase):
             gate.assert_not_called()
 
 
+class SnapshotContractTests(unittest.TestCase):
+    """The quote request must carry a ROUTABLE contract, not a conId-only stub.
+
+    Reproduction (paper gateway, 2026-11-08): ``_qualify_options`` validated the
+    full identity from ``reqContractDetails`` and then stored the bare
+    ``Contract(conId=...)`` stub it had looked up.  IB rejects that stub with
+    error 321 ("Please enter exchange"), sends no ticks, and the snapshot future
+    never completes; with ``IB.RequestTimeout == 0`` the call blocks forever, so
+    ``roll-plan`` hung indefinitely instead of degrading to "quote missing".
+    """
+
+    def _capture(self, tmp):
+        """Run a plan and record the contracts handed to reqTickers."""
+        seen = []
+
+        def capture(*contracts):
+            seen.append(list(contracts))
+            return [ticker(20), ticker(30)]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = write_evidence(Path(tmpdir) / "e.json",
+                                  [evidence_record(old_inst()),
+                                   evidence_record(candidate())])
+            args = make_args(delivery_evidence=path)
+            with patch.object(roll_cli, "_fetch_tickers",
+                              side_effect=lambda ib, c, n: _fetch(ib, c, n, capture)):
+                run_plan(tmp, args)
+        return seen
+
+    def test_quote_request_uses_the_qualified_contract_not_the_stub(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seen = self._capture(tmp)
+        self.assertEqual(len(seen), 1)
+        sent = {c.conId: c for c in seen[0]}
+        self.assertEqual(sorted(sent), [20, 30])
+        for cid, contract in sent.items():
+            # Every field IB needs to route the snapshot must survive.
+            self.assertTrue(getattr(contract, "exchange", ""),
+                            f"conId {cid} sent without exchange -> IB error 321, "
+                            "request never completes")
+            self.assertEqual(getattr(contract, "secType", ""), "OPT")
+            self.assertTrue(getattr(contract, "symbol", ""))
+
+    def test_the_stub_is_never_what_we_ask_about(self):
+        """A conId-only contract is unroutable; assert it is not what was sent."""
+        with tempfile.TemporaryDirectory() as tmp:
+            seen = self._capture(tmp)
+        for contract in seen[0]:
+            self.assertNotIsInstance(contract, FakeContract,
+                                     "the conId-only lookup stub was reused "
+                                     "for the market-data request")
+
+    def test_a_failed_quote_request_degrades_instead_of_blocking(self):
+        """A broker-side failure must become "quote missing", never a hang."""
+        def boom(*contracts):
+            raise TimeoutError("IB did not answer the snapshot request")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_evidence(Path(tmp) / "e.json",
+                                  [evidence_record(old_inst()),
+                                   evidence_record(candidate())])
+            args = make_args(delivery_evidence=path)
+            with patch.object(roll_cli, "_fetch_tickers",
+                              side_effect=lambda ib, c, n: _fetch(ib, c, n, boom)):
+                rc, out, err, _ = run_plan(tmp, args)
+        self.assertEqual(rc, 3)               # no recommendation, but a document
+        data = json.loads(out)
+        self.assertEqual(data["recommended_count"], 0)
+        self.assertTrue(any("market data request failed" in i
+                            for i in data.get("issues", [])),
+                        data.get("issues"))
+
+    def test_the_snapshot_request_is_bounded_and_restores_the_policy(self):
+        """ib_async defaults RequestTimeout to 0 == wait forever."""
+        ib = MagicMock()
+        ib.RequestTimeout = 0            # the library default: infinite
+        ib.reqTickers.return_value = [ticker(20)]
+        notes = []
+        raw = roll_cli._fetch_tickers(ib, {20: SimpleNamespace(conId=20)}, notes)
+        self.assertEqual(sorted(raw), [20])
+        self.assertEqual(ib.RequestTimeout, 0, "caller's policy was not restored")
+        # The timeout must be in force DURING the call, not just afterwards.
+        seen = {}
+
+        def capture(*contracts):
+            seen["timeout"] = ib.RequestTimeout
+            return [ticker(20)]
+
+        ib.reqTickers.side_effect = capture
+        roll_cli._fetch_tickers(ib, {20: SimpleNamespace(conId=20)}, [])
+        self.assertEqual(seen["timeout"], roll_cli.SNAPSHOT_TIMEOUT_SECONDS)
+        self.assertGreater(seen["timeout"], 0)
+
+    def test_a_timeout_is_reported_as_missing_quotes_not_raised(self):
+        ib = MagicMock()
+        ib.RequestTimeout = 0
+        ib.reqTickers.side_effect = TimeoutError()
+        notes = []
+        self.assertEqual(roll_cli._fetch_tickers(ib, {20: SimpleNamespace(conId=20)}, notes), {})
+        self.assertTrue(any("market data request failed" in n for n in notes), notes)
+        self.assertEqual(ib.RequestTimeout, 0)
+
+
+def _fetch(ib, contracts, notes, requester):
+    """Call the production _fetch_tickers body with an injected requester."""
+    raw = {}
+    try:
+        with roll_cli._private_diagnostics():
+            tickers = requester(*contracts.values())
+    except Exception as exc:
+        notes.append(f"market data request failed ({type(exc).__name__}); "
+                     "all quotes treated as missing")
+        return raw
+    for t in (tickers or ()):
+        cid = getattr(getattr(t, "contract", None), "conId", None)
+        if type(cid) is int and cid > 0 and cid not in raw:
+            raw[cid] = t
+    return raw
+
+
 if __name__ == "__main__":
     unittest.main()
