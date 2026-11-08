@@ -40,7 +40,17 @@
 
 **验证**：修复后同一命令在真实纸账户上 **3s 内返回** `rc=3`（无建议文档，非挂起），issues 明确写出 `ticker ... is DELAYED/FROZEN (marketDataType=3)`。另用不可路由空壳直连网关复验超时路径：**20.0s 返回**、`notes=['market data request failed (TimeoutError); all quotes treated as missing']`、`RequestTimeout` 调用前为 `0`、调用后仍为 `0`。
 
-**回归**：`tests/test_roll_cli.py::SnapshotContractTests` 共 5 项（发往 `reqTickers` 的必须是可路由的详情合约、空壳不得被复用、请求失败降级而非抛出、超时在调用期间生效且事后还原、超时被报告为缺失行情）。全量离线 889 项通过，覆盖率门禁 `rc=0`（全局 84.1%）。
+**回归**：`tests/test_roll_cli.py::SnapshotContractTests` 共 5 项（发往 `reqTickers` 的必须是可路由的详情合约、空壳不得被复用、请求失败降级而非抛出、超时在调用期间生效且事后还原、超时被报告为缺失行情）。全量离线 889 项通过，覆盖率门禁 `rc=0`（全局 84.1%）。CI 运行 `42464681864`（commit `527e6be`）在 Python 3.10 与 3.13 两条矩阵上 **9/9 步骤全绿**：源码测试 889 项、ruff 通过、覆盖率全局 84.0% 门禁通过、安装包测试 889 项与 17 个 `--help` 冒烟通过。
+
+### 同一根因的通用化：`RequestTimeout` 全局设上限（2026-11-08）
+
+上面的修复只解决了 `roll-plan`。更根本的问题是 `ib_async` 的 `IB.RequestTimeout` **默认值为 `0`（永不超时）**，因此**任何**得不到回应的阻塞请求（合约详情、行情快照、`whatIfOrder`、账户同步、`qualifyContracts`）都会让进程无限阻塞。这在实盘尤其危险：用户会以为命令还在跑。
+
+修复（`thetamill/cli.py`）：`connect()` 建立会话后统一设置 `ib.RequestTimeout`，取值顺序为配置项 `request_timeout` → 默认 `DEFAULT_REQUEST_TIMEOUT = 30.0`；配置值为 `0`、负数、`NaN`/`Inf`、布尔或非数字时**一律回落到默认值**，无法通过配置关掉这道保护。`roll-plan` 的快照请求在此之上仅**进一步收紧**到 20 秒（`SNAPSHOT_TIMEOUT_SECONDS`），不会放宽调用方更严格的设置。
+
+**真实网关验证**：`connect()` 后实测 `RequestTimeout = 30.0`（原为 `0`）；对不可路由空壳的请求 **20.0 秒**结束并记录 `market data request failed (TimeoutError)`；调用结束后 `RequestTimeout` 恢复为 `30.0`；同一会话内的正常正股请求仍在 5.5 秒内正常返回（`marketDataType=3`），说明上限没有破坏正常路径。
+
+**回归**：`tests/test_account_scope.py::RequestTimeoutTests` 共 4 项（`connect()` 会设上限、配置值被尊重、十种不可用取值均回落默认、设上限不产生任何 `placeOrder`/`cancelOrder`）。全量离线 893 项通过；覆盖率门禁 `rc=0`（全局 84.1%，9 个模块全部达标）。
 
 **边界**：本次只修复「不可路由合约 + 无上限等待」这一挂起路径，未证明延迟行情可用于现金估算——`_build_quotes` 仍拒收 `marketDataType != 1`，因此无实时订阅的账户上 `roll-plan` 只会给出「行情缺失」的阻塞结论。这与既有设计一致，不是本次修复放宽的项。
 

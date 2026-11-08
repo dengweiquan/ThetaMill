@@ -120,6 +120,13 @@ DEFAULT_CFG = {
 LIVE_PORTS = {4001, 7496}
 PAPER_PORTS = {4002, 7497}
 
+# Upper bound (seconds) on any single blocking request.  ib_async ships
+# ``IB.RequestTimeout = 0``, which means "wait forever": whenever the gateway
+# does not answer -- an unroutable contract, an unsubscribed feed, a dropped
+# session -- the process blocks indefinitely instead of degrading.  A bounded
+# wait turns that into an exception the caller already handles.
+DEFAULT_REQUEST_TIMEOUT = 30.0
+
 
 def _is_live_env(cfg, args, port) -> bool:
     """判断是否为实盘环境。
@@ -268,6 +275,17 @@ def connect(cfg, port, readonly=False, force_delayed=False, args=None):
     try:
         _verify_account_env(ib, cfg, args, port)
         ib._diag = []
+
+        # Bound every blocking request.  The library default is 0 ("forever"),
+        # which is why an unanswered request used to hang the whole process
+        # instead of raising something a caller can report.  A configured
+        # value wins; an unusable/zero one falls back to the default so this
+        # guard cannot be switched off by accident.
+        configured = cfg.get("request_timeout", DEFAULT_REQUEST_TIMEOUT)
+        if isinstance(configured, bool) or not isinstance(configured, (int, float)) \
+                or not math.isfinite(float(configured)) or float(configured) <= 0:
+            configured = DEFAULT_REQUEST_TIMEOUT
+        ib.RequestTimeout = float(configured)
 
         def _on_err(reqId, code, msg, contract):
             if code in ROUTINE_CODES:

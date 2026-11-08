@@ -363,5 +363,48 @@ class AccountScopeTests(unittest.TestCase):
             self.assertEqual(command.call_args.args[1].account, "DU1")
 
 
+class RequestTimeoutTests(unittest.TestCase):
+    """ib_async's ``RequestTimeout`` default of 0 means "wait forever".
+
+    Reproduction (paper gateway, 2026-11-08): a snapshot for an unroutable
+    contract never got a reply, and with an unbounded timeout
+    ``roll-plan`` blocked indefinitely instead of reporting a missing quote.
+    """
+
+    def args(self):
+        return argparse.Namespace(paper=True, port=4002, account=None,
+                                  order_id=1, delayed=False)
+
+    def _connect(self, cfg):
+        ib = MagicMock()
+        ib.managedAccounts.return_value = ["DU1"]
+        ib.RequestTimeout = 0            # the library's own "forever"
+        with patch.object(cli, "IB", return_value=ib):
+            out = cli.connect(cfg, 4002, args=self.args())
+        return out
+
+    def test_connect_bounds_the_request_timeout(self):
+        ib = self._connect(dict(cli.DEFAULT_CFG, client_id=1))
+        self.assertEqual(ib.RequestTimeout, cli.DEFAULT_REQUEST_TIMEOUT)
+        self.assertGreater(ib.RequestTimeout, 0)
+
+    def test_configured_timeout_is_honoured(self):
+        ib = self._connect(dict(cli.DEFAULT_CFG, client_id=1, request_timeout=7.5))
+        self.assertEqual(ib.RequestTimeout, 7.5)
+
+    def test_a_zero_or_unusable_setting_cannot_disable_the_bound(self):
+        for bad in (0, 0.0, -1, True, False, "30", None, float("nan"),
+                    float("inf"), [30], {"v": 30}):
+            with self.subTest(bad=bad):
+                ib = self._connect(dict(cli.DEFAULT_CFG, client_id=1,
+                                        request_timeout=bad))
+                self.assertEqual(ib.RequestTimeout, cli.DEFAULT_REQUEST_TIMEOUT)
+
+    def test_no_trading_side_effects_while_bounding(self):
+        ib = self._connect(dict(cli.DEFAULT_CFG, client_id=1))
+        ib.placeOrder.assert_not_called()
+        ib.cancelOrder.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

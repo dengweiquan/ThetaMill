@@ -357,22 +357,23 @@ def _qualify_options(ib, con_ids: Sequence[int], notes: list[str]):
 def _fetch_tickers(ib, contracts: Mapping[int, object], notes: list[str]):
     """One reqTickers call; returns a raw ``{con_id: ticker}`` map.
 
-    The request is BOUNDED.  ``ib_async`` defaults ``IB.RequestTimeout`` to 0,
-    which means "wait forever": a contract the gateway never answers (an
-    unroutable one, a dropped session, unsubscribed data) blocks the whole
-    process instead of degrading to "quote missing".  The timeout is applied
-    only around this call and restored afterwards so other requests keep
-    whatever policy the caller configured.
+    The request is additionally TIGHTENED to ``SNAPSHOT_TIMEOUT_SECONDS``.
+    ``cli.connect`` already bounds ``RequestTimeout`` globally (the library
+    default of 0 means "wait forever"), but a snapshot is a short, optional
+    read: making the caller wait the full general timeout for a quote it can
+    live without is the wrong trade.  The bound is only ever lowered, never
+    raised, so a caller-configured stricter policy is preserved.
     """
     raw: dict[int, object] = {}
     if not contracts:
         return raw
-    had_timeout = hasattr(ib, "RequestTimeout")
     previous = getattr(ib, "RequestTimeout", None)
     try:
-        ib.RequestTimeout = SNAPSHOT_TIMEOUT_SECONDS
-    except Exception:      # a strict/frozen stand-in: just run unbounded
-        had_timeout = False
+        if not isinstance(previous, (int, float)) or previous <= 0 \
+                or previous > SNAPSHOT_TIMEOUT_SECONDS:
+            ib.RequestTimeout = SNAPSHOT_TIMEOUT_SECONDS
+    except Exception:      # a strict/frozen stand-in: run with its own policy
+        pass
     try:
         with _private_diagnostics():
             tickers = ib.reqTickers(*contracts.values())
@@ -381,11 +382,10 @@ def _fetch_tickers(ib, contracts: Mapping[int, object], notes: list[str]):
                      "all quotes treated as missing")
         return raw
     finally:
-        if had_timeout:
-            try:
-                ib.RequestTimeout = previous
-            except Exception:
-                pass
+        try:
+            ib.RequestTimeout = previous
+        except Exception:
+            pass
     for t in (tickers or ()):
         cid = getattr(getattr(t, "contract", None), "conId", None)
         if type(cid) is int and cid > 0 and cid not in raw:
