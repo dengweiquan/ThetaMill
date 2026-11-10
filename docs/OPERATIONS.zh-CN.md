@@ -1,6 +1,9 @@
 # 本地状态、风险配置与恢复
 
-本文区分已存在的 A 安全门禁和正在接入的 B–E 功能。以对应发布提交的命令帮助和验收记录为准；不能把开发分支代码视作券商验收通过。
+【当前事实与基线状态】
+- 已验收历史基线（A1–A3 / B1–B3 / C1–C2 / D1）：历史 1054 项源码与 wheel 离线测试在 Python 3.10.20 和 3.13.13 下均全绿通过；历史基线 wheel 文件哈希为 `08fafe9d29e28ac13a46c5b293e411d337ea8b4ab1de8b1609a64f80e59bccaa`，保持为当前已接受基线（accepted baseline）。
+- 最新本地工作区（A4 + D2）：独立复核发现的问题及后续空 ID、精确账户和时间边界回归已修复，并机械集成至当前分支。Python 3.10.20 / 3.13.13 的候选及集成工作区源码各 1115 项通过；全新双版本虚拟环境离线安装固定依赖与新 wheel，从 checkout 外各 1115 项通过，各 20 项 CLI help 通过，临时 HOME 零新增文件。语句覆盖率 85.0%、分支覆盖率 78.9%，全部模块门禁及 ruff E9/F 通过。新 wheel SHA-256：`23e302fa5e6e618e73f9d87234448c95bfd2fdd40ac36c1b7e38dc8df357a2dc`；包内 22 个 Python 模块逐字节匹配验证源码。使用干净源码副本而非 fresh git clone；构建仍有 setuptools license 元数据弃用警告。此前 1102 项及 wheel `fc4d71eefdb0eed2a8b9ec02562091da2c7882a379e22e5c4c1a1cb0652d54c5` 仅为复核前历史检查点，1054 项及对应 wheel 亦保留为历史基线。未提交、推送或运行远端 CI。
+本文区分已通过的本地工程门禁与券商验收。以对应发布提交的命令帮助和验收记录为准；不能把开发分支代码视作券商验收通过。
 
 ## 账户选择
 
@@ -10,6 +13,7 @@
 
 - `connect_timeout`：建立 TCP/API 会话的超时（秒）。
 - `request_timeout`：**单个阻塞请求**（合约详情、行情快照、`whatIfOrder` 等）的超时上限，默认 `30.0`。
+- `command_timeout`（候选分支功能）：CLI 命令执行总时限，默认 `120` 秒。基于单调时钟（monotonic clock），动态将 `_run` 循环、`sleep` 等待与安全请求器（safe requester）收紧到命令剩余时间与单次请求上限的较小值。注意：此机制是基于事件循环调度的截止期保护，**不是 CPU 时间限制、文件 I/O 超时或硬实时（hard-realtime）保证**。
 
 `ib_async` 自带的 `IB.RequestTimeout` 默认是 `0`，语义是**永不超时**：网关不回应时进程会一直阻塞，看起来像死机而不是报错。`thetamill` 在 `connect()` 时统一设置该上限；配置里填 `0`、负数、`NaN`/`Inf`、布尔值或非数字都会**回落到 30 秒默认值**，无法借此关闭保护。`roll-plan` 的行情快照还会在这一次调用内进一步收紧到 20 秒（只会收紧，不会放宽调用方更严格的设置），超时按「行情缺失」记录而不中止整份建议。
 
@@ -54,7 +58,7 @@
 
 - 只有某一腿处于 attempting/submitting/submitted/unknown（可能已发出）才写；预检、迁移冻结、发单前拒绝都不写。日志里出现券商单号即代表确实联系过券商。
 - 字段严格按类型净化。非 JSON 安全的对象（`MagicMock`、ib_async 对象、NaN/Inf）逐字段丢弃并记入 `dropped_fields`；如果关键字段全被丢弃，整条记录都不写。旧的 `default=str` 写法曾把单元测试的 mock repr 写成 94 行看似真实的审计记录，绝不能再出现。
-- `thetamill audit` 隐藏任何含 mock repr 的合成行并显示隐藏条数，同时以只读方式并入 SQLite 账本（`来源=账本`），状态取 `confirm_leg` 记录的券商正向状态（如 `PreSubmitted`）。账本有、日志无的委托会被明确标注为「只存在于提交账本」。
+- `thetamill audit`（候选分支 D2）：展示列包含 `local_state`、`broker_status`、`broker_observed_at`、`unresolved_risk`、`source`，反映券商历史观察状态而非当前实时状态（historical not current），明确区分确切账户与唯一标识符（exact account and identifiers）。隐藏任何含 mock repr 的合成行并报告隐藏条数。本地记录状态 `confirmed` 绝非最终成交证明（NOT Filled proof），可能源自 `Filled`、`Cancelled` 或 `Submitted` 等券商历史证据；拒绝将待定状态与终态混淆合并。账本有、日志无的记录显式标注来源与未决风险归属。
 - 旧复核码导入（`_ledger` 的 legacy import、`_is_code_consumed`）同样跳过合成行：一条 mock 记录不能占用一个真实复核码。
 
 - 回执不明先对账，不重发，不删除消费记录。
@@ -110,16 +114,39 @@ thetamill resolve --reservation <id> --state released --why "<书面理由>"
 
 报告必须合并券商快照和本地未交接预留；本地历史缺失时不展示可用预算数值，也不称完整。存在未决预留时，即使券商查询成功，也明确提示提交状态未解决。
 
+## 状态诊断门禁 (doctor)
+
+`thetamill doctor` 为离线只读静态诊断命令，在业务逻辑 `load_cfg` 之前尽早执行：
+- **无网络、无写入、不读默认配置**：不向网关发起任何网络连接，不修改任何本地文件，不隐式读取默认配置文件。模块导入时会计算默认路径候选（import computes default path candidates），**切勿过度声称零文件系统探测（do NOT overclaim zero filesystem probes）**。
+- **显式配置与已停机不可变账本副本**：必须显式指定待测配置与账本路径；对运行中的账本仅在完全停机并取得只读不可变副本（stopped immutable copy）后进行检查，若存在 `-wal`、`-shm`、`-journal` 等 sidecar 伴随文件则明确拒绝，其并非运行时的动态锁检测器（not lock detector）。
+- **交割证据结构校验**：对交割证据文件执行结构合规性检查（structural_only），校验 schema 格式与必填字段，**该检查不构成任何实际交易授权**。
+
 ## 验收与授权
 
-离线测试、真实 ib_async 对象离线测试、Gateway 只读、纸账户提交/撤单、真实成交是不同证据等级。本轮 A 冷验证未进行新的账户操作。后续 Gateway 连接和任何纸账户委托/撤单仍须单独授权，不以工程 commit/push/PR 授权替代。
+离线测试、真实 ib_async 对象离线测试、Gateway 只读、纸账户提交/撤单、真实成交是不同证据等级。用户已泛化明确授权纸账户股票与期权完整端到端执行（含买入与卖出委托，并优先支持腾讯 700），但确切交易数量、限价、撤单与平仓策略方案仍待确认（concrete transaction pending；exact order qty/limit/cancel/close pending）；今日实测中未下达任何实际订单或撤单，零成交（no orders/cancels/fills today）；严禁任何实盘交易权限（no live authority）。当前只读观测已成功连接本地 IB Gateway 178（`127.0.0.1:4002`），观测时单一纸账户（`DU*`）持仓为空（positions = 0）、活动挂单为空（openorders = 0）；美股 AAPL（`conId=265598`）休市无实时盘口，期权链乘数 multiplier="100" 仅为链元数据而非特定期权交割物验证；港股腾讯 700（`conId=152791428`, SEHK, HKD）`minSize/sizeIncrement=100` 为正股交易手数而非期权乘数，香港时间 2026-11-09 14:09 正常交易时段订阅实时行情返回 IB 354 错误（无实时行情 bid/ask/time 权限）。严禁回落使用陈旧或延迟行情授权交易（no fallback stale/delayed prices to authorize trading）。原有历史记录与交割证据保持未变；本次未执行任何 commit、push、PR、合并、发布或远程 CI 操作（no commit/push/PR/merge/remoteCI, no publish/service actions）。
 
-本地跑覆盖率门禁（需要 `pip install -e '.[dev]'`，`coverage[toml]` 固定 7.16.2 以兼容 Python 3.10）：
+本地跑全量离线验证门禁（源码模式）：
 
+```bash
+# 依赖安装（使用 constraints.txt 锁定依赖）
+pip install -e '.[dev]' -c constraints.txt
+
+# 统一守卫的源码验证
+python -I /absolute/path/scripts/verify_offline.py --source-root /absolute/path
 ```
-coverage run -m unittest discover -s tests
-coverage json -o coverage.json
-python scripts/coverage_gate.py coverage.json
+
+已安装 wheel 验证（脱离源码 checkout 目录）：
+
+```bash
+# 安装构建的 wheel（基于 constraints.txt）
+pip install /absolute/path/dist/thetamill-*.whl -c constraints.txt
+
+# 外部目录已安装包离线测试
+python -I /absolute/path/scripts/offline_tests.py --require-installed --tests-dir /absolute/path/tests
 ```
 
-输出会逐模块打印实测值与下限。返回 0 才算通过；返回 1 表示某个模块跌破下限，返回 2 表示报告文件不存在（不会被当成「没有问题」）。下限是回归保护而不是目标：新代码应尽量把这些数字往上推，确实需要下调时在提交说明里写清理由。
+验证脚本行为与安全约定：
+- `verify_offline.py` 严格仅运行：单元测试 + 生成全新 `coverage.json`（`--fail-under=0`）+ `coverage_gate.py` 覆盖率门禁 + `ruff` 代码风格检查。代码变更比对为独立的 CI/PM 流程（`check_diff.py` 默认可从 GitHub 事件环境变量获取基准，不可断言「无显式命令行参数即完全无法执行」）。
+- **执行前隔离守卫**：在目标代码导入、测试发现（test discovery imports）及子进程 spawn bootstrap 之前初始化临时 `HOME`、数据及配置目录（非所有标准库 import 之前）；该防护设计为防范意外环境污染的回归保护，**绝非生产级操作系统隔离或恶意代码沙箱**。
+- **交割证据隔离**：本地私有 `delivery_evidence.json` 在当前验证会话中未被读取或修改（此为当前会话环境与证据隔离约定，并非运行时的文件名禁止规则）。
+- **乘数安全规则**：特定合约乘数必须明确提供合法正数值（支持任意合法正乘数）；缺失或非法时一律闭合拒绝（fail closed），严禁回落或默认假设为 100。

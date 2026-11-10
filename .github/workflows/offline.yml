@@ -21,6 +21,8 @@ jobs:
       THETAMILL_CONFIG: ${{ github.workspace }}/.ci/no-broker-config.json
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -29,42 +31,30 @@ jobs:
           mkdir -p .ci
           python -m pip install --upgrade pip build
           python -m build --wheel
-          python -m pip install --force-reinstall dist/*.whl
-      - name: Source regression tests (offline)
-        run: python -m unittest discover -s tests -v
-      - name: Static check baseline (E9 syntax, F pyflakes)
+          python -m pip install --force-reinstall -c constraints.txt dist/*.whl
+      - name: Source offline verification pipeline
         run: |
-          python -m pip install "ruff==0.17.4"
-          ruff check --select E9,F thetamill tests scripts
-      - name: Coverage floors for the money-path modules
-        # A global percentage alone cannot tell "the risk engine is tested" from
-        # "the help text is tested", so scripts/coverage_gate.py also holds a
-        # per-module floor for execution/ledger/risk/audit/resolve/etc.
-        # Every floor is a regression guard at the measured value.
-        run: |
-          mkdir -p .ci
-          python -m pip install "coverage[toml]==7.16.2"
-          coverage run -m unittest discover -s tests
-          coverage json -o .ci/coverage.json
-          python scripts/coverage_gate.py .ci/coverage.json
+          python -m pip install "coverage[toml]==7.16.2" "ruff==0.17.4"
+          python scripts/verify_offline.py
       - name: Whitespace and conflict markers
         run: |
-          # A fresh checkout has no working-tree diff, so compare the pushed
-          # commit against its first parent (skipped only for root commits).
-          if git rev-parse -q --verify HEAD^ >/dev/null; then
-            git diff --check HEAD^ HEAD
-          fi
+          python scripts/check_diff.py
           if grep -rnE '^(<<<<<<< |=======|>>>>>>> )' thetamill tests; then
             exit 1
           fi
       - name: Installed-wheel tests and CLI help without configuration
         # Run outside the checkout so `import thetamill` cannot resolve to the source tree.
         working-directory: ${{ github.workspace }}/.ci
+        env:
+          HOME: ${{ github.workspace }}/.ci/isolated_home
+          THETAMILL_DATA: ${{ github.workspace }}/.ci/data
+          THETAMILL_CONFIG: ${{ github.workspace }}/.ci/no-broker-config.json
         run: |
+          mkdir -p "$HOME" "$THETAMILL_DATA"
           python -I -c 'import thetamill; from pathlib import Path; p=Path(thetamill.__file__).resolve(); print(p); assert "site-packages" in str(p), p'
-          python -I -m unittest discover -s "$GITHUB_WORKSPACE/tests" -v
+          python -I "$GITHUB_WORKSPACE/scripts/offline_tests.py" --require-installed --tests-dir "$GITHUB_WORKSPACE/tests"
           thetamill --help
           python -I -m thetamill --help
-          for cmd in status account positions orders quote chain order strat combo plan run report reconcile roll-plan audit cancel resolve; do
+          for cmd in status account positions orders quote chain order strat combo plan run report reconcile roll-plan audit cancel resolve doctor; do
             thetamill "$cmd" --help
           done

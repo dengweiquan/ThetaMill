@@ -19,9 +19,14 @@ import math
 import os
 import socket
 import sys
-from contextlib import contextmanager, redirect_stdout, redirect_stderr
-from datetime import datetime, date
+from datetime import datetime, date, timezone
+from typing import Any
 from pathlib import Path
+
+from .command_budget import (
+    DEFAULT_COMMAND_TIMEOUT, Deadline, DeadlineExceededError, attach_budget,
+    command_budget, get_active_budget, validate_command_timeout, wrap_ib_instance,
+)
 
 
 def _cfg_path() -> Path:
@@ -106,6 +111,7 @@ except ImportError:
             pass
 from .universe import (universe_allowed, universe_gate,  # noqa: E402
                        validate)
+from .broker_requests import safe_req_tickers  # noqa: E402
 
 
 DEFAULT_CFG = {
@@ -126,6 +132,39 @@ PAPER_PORTS = {4002, 7497}
 # session -- the process blocks indefinitely instead of degrading.  A bounded
 # wait turns that into an exception the caller already handles.
 DEFAULT_REQUEST_TIMEOUT = 30.0
+
+
+def _validate_request_timeout(value, default=DEFAULT_REQUEST_TIMEOUT):
+    """Return a validated finite positive non-bool timeout in seconds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return float(default) if default is not None else None
+    try:
+        val = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float(default) if default is not None else None
+    if not math.isfinite(val) or val <= 0:
+        return float(default) if default is not None else None
+    return val
+
+
+def _enforce_request_timeout(ib, cfg_or_timeout, default=DEFAULT_REQUEST_TIMEOUT) -> float:
+    """Set validated finite positive non-bool RequestTimeout on an IB instance."""
+    raw = cfg_or_timeout.get("request_timeout", default) if isinstance(cfg_or_timeout, dict) else cfg_or_timeout
+    timeout = _validate_request_timeout(raw, default=default)
+    if timeout is None:
+        timeout = float(default)
+    try:
+        ib.RequestTimeout = float(timeout)
+        actual = getattr(ib, "RequestTimeout", None)
+        if (isinstance(actual, bool)
+                or not isinstance(actual, (int, float))
+                or not math.isfinite(float(actual))
+                or float(actual) <= 0
+                or float(actual) != float(timeout)):
+            raise RuntimeError("RequestTimeout assignment verification failed")
+    except Exception as exc:
+        raise RuntimeError(f"RequestTimeout assignment failed: {type(exc).__name__}") from None
+    return timeout
 
 
 def _is_live_env(cfg, args, port) -> bool:
@@ -267,25 +306,25 @@ def _dec(s):
 def connect(cfg, port, readonly=False, force_delayed=False, args=None):
     ib = IB()
     try:
-        ib.connect(cfg["host"], port, clientId=cfg["client_id"],
-                   timeout=cfg.get("connect_timeout", 4), readonly=readonly)
-    except Exception as e:
-        sys.exit(f"连接失败 {cfg['host']}:{port} — {type(e).__name__}: {e}\n"
-                 f"→ 请确认 IB Gateway / TWS 已启动并登录，且已在 API 设置中勾选 Enable ActiveX and Socket Clients。")
-    try:
+        active = get_active_budget()
+        if active is not None:
+            budget = active
+        else:
+            raw_timeout = cfg.get("command_timeout", DEFAULT_COMMAND_TIMEOUT) if isinstance(cfg, dict) else DEFAULT_COMMAND_TIMEOUT
+            budget = Deadline(validate_command_timeout(raw_timeout))
+        req_timeout = _enforce_request_timeout(ib, cfg)
+        attach_budget(ib, budget)
+        wrap_ib_instance(ib, budget, configured_timeout=req_timeout)
+        try:
+            ib.connect(cfg["host"], port, clientId=cfg["client_id"],
+                       timeout=cfg.get("connect_timeout", 4), readonly=readonly)
+        except DeadlineExceededError:
+            raise
+        except Exception as e:
+            sys.exit(f"连接失败 (port {port}) — {type(e).__name__}\n"
+                     f"→ 请确认 IB Gateway / TWS 已启动并登录，且已在 API 设置中勾选 Enable ActiveX and Socket Clients。")
         _verify_account_env(ib, cfg, args, port)
         ib._diag = []
-
-        # Bound every blocking request.  The library default is 0 ("forever"),
-        # which is why an unanswered request used to hang the whole process
-        # instead of raising something a caller can report.  A configured
-        # value wins; an unusable/zero one falls back to the default so this
-        # guard cannot be switched off by accident.
-        configured = cfg.get("request_timeout", DEFAULT_REQUEST_TIMEOUT)
-        if isinstance(configured, bool) or not isinstance(configured, (int, float)) \
-                or not math.isfinite(float(configured)) or float(configured) <= 0:
-            configured = DEFAULT_REQUEST_TIMEOUT
-        ib.RequestTimeout = float(configured)
 
         def _on_err(reqId, code, msg, contract):
             if code in ROUTINE_CODES:
@@ -630,25 +669,35 @@ def cmd_status(cfg, args):
     print(f"主机 {cfg['host']} — 逐端口探测：")
     names = {4001: "Live Gateway", 4002: "Paper Gateway", 7496: "Live TWS", 7497: "Paper TWS"}
     alive = []
-    for p, label in names.items():
-        ib = IB()
-        try:
-            ib.connect(cfg["host"], p, clientId=cfg["client_id"] + 90, timeout=3, readonly=True)
-            print(f"  ✅ {p} {label} — 已连接")
-            alive.append(p)
+    with command_budget(cfg) as budget:
+        for p, label in names.items():
+            ib = IB()
             try:
-                account = _selected_account(ib, cfg, args)
-                s = ib.accountSummary(account)
-                for k in ("NetLiquidation", "AvailableFunds", "BuyingPower"):
-                    for row in s:
-                        if row.account == account and row.tag == k:
-                            print(f"       {k}: {fmt(row.value)} {row.currency}")
-            except (Exception, SystemExit):
-                print("       账户读取失败；多账户请用 --account 明确选择。")
-        except Exception:
-            print(f"  ❌ {p} {label} — 未监听")
-        finally:
-            finish(ib)
+                budget.check()
+                req_timeout = _enforce_request_timeout(ib, cfg)
+                attach_budget(ib, budget)
+                wrap_ib_instance(ib, budget, configured_timeout=req_timeout)
+                ib.connect(cfg["host"], p, clientId=cfg["client_id"] + 90, timeout=3, readonly=True)
+                print(f"  ✅ {p} {label} — 已连接")
+                alive.append(p)
+                try:
+                    account = _selected_account(ib, cfg, args)
+                    s = ib.accountSummary(account)
+                    for k in ("NetLiquidation", "AvailableFunds", "BuyingPower"):
+                        for row in s:
+                            if row.account == account and row.tag == k:
+                                print(f"       {k}: {fmt(row.value)} {row.currency}")
+                except DeadlineExceededError:
+                    raise
+                except (Exception, SystemExit):
+                    print("       账户读取失败；多账户请用 --account 明确选择。")
+            except DeadlineExceededError:
+                raise
+            except Exception as exc:
+                msg = "未监听" if (isinstance(exc, OSError) and not isinstance(exc, DeadlineExceededError)) else f"错误 ({type(exc).__name__})"
+                print(f"  ❌ {p} {label} — {msg}")
+            finally:
+                finish(ib)
     if not alive:
         print("\n结论：本机没有可用的 IBKR 网关。请先安装并登录 IB Gateway。")
     return 0
@@ -809,7 +858,7 @@ def cmd_chain(cfg, args):
         return 1
     if missing > 0:
         print(f"  （{missing} 个合约在该到期日不存在，已跳过 —— 月度阶梯只含部分行权价）")
-    tickers = ib.reqTickers(*contracts)
+    tickers = safe_req_tickers(ib, *contracts)
     ib.sleep(2.5)
     fell_back = False
     if not any(_has_num(t.bid, t.ask, t.last) for t in tickers) and not getattr(args, "delayed", False):
@@ -1736,7 +1785,10 @@ def _cost_basis(ib, symbol, currency):
 
 def _quote_premium(ib, opt):
     """卖方可得的参考权利金：优先买价（对手盘出价），退化到最新/昨收。返回 (价格, 来源)"""
-    t = ib.reqTickers(opt)[0]
+    tickers = safe_req_tickers(ib, opt)
+    if not tickers:
+        return None, "无行情"
+    t = tickers[0]
     ib.sleep(1.5)
     for label, v in (("买价", t.bid), ("最新", t.last), ("昨收", t.close)):
         try:
@@ -1931,7 +1983,132 @@ def cmd_run(cfg, args):
     return cmd_combo(cfg, ns)
 
 
-def _ledger_audit_rows(selected):
+_CANONICAL_ENVS = {
+    "paper": "paper",
+    "纸账户": "paper",
+    "纸账户(paper)": "paper",
+    "纸账户(paper·自动识别)": "paper",
+    "live": "live",
+    "实盘": "live",
+    "实盘(live)": "live",
+    "实盘(live·自动识别)": "live",
+}
+
+
+def _normalize_env(val):
+    if not isinstance(val, str):
+        return None
+    return _CANONICAL_ENVS.get(val.strip().lower())
+
+
+def _jsonl_order_ref(row):
+    legs = row.get("legs")
+    if isinstance(legs, (list, tuple)):
+        if len(legs) > 1:
+            return None
+        if len(legs) == 1 and isinstance(legs[0], dict):
+            ref = legs[0].get("order_ref") or legs[0].get("orderRef")
+            top_ref = row.get("orderRef") or row.get("order_ref")
+            if ref and top_ref and ref != top_ref:
+                return None
+            res = ref or top_ref
+            if isinstance(res, str) and res.strip():
+                return res
+        return None
+    ref = row.get("orderRef") or row.get("order_ref")
+    if isinstance(ref, str) and ref.strip():
+        return ref
+    return None
+
+
+def _as_id(val):
+    if val is None or val == "":
+        return None
+    s = str(val).strip()
+    return int(s) if s.isdigit() else s
+
+
+def _parse_observation_time(val):
+    from datetime import datetime, timezone
+    if not isinstance(val, (str, datetime)):
+        return None
+    if isinstance(val, datetime):
+        dt = val
+    else:
+        s = val.strip()
+        if not s:
+            return None
+        if s.endswith("Z") or s.endswith("z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        return None
+    try:
+        return dt.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _observation_sort_key(rec):
+    raw_time = getattr(rec, "observed_at", None) if not isinstance(rec, dict) else rec.get("observed_at")
+    return _parse_observation_time(raw_time)
+
+
+def _parse_audit_ts(val, local_tz=None):
+    """Parse audit timestamp for sorting and date filtering.
+
+    Returns (utc_dt, local_date):
+    - utc_dt: timezone-aware UTC datetime, or None if invalid/unknown
+    - local_date: datetime.date (machine local or local_tz), or None if invalid/unknown
+    """
+    if val is None or val == "":
+        return None, None
+    from datetime import datetime, timezone
+    if isinstance(val, datetime):
+        dt = val
+    elif isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None, None
+        if s.endswith("Z") or s.endswith("z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None, None
+    else:
+        return None, None
+
+    if dt.tzinfo is not None and dt.utcoffset() is not None:
+        try:
+            utc_dt = dt.astimezone(timezone.utc)
+            local_date = dt.astimezone(local_tz).date() if local_tz is not None else dt.astimezone().date()
+            return utc_dt, local_date
+        except (OverflowError, ValueError):
+            return None, None
+        except Exception:
+            return None, None
+    else:
+        # Legacy naive submission timestamps interpret machine local for display/filter only,
+        # never promote naive broker observations.
+        try:
+            local_date = dt.date()
+            if local_tz is not None:
+                local_dt = dt.replace(tzinfo=local_tz)
+            else:
+                local_dt = dt.astimezone()
+            utc_dt = local_dt.astimezone(timezone.utc)
+            return utc_dt, local_date
+        except (OverflowError, ValueError):
+            return None, None
+        except Exception:
+            return None, None
+
+
+def _ledger_audit_rows(selected=None):
     """Orders the SQLite ledger knows about, as audit-shaped rows (read-only).
 
     The ledger — not ``orders.jsonl`` — is authoritative for what was actually
@@ -1944,12 +2121,13 @@ def _ledger_audit_rows(selected):
         return [], None
     from . import audit as audit_mod
     from .state import SubmissionLedger, StateError
+    import sqlite3
 
     try:
         ledger = SubmissionLedger(path, "UTC", read_only=True)
         scopes = ledger.list_scopes()
-    except StateError as exc:
-        return [], f"提交账本无法只读打开：{exc}"
+    except (StateError, sqlite3.Error) as exc:
+        return [], f"提交账本无法只读打开：{type(exc).__name__}"
     rows = []
     for account, environment in scopes:
         if selected is not None and account != selected:
@@ -1958,29 +2136,60 @@ def _ledger_audit_rows(selected):
             legs = ledger.list_legs(account=account, environment=environment)
             observed = ledger.list_reconciliations(account=account,
                                                    environment=environment)
-        except StateError as exc:
-            return [], f"提交账本读取失败：{exc}"
-        # A reconciliation observation carries the broker status the ledger
-        # could actually prove ("Submitted"/"Filled"/"Cancelled"); the bare leg
-        # state ("confirmed") no longer says HOW it resolved.
-        evidence = {}
-        for rec in observed:
-            if rec.broker_status:
-                evidence[rec.order_ref] = rec.broker_status
+        except (StateError, sqlite3.Error) as exc:
+            return [], f"提交账本读取失败：{type(exc).__name__}"
         for leg in legs:
+            matching_recs = []
+            for r in observed:
+                r_status = getattr(r, "broker_status", None) if not isinstance(r, dict) else r.get("broker_status")
+                if not r_status:
+                    continue
+                r_ref = getattr(r, "order_ref", None) if not isinstance(r, dict) else r.get("order_ref")
+                if r_ref != leg.order_ref:
+                    continue
+                r_intent = getattr(r, "intent_id", None) if not isinstance(r, dict) else r.get("intent_id")
+                leg_intent = getattr(leg, "intent_id", None) if not isinstance(leg, dict) else leg.get("intent_id")
+                if r_intent and leg_intent and r_intent != leg_intent:
+                    continue
+                r_oid = _as_id(getattr(r, "order_id", None) if not isinstance(r, dict) else r.get("order_id"))
+                leg_oid = _as_id(getattr(leg, "order_id", None) if not isinstance(leg, dict) else leg.get("order_id"))
+                if r_oid is not None and leg_oid is not None and r_oid != leg_oid:
+                    continue
+                r_pid = _as_id(getattr(r, "perm_id", None) if not isinstance(r, dict) else r.get("perm_id"))
+                leg_pid = _as_id(getattr(leg, "perm_id", None) if not isinstance(leg, dict) else leg.get("perm_id"))
+                if r_pid is not None and leg_pid is not None and r_pid != leg_pid:
+                    continue
+                matching_recs.append(r)
+            valid_recs = []
+            for r in matching_recs:
+                dt = _observation_sort_key(r)
+                if dt is not None:
+                    valid_recs.append((dt, r))
+            rec = max(valid_recs, key=lambda item: item[0])[1] if valid_recs else None
+            b_status = (rec.get("broker_status") if isinstance(rec, dict) else rec.broker_status) if rec is not None else None
+            b_time = (rec.get("observed_at") if isinstance(rec, dict) else rec.observed_at) if rec is not None else None
+            unresolved = leg.state in ("submitting", "submitted", "unknown")
             rows.append({
                 "ts": leg.updated_at, "account": account, "env": environment,
                 "kind": "leg", "preset": "ledger", "strategy": "ledger",
-                "orderId": leg.order_id, "permId": leg.perm_id,
-                "status": evidence.get(leg.order_ref, leg.state),
-                "orderRef": leg.order_ref, "qty": leg.quantity,
+                "orderId": int(leg.order_id) if (isinstance(leg.order_id, str) and leg.order_id.isdigit()) else leg.order_id,
+                "permId": int(leg.perm_id) if (isinstance(leg.perm_id, str) and leg.perm_id.isdigit()) else leg.perm_id,
+                "status": b_status or leg.state,
+                "local_state": leg.state,
+                "broker_status": b_status,
+                "broker_observed_at": b_time,
+                "historical_status": b_status,
+                "historical_observed_at": b_time,
+                "unresolved_risk": unresolved,
+                "orderRef": leg.order_ref, "intent": leg.intent_id,
+                "qty": leg.quantity,
                 "action": leg.action, "contract_id": leg.contract_id,
                 "source": "ledger",
             })
     return [row for row in rows if audit_mod.is_real_record(row)], None
 
 
-def cmd_audit(cfg, args):
+def cmd_audit(cfg, args, now: datetime | None = None, clock: Any = None):
     """Show the audit trail: real broker orders only, plus ledger records.
 
     Synthetic rows (a leaked unit-test ``MagicMock`` repr written by the old
@@ -1994,49 +2203,180 @@ def cmd_audit(cfg, args):
     parsed = audit_mod.read_records(path)
     rows = [row for row in parsed if audit_mod.is_real_record(row)]
     hidden = len(parsed) - len(rows)
-    selected = getattr(args, "account", None) or cfg.get("account")
-    known_accounts = {r["account"] for r in rows
-                      if isinstance(r.get("account"), str) and r["account"].strip()}
-    if selected is None and len(known_accounts) > 1:
-        sys.exit("审计含多个账户，请用 --account 明确选择；旧记录未知归属不能推断。")
-    if selected is None and len(known_accounts) == 1:
-        selected = next(iter(known_accounts))
     unknown_count = sum(not isinstance(r.get("account"), str) or not r["account"].strip()
                         for r in rows)
-    ledger_rows, ledger_error = _ledger_audit_rows(selected)
+    jsonl_accounts = {r["account"] for r in rows
+                      if isinstance(r.get("account"), str) and r["account"].strip()}
+
+    all_ledger_rows, ledger_error = _ledger_audit_rows(None)
+    ledger_accounts = {lr["account"] for lr in all_ledger_rows
+                       if isinstance(lr.get("account"), str) and lr["account"].strip()}
+    known_accounts = jsonl_accounts | ledger_accounts
+
+    raw_account = getattr(args, "account", None)
+    account_specified = False
+    if raw_account is not None:
+        account_specified = True
+    elif isinstance(cfg, dict) and "account" in cfg and cfg.get("account") is not None:
+        raw_account = cfg.get("account")
+        account_specified = True
+
+    if account_specified:
+        if isinstance(raw_account, bool) or not isinstance(raw_account, str) or not raw_account.strip():
+            sys.exit("⛔ 指定的账户无效或为空，请用 --account 明确指定有效账户。")
+        selected = raw_account
+    else:
+        selected = None
+        if len(known_accounts) > 1:
+            sys.exit("审计含多个账户，请用 --account 明确选择；旧记录未知归属不能推断。")
+        if len(known_accounts) == 1:
+            selected = next(iter(known_accounts))
+
     if selected is not None:
         rows = [r for r in rows if r.get("account") == selected]
+        ledger_rows = [lr for lr in all_ledger_rows if lr.get("account") == selected]
         from .report import mask_account
         print(f"审计账户：{mask_account(selected)}；排除 {unknown_count} 条未知账户旧记录")
-    elif unknown_count:
-        print("旧审计记录账户归属未知；不用于配额或风险额度计算。")
+    else:
+        ledger_rows = all_ledger_rows
+        if unknown_count:
+            print("旧审计记录账户归属未知；不用于配额或风险额度计算。")
+
     if hidden:
         print(f"已隐藏 {hidden} 条非真实审计记录（单元测试遗留的 mock 值，不是券商订单）")
     if ledger_error:
         print(f"⚠️ {ledger_error}")
 
-    # Merge the ledger's view: a real order with no (or lost) JSONL line is
-    # still an order.  One row per (orderRef, orderId); the log wins on detail.
-    seen = {(str(r.get("orderRef", "")), str(r.get("orderId", "")))
-            for r in rows if r.get("orderRef")}
-    only_ledger = [r for r in ledger_rows
-                   if (str(r.get("orderRef", "")), str(r.get("orderId", ""))) not in seen]
-    combined = sorted(rows + only_ledger, key=lambda r: str(r.get("ts", "")))
+    ledger_by_key = {}
+    ambiguous_ledger_keys = set()
+    for lr in ledger_rows:
+        acc = lr.get("account")
+        env = _normalize_env(lr.get("env"))
+        ref = lr.get("orderRef")
+        if not (isinstance(acc, str) and acc.strip() and env and isinstance(ref, str) and ref.strip()):
+            continue
+        k = (acc, env, ref)
+        if k in ambiguous_ledger_keys:
+            continue
+        if k in ledger_by_key:
+            del ledger_by_key[k]
+            ambiguous_ledger_keys.add(k)
+        else:
+            ledger_by_key[k] = lr
+
+    matched_ledger_ids = set()
+    for r in rows:
+        acc = r.get("account")
+        env = _normalize_env(r.get("env"))
+        ref = _jsonl_order_ref(r)
+        lr = None
+        if isinstance(acc, str) and acc.strip() and env and ref:
+            k = (acc, env, ref)
+            if k in ledger_by_key:
+                cand = ledger_by_key[k]
+                r_oid, l_oid = _as_id(r.get("orderId")), _as_id(cand.get("orderId"))
+                r_pid, l_pid = _as_id(r.get("permId")), _as_id(cand.get("permId"))
+                r_int, l_int = r.get("intent"), cand.get("intent")
+                oid_conflict = (r_oid is not None and l_oid is not None and r_oid != l_oid)
+                pid_conflict = (r_pid is not None and l_pid is not None and r_pid != l_pid)
+                int_conflict = (isinstance(r_int, str) and isinstance(l_int, str)
+                                and r_int.strip() and l_int.strip() and r_int != l_int)
+                if not (oid_conflict or pid_conflict or int_conflict):
+                    lr = cand
+
+        if lr is not None:
+            matched_ledger_ids.add(id(lr))
+            r["local_state"] = lr["local_state"]
+            r["broker_status"] = lr.get("broker_status")
+            r["broker_observed_at"] = lr.get("broker_observed_at")
+            r["historical_status"] = lr.get("historical_status")
+            r["historical_observed_at"] = lr.get("historical_observed_at")
+            r["unresolved_risk"] = lr.get("unresolved_risk")
+            if _as_id(r.get("orderId")) is None:
+                r["orderId"] = lr.get("orderId")
+            if _as_id(r.get("permId")) is None:
+                r["permId"] = lr.get("permId")
+            r["source"] = "log+ledger"
+        else:
+            legs = r.get("legs")
+            leg_state = None
+            if isinstance(legs, (list, tuple)) and len(legs) == 1 and isinstance(legs[0], dict):
+                leg_state = legs[0].get("state")
+            r["local_state"] = r.get("local_state") or leg_state or r.get("state") or r.get("outcome") or r.get("status") or "-"
+            r["broker_status"] = r.get("broker_status")
+            r["broker_observed_at"] = r.get("broker_observed_at")
+            r["historical_status"] = r.get("historical_status") or r.get("broker_status")
+            r["historical_observed_at"] = r.get("historical_observed_at") or r.get("broker_observed_at")
+            r["unresolved_risk"] = "unknown"
+            r["source"] = "log"
+
+    only_ledger = [lr for lr in ledger_rows if id(lr) not in matched_ledger_ids]
+    all_combined = rows + only_ledger
+
+    if clock is not None and callable(clock):
+        ref_now = clock()
+    elif now is not None:
+        ref_now = now
+    elif getattr(args, "now", None) is not None:
+        ref_now = getattr(args, "now")
+    elif getattr(args, "clock", None) is not None and callable(getattr(args, "clock")):
+        ref_now = args.clock()
+    else:
+        ref_now = datetime.now().astimezone()
+
+    if isinstance(ref_now, datetime) and ref_now.tzinfo is not None:
+        local_tz = ref_now.tzinfo
+        today_date = ref_now.astimezone(local_tz).date()
+    elif isinstance(ref_now, datetime):
+        local_tz = None
+        today_date = ref_now.date()
+    else:
+        local_tz = None
+        today_date = datetime.now().date()
+
+    annotated = []
+    for idx, r in enumerate(all_combined):
+        sort_utc, local_d = _parse_audit_ts(r.get("ts"), local_tz=local_tz)
+        annotated.append((idx, r, sort_utc, local_d))
+
+    def _row_sort_key(item):
+        idx, r, sort_utc, local_d = item
+        if sort_utc is None:
+            return (0, datetime.min.replace(tzinfo=timezone.utc), idx)
+        return (1, sort_utc, idx)
+
+    annotated.sort(key=_row_sort_key)
+
     if args.today:
-        today = datetime.now().strftime("%Y-%m-%d")
-        combined = [r for r in combined if str(r.get("ts", "")).startswith(today)]
+        filtered_items = [it for it in annotated if it[3] is not None and it[3] == today_date]
+    else:
+        filtered_items = annotated
+
+    combined = [it[1] for it in filtered_items]
     combined = combined[-max(args.limit, 1):]
+
     if not combined and not hidden:
         print(f"暂无审计记录 —— 日志路径 {path}")
         return 0
     print(f"审计日志 {path}")
-    print(f"  {'时间':<20}{'策略':<14}{'单号':>7}  {'状态':<14}{'成交':>6}  {'环境':<12}来源")
+    print(f"  {'时间':<20}{'策略':<14}{'单号':>7}  {'成交':>6}  {'环境':<12}"
+          f"{'本地腿状态':<12}{'最后券商观察':<14}{'券商观察时间':<22}{'未决风险':<10}来源")
     for r in combined:
-        print(f"  {str(r.get('ts', ''))[:19]:<20}{str(r.get('preset') or r.get('label') or '-'):<14}"
-              f"{str(r.get('orderId', '-')):>7}  {str(r.get('status', '-'))[:13]:<14}"
-              f"{fmt(r.get('filled'), 0):>6}  {str(r.get('env', '-'))[:11]:<12}"
-              f"{'账本' if r.get('source') == 'ledger' else '日志'}")
-    print(f"\n  共 {len(combined)} 条（含纸账户与实盘，看「环境」列区分）")
+        ts_str = str(r.get("ts", ""))[:19]
+        preset_str = str(r.get("preset") or r.get("label") or r.get("strategy") or "-")[:12]
+        oid_val = r.get("orderId")
+        oid_str = "-" if oid_val in (None, "") else str(oid_val)
+        filled_str = fmt(r.get("filled"), 0)
+        env_str = str(r.get("env", "-"))[:10]
+        lstate_str = str(r.get("local_state", "-"))[:10]
+        bstatus_str = str(r.get("broker_status") or "-")[:12]
+        btime_str = str(r.get("broker_observed_at") or "-")[:19]
+        risk_str = str(r.get("unresolved_risk", "-"))[:8]
+        src_val = r.get("source")
+        src_str = "账本" if src_val == "ledger" else ("日志+账本" if src_val == "log+ledger" else "日志")
+        print(f"  {ts_str:<20}{preset_str:<14}{oid_str:>7}  {filled_str:>6}  {env_str:<12}"
+              f"{lstate_str:<12}{bstatus_str:<14}{btime_str:<22}{risk_str:<10}{src_str}")
+    print(f"\n  共 {len(combined)} 条（含纸账户与实盘，看「环境」列区分；『最后券商观察』记录历史观测，非当前实时状态）")
     if only_ledger:
         print(f"  其中 {len(only_ledger)} 条只存在于提交账本（审计日志未写入或已丢失）")
     return 0
@@ -2049,100 +2389,28 @@ def cmd_roll_plan(cfg, args):
 
 
 def _selected_account(ib, cfg, args):
-    from .broker_state import select_account, SnapshotError
+    from .broker_state import SnapshotError
+    from .broker_session import select_account
     try:
-        return select_account(ib, getattr(args, "account", None) or cfg.get("account"))
+        return select_account(ib, cfg, args)
     except SnapshotError as exc:
         sys.exit(f"⛔ {exc}")
 
 
-def _timestamped_mid(ib, contract):
+def _timestamped_mid(ib, contract, *, now=None, requester=None):
     """Use a timestamped two-sided tick; never relabel a historical close as fresh."""
-    from decimal import Decimal
-    from datetime import timezone
-    try:
-        ticks = ib.reqTickers(contract)
-        if not isinstance(ticks, (list, tuple)) or len(ticks) != 1:
-            return None
-        tick = ticks[0]
-        if getattr(tick, "marketDataType", None) != 1:
-            return None
-        if getattr(getattr(tick, "contract", None), "conId", None) != contract.conId:
-            return None
-        stamp = getattr(tick, "time", None)
-        if not isinstance(stamp, datetime) or stamp.tzinfo is None or stamp.utcoffset() is None:
-            return None
-        age = (datetime.now(timezone.utc) - stamp).total_seconds()
-        if age < -5 or age > 30:
-            return None
-        bid, ask = tick.bid, tick.ask
-        if any(isinstance(v, bool) or not math.isfinite(v) or v <= 0 for v in (bid, ask)) or bid > ask:
-            return None
-        return (Decimal(str(bid)) + Decimal(str(ask))) / 2, stamp, "IB timestamped bid/ask midpoint"
-    except Exception:
-        return None
+    from .broker_session import timestamped_mid
+    return timestamped_mid(ib, contract, now=now, requester=requester)
 
 
-def _risk_snapshot(ib, cfg, args, environment, *, required_currencies=()):
-    from decimal import Decimal
-    from .broker_state import collect_snapshot, PriceQuote, FxQuote
-    account = _selected_account(ib, cfg, args)
-    snapshot = collect_snapshot(ib, account=account, environment=environment)
-    currencies = set(snapshot.cash)
-    for currency in required_currencies:
-        if not isinstance(currency, str) or len(currency.strip()) != 3 or not currency.strip().isascii() or not currency.strip().isalpha():
-            raise ValueError("Required FX currency must be a three-letter code")
-        currencies.add(currency.strip().upper())
-    currencies.update(p.instrument.currency for p in snapshot.positions)
-    currencies.update(t.instrument.currency for t in snapshot.orders)
-    rates, fx_quotes, price_quotes = {snapshot.base_currency: Decimal(1)}, {}, {}
-    for currency in currencies - {snapshot.base_currency}:
-        for symbol, target, invert in ((currency, snapshot.base_currency, False),
-                                       (snapshot.base_currency, currency, True)):
-            try:
-                qualified = ib.qualifyContracts(Contract(secType="CASH", symbol=symbol,
-                                                        currency=target, exchange="IDEALPRO"))
-                if not isinstance(qualified, (list, tuple)) or len(qualified) != 1:
-                    continue
-                pair = qualified[0]
-                if (type(getattr(pair, "conId", None)) is not int or pair.conId <= 0
-                        or pair.secType != "CASH" or pair.symbol != symbol or pair.currency != target):
-                    continue
-                tick = _timestamped_mid(ib, pair)
-                if tick is None:
-                    continue
-                price, stamp, source = tick
-                rate = Decimal(1) / price if invert else price
-                fx_quotes[currency] = FxQuote(currency, rate, stamp, source)
-                rates[currency] = rate
-                break
-            except Exception:
-                continue
-    from dataclasses import replace
-    positions = []
-    for position in snapshot.positions:
-        if position.instrument.sec_type == "STK":
-            tick = _timestamped_mid(ib, Contract(conId=position.instrument.con_id,
-                                               exchange=position.instrument.exchange or "SMART"))
-            if tick is not None:
-                price, stamp, source = tick
-                price_quotes[position.instrument.con_id] = PriceQuote(position.instrument.con_id,
-                                                                      price, stamp, source)
-                position = replace(position, price=price)
-            else:
-                position = replace(position, price=None)
-        positions.append(position)
-    return replace(snapshot, fx=rates, fx_quotes=fx_quotes, price_quotes=price_quotes,
-                   positions=positions)
+def _risk_snapshot(ib, cfg, args, environment, *, required_currencies=(), now=None):
+    from .broker_session import risk_snapshot
+    return risk_snapshot(ib, cfg, args, environment, required_currencies=required_currencies, now=now)
 
 
-@contextmanager
-def _private_broker_diagnostics():
-    """Do not expose raw broker messages in privacy-preserving reports."""
-    with open(os.devnull, "w", encoding="utf-8") as sink:
-        with redirect_stdout(sink), redirect_stderr(sink):
-            yield
-
+from .broker_session import private_diagnostics as _private_broker_diagnostics
+private_diagnostics = _private_broker_diagnostics
+select_account = _selected_account
 
 def cmd_resolve(cfg, args):
     """解除未决预留 —— 只认券商正向证据，绝不因「没看到挂单」就放行。
@@ -2399,6 +2667,11 @@ def cmd_reconcile(cfg, args):
     return 0
 
 
+def cmd_doctor(_cfg, args) -> int:
+    from . import doctor as doctor_mod
+    return doctor_mod.run_doctor_cli(args)
+
+
 # ---------------------------------------------------------------- 入口
 def _global_flags(parser, hidden=False):
     """全局开关同时挂到顶层与子命令，前写后写都生效（--paper account / account --paper 均可）"""
@@ -2547,6 +2820,13 @@ def build_parser(cfg: dict | None = None) -> argparse.ArgumentParser:
     x = sub.add_parser("cancel", help="撤单"); x.set_defaults(func=cmd_cancel)
     x.add_argument("order_id", type=int)
 
+    doc = sub.add_parser("doctor", help="离线健康诊断（不连券商，只读检查配置/账本/依赖/交割证据）")
+    doc.set_defaults(func=cmd_doctor)
+    doc.add_argument("--config", help="可选显式配置文件路径（默认不探测实际配置）")
+    doc.add_argument("--ledger", help="可选显式账本数据库路径（默认不探测实际账本）")
+    doc.add_argument("--delivery-evidence", dest="delivery_evidence", help="可选显式交割证据文件路径")
+    doc.add_argument("--format", choices=["text", "json"], default="text", help="输出格式：text 或 json（默认 text）")
+
     seen = set()
     for sp in sub.choices.values():
         if id(sp) not in seen:
@@ -2555,10 +2835,20 @@ def build_parser(cfg: dict | None = None) -> argparse.ArgumentParser:
     return p
 
 
-def main():
+def main(argv=None):
+    args_list = sys.argv[1:] if argv is None else list(argv)
+    if "doctor" in args_list:
+        p = build_parser(DEFAULT_CFG)
+        parsed = p.parse_args(args_list)
+        if getattr(parsed, "cmd", None) == "doctor":
+            sys.exit(parsed.func(None, parsed))
     cfg = load_cfg(required=False)
-    args = build_parser(cfg).parse_args()
-    sys.exit(args.func(cfg, args))
+    args = build_parser(cfg).parse_args(args_list)
+    try:
+        with command_budget(cfg):
+            sys.exit(args.func(cfg, args))
+    except DeadlineExceededError as exc:
+        sys.exit(f"⛔ 命令超时：{type(exc).__name__}")
 
 
 if __name__ == "__main__":

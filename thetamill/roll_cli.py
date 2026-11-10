@@ -33,255 +33,36 @@ diagnostics are suppressed so ``--format json`` stays clean without privacy leak
 from __future__ import annotations
 
 import inspect
-import io
 import json
 import sys
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 from types import MappingProxyType
-from typing import Iterable, Mapping, Sequence
+from typing import Mapping, Sequence
 
 from . import broker_state as bs
+from .delivery_evidence import (
+    DELIVERABLES_SCHEMA as DELIVERABLES_SCHEMA,
+    DeliverableEvidenceError as DeliverableEvidenceError,
+    _IDENTITY_FIELDS as _IDENTITY_FIELDS,
+    _aware as _aware,
+    _finite as _finite,
+    _freeze as _freeze,
+    _identity_for as _identity_for,
+    _identity_matches as _identity_matches,
+    load_delivery_evidence as load_delivery_evidence,
+)
 from . import roll
 from . import universe as uni
-
-# Separate, versioned deliverable-evidence document.  It is NOT a plan, NOT a
-# roll recommendation, and carries no order/executable fields.
-DELIVERABLES_SCHEMA = "thetamill.deliverables.v1"
+from .market_data import ROLL_POLICY, validate_ticker
+from .broker_requests import safe_req_tickers
 
 # Upper bound (seconds) on one snapshot request.  ib_async's own default of 0
 # means "never time out", which turns an unanswered request into a hang.
 SNAPSHOT_TIMEOUT_SECONDS = 20.0
 
 
-class DeliverableEvidenceError(ValueError):
-    """Delivery evidence is missing, malformed, stale or contradicts identity."""
-
-
-@contextmanager
-def _private_diagnostics():
-    """Never forward arbitrary broker/library output, even on error paths."""
-    with io.StringIO() as sink, redirect_stdout(sink), redirect_stderr(sink):
-        yield
-
-
-def _freeze(value):
-    if isinstance(value, Mapping):
-        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, list):
-        return tuple(_freeze(item) for item in value)
-    return value
-
-
-# --------------------------------------------------------------------------- #
-# Small pure helpers (never leak raw account IDs, never coerce bad numbers)
-# --------------------------------------------------------------------------- #
-
-def _finite(value, label: str, *, positive: bool = False) -> Decimal:
-    if isinstance(value, bool) or value is None:
-        raise DeliverableEvidenceError(f"{label}: expected a finite number")
-    try:
-        result = Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError):
-        raise DeliverableEvidenceError(f"{label}: expected a finite number") from None
-    if not result.is_finite() or (positive and result <= 0):
-        raise DeliverableEvidenceError(
-            f"{label}: expected a {'positive ' if positive else ''}finite number")
-    return result
-
-
-def _aware(value, label: str) -> datetime:
-    """Strict ISO-8601 aware timestamp (an offset is mandatory, never assumed)."""
-    if not isinstance(value, str) or not value.strip():
-        raise DeliverableEvidenceError(f"{label}: expected an ISO-8601 timestamp")
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        raise DeliverableEvidenceError(f"{label}: invalid ISO-8601 timestamp") from None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise DeliverableEvidenceError(f"{label}: timestamp must include a UTC offset")
-    return parsed.astimezone(timezone.utc)
-
-
-def _identity_for(instrument: bs.Instrument) -> dict:
-    """Full, explicit identity of a qualified Instrument (independent of cli)."""
-    return {
-        "con_id": instrument.con_id,
-        "underlying_id": instrument.underlying_id,
-        "symbol": instrument.symbol,
-        "currency": instrument.currency,
-        "sec_type": instrument.sec_type,
-        "exchange": instrument.exchange,
-        "multiplier": str(_finite(instrument.multiplier, "multiplier", positive=True)),
-        "right": instrument.right,
-        "strike": str(_finite(instrument.strike, "strike", positive=True)),
-        "expiry": instrument.expiry,
-        "trading_class": instrument.trading_class,
-    }
-
-
-_IDENTITY_FIELDS = frozenset(_identity_for(
-    bs.Instrument(1, "X", "USD", "OPT", "SMART", 1, Decimal(1), "P", Decimal(1),
-                  "20260101", "X")).keys())
-
-
-def _identity_matches(record: Mapping, inst: bs.Instrument) -> bool:
-    """STRICT equality of every identity field, including the actual multiplier.
-
-    ``con_id``/``underlying_id`` are compared as integers; multiplier/strike as
-    exact Decimals (so ``100`` == ``100.0`` but a different multiplier never
-    matches); all other fields are exact string matches.  Every known field
-    must be PRESENT and agree; unknown extra fields are ignored.
-    """
-    expected = _identity_for(inst)
-    for field in _IDENTITY_FIELDS:
-        if field not in record:
-            return False
-        got, want = record[field], expected[field]
-        if field in {"con_id", "underlying_id"}:
-            if isinstance(got, bool) or not isinstance(got, int) or got != want:
-                return False
-        elif field in {"multiplier", "strike"}:
-            try:
-                if _finite(got, field, positive=True) != _finite(want, field, positive=True):
-                    return False
-            except DeliverableEvidenceError:
-                return False
-        else:
-            if not isinstance(got, str) or got != want:
-                return False
-    return True
-
-
-# --------------------------------------------------------------------------- #
-# Public evidence loader (also consumed by later execution layers)
-# --------------------------------------------------------------------------- #
-
-def load_delivery_evidence(path, instruments: Iterable[bs.Instrument],
-                           now: datetime | None = None
-                           ) -> Mapping[int, Mapping[str, object]]:
-    """Load and cross-check explicit per-OPTION-conId stock-only evidence.
-
-    Parameters
-    ----------
-    path
-        ``str`` / ``Path`` to a ``thetamill.deliverables.v1`` JSON document::
-
-            {
-              "schema": "thetamill.deliverables.v1",
-              "records": [
-                {
-                  "instrument": {<full instrument_data dict, every identity field>},
-                  "stock_only": true,
-                  "source": "IB contract details / human review, non-empty",
-                  "verified_at":  "2026-11-07T18:00:00+00:00",
-                  "expires_at":  "2026-11-08T18:00:00+00:00"
-                }, ...
-              ]
-            }
-
-        For convenience ``instrument`` may instead be ``instrument_data``, or
-        the record may carry the identity fields inline.  Every field returned
-        by :func:`thetamill.roll.instrument_data` is compared against the
-        *qualified* Instrument; the actual multiplier is never guessed.
-    instruments
-        The real qualified Instruments that will be traded (old short + every
-        candidate / all prepared OPT legs).  A record confirms ONLY the exact
-        OPTION ``con_id`` it names; sharing an underlying conId, tradingClass,
-        symbol or multiplier grants NO authorization (an adjusted contract can
-        settle into cash/basket).  STK instruments are intrinsically stock and
-        are skipped (they need no per-contract evidence).
-    now
-        Aware datetime used for expiry checks; defaults to
-        ``datetime.now(timezone.utc)``.  Naive datetimes are rejected.
-
-    Returns
-    -------
-    An immutable mapping ``{option_con_id: evidence_record}`` containing ONLY
-    conIds that were (a) requested in ``instruments`` and (b) fully confirmed.
-    Test membership per OPTION conId with ``con_id in confirmed``; it is NEVER
-    keyed by underlying conId.  Missing/partial coverage is NOT an error: the
-    absent conIds are simply unconfirmed and callers MUST reject them.  Invalid
-    schema / malformed JSON / a single bad record raises
-    :class:`DeliverableEvidenceError` (fail closed; never a partial guess).
-    A None path or missing file yields an EMPTY mapping. Malformed/empty JSON
-    raises DeliverableEvidenceError; nested records are recursively immutable.
-    """
-    moment = now if now is not None else datetime.now(timezone.utc)
-    if not isinstance(moment, datetime) or moment.tzinfo is None \
-            or moment.utcoffset() is None:
-        raise DeliverableEvidenceError("now must be an aware datetime")
-
-    requested: dict[int, bs.Instrument] = {}
-    for inst in instruments or ():
-        if not isinstance(inst, bs.Instrument):
-            raise DeliverableEvidenceError("instruments must be broker_state.Instrument objects")
-        if inst.sec_type != "OPT":
-            continue  # stock itself needs no delivery evidence
-        if isinstance(inst.con_id, bool) or type(inst.con_id) is not int or inst.con_id <= 0:
-            raise DeliverableEvidenceError("instrument requires a positive integer conId")
-        prior = requested.get(inst.con_id)
-        if prior is not None and _identity_for(prior) != _identity_for(inst):
-            raise DeliverableEvidenceError(f"conflicting identity for conId {inst.con_id}")
-        requested[inst.con_id] = inst
-
-    if path is None:
-        return MappingProxyType({})
-    p = Path(path).expanduser()
-    if not p.exists():
-        return MappingProxyType({})
-    try:
-        doc = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeError) as exc:
-        raise DeliverableEvidenceError(
-            f"cannot read delivery evidence: {type(exc).__name__}") from exc
-    if not isinstance(doc, dict) or doc.get("schema") != DELIVERABLES_SCHEMA:
-        raise DeliverableEvidenceError(
-            f"delivery evidence schema must be {DELIVERABLES_SCHEMA}")
-    if any(k in doc for k in ("items", "orders", "orders_to_place", "placeOrder", "submit")):
-        raise DeliverableEvidenceError("delivery evidence must not carry executable fields")
-    records = doc.get("records")
-    if not isinstance(records, list):
-        raise DeliverableEvidenceError("delivery evidence requires a 'records' list")
-
-    confirmed: dict[int, Mapping[str, object]] = {}
-    for index, record in enumerate(records):
-        label = f"records[{index}]"
-        if not isinstance(record, dict):
-            raise DeliverableEvidenceError(f"{label}: expected an object")
-        identity = record.get("instrument", record.get("instrument_data", record))
-        if not isinstance(identity, dict):
-            raise DeliverableEvidenceError(f"{label}: missing instrument identity")
-        con_id = identity.get("con_id")
-        if isinstance(con_id, bool) or type(con_id) is not int or con_id <= 0:
-            raise DeliverableEvidenceError(f"{label}: invalid option conId")
-        if record.get("stock_only") is not True:
-            raise DeliverableEvidenceError(f"{label}: stock_only must be true")
-        source = record.get("source")
-        if not isinstance(source, str) or not source.strip():
-            raise DeliverableEvidenceError(f"{label}: source must be a non-empty string")
-        verified = _aware(record.get("verified_at"), f"{label}.verified_at")
-        expires = _aware(record.get("expires_at"), f"{label}.expires_at")
-        if expires <= verified:
-            raise DeliverableEvidenceError(f"{label}: expires_at must be after verified_at")
-        if verified > moment:
-            raise DeliverableEvidenceError(f"{label}: verified_at is in the future")
-        if expires <= moment:
-            raise DeliverableEvidenceError(f"{label}: evidence has expired")
-
-        inst = requested.get(con_id)
-        if inst is None:
-            continue  # evidence for a conId we are not trading is not a confirmation
-        if not _identity_matches(identity, inst):
-            raise DeliverableEvidenceError(
-                f"{label}: identity/multiplier does not match qualified conId {con_id}")
-        confirmed[con_id] = _freeze(record)
-    return MappingProxyType(confirmed)
+from .broker_session import private_diagnostics as _private_diagnostics
 
 
 # --------------------------------------------------------------------------- #
@@ -364,19 +145,26 @@ def _fetch_tickers(ib, contracts: Mapping[int, object], notes: list[str]):
     live without is the wrong trade.  The bound is only ever lowered, never
     raised, so a caller-configured stricter policy is preserved.
     """
+    from . import cli as _cli  # lazy: avoid a module-level circular import
+
     raw: dict[int, object] = {}
     if not contracts:
         return raw
     previous = getattr(ib, "RequestTimeout", None)
+    caller_timeout = _cli._validate_request_timeout(previous, default=None)
+    if caller_timeout is not None:
+        target = min(caller_timeout, SNAPSHOT_TIMEOUT_SECONDS)
+    else:
+        target = SNAPSHOT_TIMEOUT_SECONDS
     try:
-        if not isinstance(previous, (int, float)) or previous <= 0 \
-                or previous > SNAPSHOT_TIMEOUT_SECONDS:
-            ib.RequestTimeout = SNAPSHOT_TIMEOUT_SECONDS
-    except Exception:      # a strict/frozen stand-in: run with its own policy
-        pass
+        _cli._enforce_request_timeout(ib, target)
+    except Exception as exc:
+        notes.append(f"market data request failed ({type(exc).__name__}); "
+                     "all quotes treated as missing")
+        return raw
     try:
         with _private_diagnostics():
-            tickers = ib.reqTickers(*contracts.values())
+            tickers = safe_req_tickers(ib, *contracts.values(), timeout=target)
     except Exception as exc:
         notes.append(f"market data request failed ({type(exc).__name__}); "
                      "all quotes treated as missing")
@@ -404,65 +192,46 @@ def _build_quotes(raw: Mapping[int, object], instruments: Sequence[bs.Instrument
             notes.append(f"no timestamped ticker for conId {cid}; quote missing")
             quotes[cid] = None
             continue
-        # A usable quote (one that can feed a cash estimate / cost floor) MUST
-        # come from the LIVE feed.  ticker.time is only the local reception
-        # time and does NOT prove a delayed/frozen price is fresh; types 2/3/4
-        # are clearly labelled and excluded rather than passed off as current.
+
+        validated = validate_ticker(t, cid, now, policy=ROLL_POLICY, source="reqTickers")
+        if validated is not None:
+            try:
+                quotes[cid] = roll.Quote(cid, validated.bid, validated.ask, validated.time, source="reqTickers")
+            except Exception as exc:
+                notes.append(f"quote for conId {cid} rejected by roll engine "
+                             f"({type(exc).__name__}); quote unavailable")
+                quotes[cid] = None
+            continue
+
+        quotes[cid] = None
         data_type = getattr(t, "marketDataType", None)
-        if data_type != 1:
+        if type(data_type) is not int or data_type != 1:
             notes.append(f"ticker for conId {cid} is DELAYED/FROZEN "
                          f"(marketDataType={data_type!r}); not usable as a "
                          "current cash-estimate quote")
-            quotes[cid] = None
             continue
         stamp = getattr(t, "time", None)
         if not isinstance(stamp, datetime) or stamp.tzinfo is None \
                 or stamp.utcoffset() is None:
-            # NEVER stamp a stale/undated bid/ask with the current wall clock.
             notes.append(f"ticker for conId {cid} has no source timestamp; "
                          "quote missing (not re-stamped)")
-            quotes[cid] = None
             continue
         if stamp.astimezone(timezone.utc) > now + roll._CLOCK_SKEW:
             notes.append(f"ticker for conId {cid} is in the future; quote unavailable")
-            quotes[cid] = None
             continue
 
-        def price(value, label):
-            if value is None:
-                return None
-            if isinstance(value, bool):
-                notes.append(f"{label} for conId {cid} is not a number; missing")
-                return None
-            try:
-                result = Decimal(str(value))
-            except (InvalidOperation, ValueError, TypeError):
-                notes.append(f"{label} for conId {cid} is not a number; missing")
-                return None
-            if not result.is_finite() or result < 0:
-                notes.append(f"{label} for conId {cid} is unusable; missing")
-                return None
-            return result
-
-        bid = price(getattr(t, "bid", None), "bid")
-        ask = price(getattr(t, "ask", None), "ask")
-        if bid is None and ask is None:
-            notes.append(f"ticker for conId {cid} has no bid/ask; quote missing")
-            quotes[cid] = None
-            continue
-        if bid is not None and ask is not None and bid > ask:
-            # A crossed quote is unusable: an unavailable warning, never a crash.
-            notes.append(f"ticker for conId {cid} is crossed (bid {bid} > ask {ask}); "
-                         "quote unavailable")
-            quotes[cid] = None
-            continue
+        bid_raw = getattr(t, "bid", None)
+        ask_raw = getattr(t, "ask", None)
         try:
-            quotes[cid] = roll.Quote(cid, bid, ask, stamp, source="reqTickers")
-        except Exception as exc:
-            # The roll engine may add further quote validation; degrade per-leg.
-            notes.append(f"quote for conId {cid} rejected by roll engine "
-                         f"({type(exc).__name__}); quote unavailable")
-            quotes[cid] = None
+            b = Decimal(str(bid_raw)) if bid_raw is not None and not isinstance(bid_raw, bool) else None
+            a = Decimal(str(ask_raw)) if ask_raw is not None and not isinstance(ask_raw, bool) else None
+            if b is not None and a is not None and b.is_finite() and a.is_finite() and b > a:
+                notes.append(f"ticker for conId {cid} is crossed (bid {b} > ask {a}); "
+                             "quote unavailable")
+                continue
+        except Exception:
+            pass
+        notes.append(f"ticker for conId {cid} has no bid/ask; quote missing")
     return quotes
 
 

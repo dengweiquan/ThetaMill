@@ -20,7 +20,7 @@ Design boundaries (deliberate, do not weaken)
 * Confirmation requires BOTH an explicit ``--intent`` and ``--code``.  Neither
   alone does anything; with neither, a fresh ``preflight`` is produced.  There
   is no ``--force`` and no fabricated ``verified_prior_submissions``.
-* Deliverable evidence is loaded via ``roll_cli.load_delivery_evidence``
+* Deliverable evidence is loaded via ``delivery_evidence.load_delivery_evidence``
   (lazy import; fail closed if unavailable).  STK is intrinsically stock;
   EVERY OPT (including a read-only buy-to-close) needs its OWN option conId in
   the evidence set.  If the engine currently requires ``deliverable_verified``
@@ -44,7 +44,6 @@ CLI supplies ``ib``, ``cfg`` and ``args``.  Tests use mocks + temp DB only.
 from __future__ import annotations
 
 import json
-from contextlib import nullcontext as _nullcontext
 import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -110,7 +109,10 @@ def _broker_silence():
     gate, and every exception raised inside still propagates (fail closed).
     """
     privacy = getattr(cli, "_private_broker_diagnostics", None)
-    return privacy() if callable(privacy) else _nullcontext()
+    if callable(privacy):
+        return privacy()
+    from . import broker_session
+    return broker_session.private_diagnostics()
 
 
 # --------------------------------------------------------------------------- #
@@ -277,7 +279,7 @@ def build_leg_specs(pairs: Sequence[tuple], *, ib: Any, account: str,
     """Convert caller (contract, order) pairs into canonical LegSpec objects.
 
     ``delivery_evidence`` is a mapping keyed by OPTION conId (the output of
-    ``roll_cli.load_delivery_evidence``).  STK is intrinsically stock; EVERY
+    ``delivery_evidence.load_delivery_evidence``).  STK is intrinsically stock; EVERY
     OPT leg — including a buy-to-close — must have its OWN conId in that set.
     A missing OPT evidence does NOT auto-verify: it is left False so the engine
     blocks the leg safely.
@@ -356,7 +358,7 @@ def load_delivery_evidence(path, instruments: Sequence[Instrument],
                            now: Optional[datetime] = None) -> Mapping[int, Any]:
     """Load explicitly-confirmed stock-only OPTION conIds, keyed by OPTION conId.
 
-    Delegates to ``roll_cli.load_delivery_evidence`` (lazy import).  If the
+    Delegates to ``delivery_evidence.load_delivery_evidence`` (lazy import).  If the
     loader is unavailable or rejects the evidence, we FAIL CLOSED by returning
     an empty mapping (so all OPT legs stay unverified and the engine blocks
     them).  We NEVER infer delivery from tradingClass/multiplier/underlying.
@@ -365,8 +367,8 @@ def load_delivery_evidence(path, instruments: Sequence[Instrument],
     """
     now = now or datetime.now(timezone.utc)
     try:
-        from thetamill import roll_cli  # lazy: owner may still be writing it
-        loader = getattr(roll_cli, "load_delivery_evidence", None)
+        from thetamill import delivery_evidence
+        loader = getattr(delivery_evidence, "load_delivery_evidence", None)
         if not callable(loader):
             return {}
         result = loader(path, instruments, now)
@@ -376,24 +378,14 @@ def load_delivery_evidence(path, instruments: Sequence[Instrument],
     if result is None:
         return {}
     # Normalise the loader's return into a {option_conId: evidence} mapping.
-    # Accept a set/frozenset/list of conIds, or a dict keyed by conId.
     out: dict[int, Any] = {}
     if isinstance(result, Mapping):
         for key, value in result.items():
-            try:
-                con_id = int(key)
-            except (TypeError, ValueError):
+            if isinstance(key, bool) or not isinstance(key, int) or key <= 0:
                 continue
-            if con_id > 0:
-                out[con_id] = value
-    elif isinstance(result, (set, frozenset, list, tuple)):
-        for value in result:
-            try:
-                con_id = int(value)
-            except (TypeError, ValueError):
+            if not isinstance(value, Mapping):
                 continue
-            if con_id > 0:
-                out[con_id] = True
+            out[key] = value
     return out
 
 
@@ -419,11 +411,10 @@ def _fresh_snapshot(ib, cfg, args, environment: str,
         try:
             snapshot = cli._risk_snapshot(ib, cfg, args, environment,
                                           required_currencies=tuple(required_currencies))
-        except TypeError:
-            # An older helper without the new kwarg: retry with the old call.
-            # The freshness gate still fails closed if a needed FX quote is
-            # missing, so this fallback can never authorize stale data.
-            snapshot = cli._risk_snapshot(ib, cfg, args, environment)
+        except SubmissionCliError:
+            raise
+        except Exception as exc:
+            raise SubmissionCliError(f"_risk_snapshot failed: {type(exc).__name__}") from None
     if not isinstance(snapshot, Snapshot):
         raise SubmissionCliError("_risk_snapshot did not return a Snapshot")
     return snapshot
@@ -915,7 +906,8 @@ def build_broker_order(leg: "execution.PreparedLeg", order_ref: str,
     return order
 
 
-def _bounded_receipt(ib, contract, order, *, max_wait_seconds: float = 5.0) -> dict:
+def _bounded_receipt(ib, contract, order, *, max_wait_seconds: float = 5.0,
+                     clock: Optional[Callable[[], float]] = None) -> dict:
     """Submit ONE order and observe a POSITIVE status within a bounded wait.
 
     Returns a dict with ``order_id`` / ``perm_id`` / ``status``.  ``status`` is
@@ -923,16 +915,26 @@ def _bounded_receipt(ib, contract, order, *, max_wait_seconds: float = 5.0) -> d
     actually observed.  There is NO retry: a single ``placeOrder`` call only.
     ``ib.sleep`` is used for the bounded wait when available (mock-friendly).
     """
+    import time
+    from .command_budget import DeadlineExceededError, get_instance_budget
+    budget = get_instance_budget(ib)
+    if budget is not None:
+        budget.check()
+
     # ONE placeOrder; raw broker diagnostics are privacy-suppressed, but the
     # trade object (and every exception) still propagates normally.
     with _broker_silence():
         trade = ib.placeOrder(contract, order)
-    deadline = (datetime.now(timezone.utc).timestamp() + max_wait_seconds)
+    clock_fn = clock if (clock is not None and callable(clock)) else time.monotonic
+    start_time = clock_fn()
+    wait_deadline = start_time + max_wait_seconds
     status = None
     order_id = None
     perm_id = None
     # Poll a few times within the bounded window for a positive observation.
     for _ in range(3):
+        if budget is not None:
+            budget.check()
         st = getattr(getattr(trade, "orderStatus", None), "status", None)
         oid = getattr(getattr(trade, "order", None), "orderId", None) \
             or getattr(order, "orderId", None)
@@ -945,20 +947,38 @@ def _bounded_receipt(ib, contract, order, *, max_wait_seconds: float = 5.0) -> d
         if isinstance(st, str) and st in state.POSITIVE_BROKER_STATES:
             status = st
             break
+        now = clock_fn()
+        local_remaining = wait_deadline - now
+        if local_remaining <= 0:
+            break
         if hasattr(ib, "sleep"):
-            try:
-                with _broker_silence():
-                    ib.sleep(min(0.5, max(0.0, max_wait_seconds / 3.0)))
-            except Exception:
-                pass
-        if datetime.now(timezone.utc).timestamp() >= deadline:
+            step_target = min(0.5, max(0.0, max_wait_seconds / 3.0))
+            sleep_dur = min(step_target, max(0.0, local_remaining))
+            if budget is not None:
+                sleep_dur = min(sleep_dur, max(0.0, float(budget.remaining())))
+            if sleep_dur > 0:
+                try:
+                    with _broker_silence():
+                        ib.sleep(sleep_dur)
+                except DeadlineExceededError:
+                    raise
+                except Exception:
+                    pass
+        if budget is not None:
+            budget.check()
+        if clock_fn() >= wait_deadline:
             break
     return {"order_id": order_id, "perm_id": perm_id, "status": status}
 
 
 def _broker_submit(ib, leg: "execution.PreparedLeg", order_ref: str,
-                   account: str, evidence: Mapping[int, Any]) -> "execution.BrokerReceipt":
+                   account: str, evidence: Mapping[int, Any],
+                   *, clock: Optional[Callable[[], float]] = None) -> "execution.BrokerReceipt":
     """The engine's ONLY network boundary (opaque-contract verification here)."""
+    from .command_budget import get_instance_budget
+    budget = get_instance_budget(ib)
+    if budget is not None:
+        budget.check()
     # The engine does NOT introspect the contract; verify FULL identity here.
     contract = leg.contract
     mismatches = verify_contract_identity(contract, leg.instrument)
@@ -972,7 +992,7 @@ def _broker_submit(ib, leg: "execution.PreparedLeg", order_ref: str,
             f"refusing send: option conId={leg.instrument.con_id} has no explicit "
             "delivery evidence")
     order = build_broker_order(leg, order_ref, account)
-    receipt = _bounded_receipt(ib, contract, order)
+    receipt = _bounded_receipt(ib, contract, order, clock=clock)
     return execution.BrokerReceipt(
         order_id=receipt["order_id"], perm_id=receipt["perm_id"],
         status=receipt["status"])
@@ -1274,7 +1294,7 @@ def execute_prepared(ib, cfg, args, *, pairs: Sequence[tuple],
         Indices of deferred-coverage legs (need a prior leg's actual fill).
     delivery_evidence_path
         Path to the explicitly-confirmed delivery evidence file; loaded via
-        ``roll_cli.load_delivery_evidence`` (lazy import).  None/expired/missing
+        ``delivery_evidence.load_delivery_evidence`` (lazy import).  None/expired/missing
         => NO OPT leg is verified (fail closed, never inferred).
     price_quotes / fx_quotes
         Optional explicit timestamped quotes that OVERRIDE the snapshot's own

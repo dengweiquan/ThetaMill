@@ -9,6 +9,7 @@ timestamped tickers whose OWN ``time`` is used (never re-stamped with now).
 import argparse
 import io
 import json
+import math
 import sys
 import tempfile
 import unittest
@@ -136,9 +137,17 @@ def run_plan(tmp, args, *, snap=None, details=None, tickers=None, cfg=None,
     details = details if details is not None else {
         20: [detail(20, old_inst())], 30: [detail(30, candidate())]}
     ib.reqContractDetails.side_effect = lambda c: details.get(c.conId, [])
-    tickers = tickers if tickers is not None else [
-        ticker(20), ticker(30)]
-    ib.reqTickers.return_value = tickers
+    if callable(tickers):
+        ib.reqTickers.side_effect = tickers
+    else:
+        tickers = tickers if tickers is not None else [
+            ticker(20), ticker(30)]
+        ib.reqTickers.return_value = tickers
+    def safe_req_tickers_roll(ib_, *contracts, **kwargs):
+        if callable(tickers):
+            return tickers(*contracts)
+        return tickers
+
     ib._diag = []
     if ledger_exists:
         # A real (empty) temp SQLite ledger: no outstanding reservations, but
@@ -154,6 +163,7 @@ def run_plan(tmp, args, *, snap=None, details=None, tickers=None, cfg=None,
          patch.object(cli, "_risk_snapshot", return_value=snap), \
          patch.object(cli, "_data_dir", return_value=Path(tmp)), \
          patch.object(cli, "Contract", FakeContract), \
+         patch.object(roll_cli, "safe_req_tickers", side_effect=safe_req_tickers_roll), \
          patch("sys.stdout", stdout), patch("sys.stderr", stderr):
         rc = roll_cli.cmd_roll_plan(cfg or CFG, args, now=now)
     return rc, stdout.getvalue(), stderr.getvalue(), ib
@@ -371,7 +381,7 @@ class QuoteHelperTests(unittest.TestCase):
         self.assertIsNone(quotes[20])
 
     def test_delayed_market_data_is_not_usable_current_quote(self):
-        for data_type in (2, 3, 4, None):
+        for data_type in (2, 3, 4, None, True, False, 1.0, "1", 0):
             notes = []
             quotes = roll_cli._build_quotes(
                 {20: ticker(20, market_data_type=data_type)},
@@ -386,6 +396,36 @@ class QuoteHelperTests(unittest.TestCase):
         self.assertIsNotNone(quotes[20])
         self.assertEqual(quotes[20].source, "reqTickers")
 
+    def test_strict_live_int_market_data_type_regression(self):
+        for data_type in (True, False, 1.0, "1", 0, 2, 3, 4, None):
+            notes = []
+            quotes = roll_cli._build_quotes(
+                {20: ticker(20, market_data_type=data_type)},
+                [old_inst()], NOW, notes)
+            self.assertIsNone(quotes[20])
+            self.assertTrue(any("DELAYED/FROZEN" in n for n in notes))
+
+    def test_exact_con_id_equality_and_no_fallbacks_regression(self):
+        notes = []
+        quotes = roll_cli._build_quotes({20: ticker(999)}, [old_inst()], NOW, notes)
+        self.assertIsNone(quotes[20])
+        notes = []
+        t_alias = SimpleNamespace(conId=20, contract=None, time=QUOTE_TIME,
+                                  bid=D(3), ask=D("3.5"), marketDataType=1)
+        quotes = roll_cli._build_quotes({20: t_alias}, [old_inst()], NOW, notes)
+        self.assertIsNone(quotes[20])
+
+    def test_fetch_tickers_no_network_and_no_order_calls(self):
+        ib = MagicMock()
+        ib.reqTickers.return_value = [ticker(20)]
+        notes = []
+        with patch.object(roll_cli, "safe_req_tickers", return_value=[ticker(20)]) as mock_safe:
+            raw = roll_cli._fetch_tickers(ib, {20: object()}, notes)
+        self.assertIn(20, raw)
+        mock_safe.assert_called_once()
+        ib.reqMktData.assert_not_called()
+        ib.placeOrder.assert_not_called()
+        ib.bracketOrder.assert_not_called()
 
 # --------------------------------------------------------------------------- #
 # Full cmd_roll_plan integration (all I/O mocked)
@@ -401,6 +441,8 @@ class RollPlanCLITests(unittest.TestCase):
             self.assertTrue(data["recommendation_only"])
             ib.placeOrder.assert_not_called()
             ib.cancelOrder.assert_not_called()
+            ib.bracketOrder.assert_not_called()
+            ib.reqMktData.assert_not_called()
             self.assertNotIn("DU1234567", out)  # masked
             self.assertIn("***", out)
 
@@ -911,6 +953,10 @@ class SharedEvidenceIntegrationTests(unittest.TestCase):
 
 
 class SnapshotContractTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(roll_cli, "safe_req_tickers", side_effect=lambda ib, *cs, **kw: ib.reqTickers(*cs))
+        patcher.start()
+        self.addCleanup(patcher.stop)
     """The quote request must carry a ROUTABLE contract, not a conId-only stub.
 
     Reproduction (paper gateway, 2026-11-08): ``_qualify_options`` validated the
@@ -934,9 +980,7 @@ class SnapshotContractTests(unittest.TestCase):
                                   [evidence_record(old_inst()),
                                    evidence_record(candidate())])
             args = make_args(delivery_evidence=path)
-            with patch.object(roll_cli, "_fetch_tickers",
-                              side_effect=lambda ib, c, n: _fetch(ib, c, n, capture)):
-                run_plan(tmp, args)
+            run_plan(tmp, args, tickers=capture)
         return seen
 
     def test_quote_request_uses_the_qualified_contract_not_the_stub(self):
@@ -972,9 +1016,7 @@ class SnapshotContractTests(unittest.TestCase):
                                   [evidence_record(old_inst()),
                                    evidence_record(candidate())])
             args = make_args(delivery_evidence=path)
-            with patch.object(roll_cli, "_fetch_tickers",
-                              side_effect=lambda ib, c, n: _fetch(ib, c, n, boom)):
-                rc, out, err, _ = run_plan(tmp, args)
+            rc, out, err, _ = run_plan(tmp, args, tickers=boom)
         self.assertEqual(rc, 3)               # no recommendation, but a document
         data = json.loads(out)
         self.assertEqual(data["recommended_count"], 0)
@@ -1012,22 +1054,72 @@ class SnapshotContractTests(unittest.TestCase):
         self.assertTrue(any("market data request failed" in n for n in notes), notes)
         self.assertEqual(ib.RequestTimeout, 0)
 
+    def test_fetch_tickers_handles_nan_bool_and_invalid_policies(self):
+        for bad in (float("nan"), True, False, -5.0, 0, None, "bad"):
+            with self.subTest(bad=bad):
+                ib = MagicMock()
+                ib.RequestTimeout = bad
+                seen = {}
 
-def _fetch(ib, contracts, notes, requester):
-    """Call the production _fetch_tickers body with an injected requester."""
-    raw = {}
-    try:
-        with roll_cli._private_diagnostics():
-            tickers = requester(*contracts.values())
-    except Exception as exc:
-        notes.append(f"market data request failed ({type(exc).__name__}); "
-                     "all quotes treated as missing")
-        return raw
-    for t in (tickers or ()):
-        cid = getattr(getattr(t, "contract", None), "conId", None)
-        if type(cid) is int and cid > 0 and cid not in raw:
-            raw[cid] = t
-    return raw
+                def capture(*contracts):
+                    seen["timeout"] = ib.RequestTimeout
+                    return [ticker(20)]
+
+                ib.reqTickers.side_effect = capture
+                roll_cli._fetch_tickers(ib, {20: SimpleNamespace(conId=20)}, [])
+                self.assertEqual(seen["timeout"], roll_cli.SNAPSHOT_TIMEOUT_SECONDS)
+                if isinstance(bad, float) and math.isnan(bad):
+                    self.assertTrue(isinstance(ib.RequestTimeout, float) and math.isnan(ib.RequestTimeout))
+                else:
+                    self.assertEqual(ib.RequestTimeout, bad)
+
+    def test_fetch_tickers_never_widens_stricter_finite_setting(self):
+        ib = MagicMock()
+        ib.RequestTimeout = 5.0
+        seen = {}
+
+        def capture(*contracts):
+            seen["timeout"] = ib.RequestTimeout
+            return [ticker(20)]
+
+        ib.reqTickers.side_effect = capture
+        roll_cli._fetch_tickers(ib, {20: SimpleNamespace(conId=20)}, [])
+        self.assertEqual(seen["timeout"], 5.0)
+        self.assertEqual(ib.RequestTimeout, 5.0)
+
+    def test_fetch_tickers_assignment_failure_never_calls_reqtickers(self):
+        class BadIB(MagicMock):
+            @property
+            def RequestTimeout(self):
+                return 30.0
+
+            @RequestTimeout.setter
+            def RequestTimeout(self, val):
+                raise RuntimeError("RequestTimeout cannot be set")
+
+        ib = BadIB()
+        notes = []
+        raw = roll_cli._fetch_tickers(ib, {20: SimpleNamespace(conId=20)}, notes)
+        self.assertEqual(raw, {})
+        ib.reqTickers.assert_not_called()
+        self.assertTrue(any("market data request failed" in n for n in notes))
+
+    def test_fetch_tickers_silent_noop_setter_never_calls_reqtickers(self):
+        class SilentNoOpIB(MagicMock):
+            @property
+            def RequestTimeout(self):
+                return 0
+
+            @RequestTimeout.setter
+            def RequestTimeout(self, val):
+                pass
+
+        ib = SilentNoOpIB()
+        notes = []
+        raw = roll_cli._fetch_tickers(ib, {20: SimpleNamespace(conId=20)}, notes)
+        self.assertEqual(raw, {})
+        ib.reqTickers.assert_not_called()
+        self.assertTrue(any("market data request failed" in n for n in notes))
 
 
 if __name__ == "__main__":

@@ -50,6 +50,12 @@ def broker():
 
 
 class QuoteMetadataTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        p = patch('thetamill.broker_session.safe_req_tickers', side_effect=lambda ib, *cs, **kw: ib.reqTickers(*cs))
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_metadata_is_explicit_validated_and_immutable(self):
         from dataclasses import replace
         from thetamill.broker_state import PriceQuote, FxQuote

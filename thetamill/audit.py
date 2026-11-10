@@ -126,7 +126,7 @@ def is_real_record(row: Any) -> bool:
     if is_synthetic_record(row):
         return False
     order_id = row.get("orderId")
-    if order_id is None:
+    if order_id is None or order_id == "":
         return True
     if isinstance(order_id, bool):
         return False

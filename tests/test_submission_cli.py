@@ -1345,6 +1345,24 @@ class CandidateCurrencyTests(AdapterTestCase):
             self.run_adapter(ib, pairs=pairs)
         self.assertEqual(ib.place_calls, [])
 
+    def test_fresh_snapshot_provider_internal_typeerror_called_once_and_fails_safely(self):
+        ib = MockIB()
+        calls = []
+
+        def failing_risk_snapshot(ib, cfg, args, env, *, required_currencies=()):
+            calls.append(tuple(required_currencies))
+            raise TypeError("internal TypeError inside provider with account U1234567")
+
+        self._patch(cli, "_risk_snapshot", failing_risk_snapshot)
+        with self.assertRaises(sc.SubmissionCliError) as ctx:
+            sc._fresh_snapshot(ib, CONFIG, self.args(), ENV, ("EUR", "USD"))
+        self.assertEqual(calls, [("EUR", "USD")])
+        self.assertEqual(ib.place_calls, [])
+        self.assertIn("TypeError", str(ctx.exception))
+        self.assertNotIn("U1234567", str(ctx.exception))
+        self.assertNotIn("internal TypeError inside provider", str(ctx.exception))
+        self.assertIsNone(ctx.exception.__cause__)
+
 
 # --------------------------------------------------------------------------- #
 # Covered two-leg deferred combo (requires_filled)

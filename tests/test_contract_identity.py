@@ -263,6 +263,7 @@ class PlanRunIdentityTests(unittest.TestCase):
                  patch.object(cli, "_chain_safe", return_value=(stock, chain)), \
                  patch.object(cli, "_spot", return_value=100), \
                  patch.object(cli, "_quote_premium", return_value=(2, "bid")), \
+                 patch("thetamill.plan_cli.safe_req_tickers", side_effect=lambda ib_, *cs, **kw: ib_.reqTickers(*cs)), \
                  patch("sys.stdout", new_callable=io.StringIO):
                 yield ib
 

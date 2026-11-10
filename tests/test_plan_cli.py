@@ -220,6 +220,12 @@ def run_plan(tmp, args, *, snap=None, cfg=None, symbols=("AAA",),
                 return [detail(s, qi)]
         return []
 
+    def safe_req_tickers_plan(ib_, *contracts, **kwargs):
+        res = []
+        for c in contracts:
+            res.extend(req_tickers(c))
+        return res
+
     ib.reqTickers.side_effect = req_tickers
     ib.reqContractDetails.side_effect = req_contract_details
     ib.qualifyContracts.side_effect = lambda c: [c]
@@ -260,6 +266,8 @@ def run_plan(tmp, args, *, snap=None, cfg=None, symbols=("AAA",),
          patch.object(cli, "_pick_expiry", return_value=(EXPIRY, 41)), \
          patch.object(cli, "_resolve_option", side_effect=actual_resolve), \
          patch.object(cli, "_quote_premium", side_effect=actual_quote_premium), \
+         patch.object(plan_cli, "safe_req_tickers", side_effect=safe_req_tickers_plan), \
+         patch.object(cli, "safe_req_tickers", side_effect=safe_req_tickers_plan), \
          patch.object(cli, "_data_dir", return_value=Path(tmp)), \
          patch.object(cli, "CFG_PATH", Path(tmp) / "config.json"), \
          patch("sys.stdout", stdout), patch("sys.stderr", stderr):
@@ -290,6 +298,16 @@ def run_plan(tmp, args, *, snap=None, cfg=None, symbols=("AAA",),
 # Pure quote helper
 # --------------------------------------------------------------------------- #
 class FreshStockMidTests(unittest.TestCase):
+    def setUp(self):
+        self._safe_patcher = patch.object(
+            plan_cli, "safe_req_tickers", side_effect=self._mock_safe_req_tickers
+        )
+        self._mock_safe = self._safe_patcher.start()
+        self.addCleanup(self._safe_patcher.stop)
+
+    def _mock_safe_req_tickers(self, ib, *contracts, **kwargs):
+        return ib.reqTickers(*contracts)
+
     def _ib(self, t):
         ib = MagicMock()
         ib.reqTickers.return_value = [t]
@@ -302,7 +320,7 @@ class FreshStockMidTests(unittest.TestCase):
 
     def test_delayed_and_frozen_market_data_types_refused(self):
         c = stock_contract("AAA")
-        for mdt in (2, 3, 4, None, 0):
+        for mdt in (2, 3, 4, None, 0, True, False, 1.0, "1"):
             ib = self._ib(ticker(10, 100.0, market_data_type=mdt))
             self.assertIsNone(plan_cli.fresh_stock_mid(ib, c, NOW), mdt)
 
@@ -335,6 +353,31 @@ class FreshStockMidTests(unittest.TestCase):
         for ib in (MagicMock(reqTickers=MagicMock(return_value=[])),
                    MagicMock(reqTickers=MagicMock(side_effect=RuntimeError("x")))):
             self.assertIsNone(plan_cli.fresh_stock_mid(ib, c, NOW))
+
+    def test_strict_live_int_market_data_type_regression(self):
+        c = stock_contract("AAA")
+        for bad_mdt in (True, False, 1.0, "1", 0, 2, 3, 4, None):
+            ib = self._ib(ticker(10, 100.0, market_data_type=bad_mdt))
+            self.assertIsNone(plan_cli.fresh_stock_mid(ib, c, NOW))
+        ib_live = self._ib(ticker(10, 100.0, market_data_type=1))
+        self.assertIsNotNone(plan_cli.fresh_stock_mid(ib_live, c, NOW))
+
+    def test_exact_con_id_equality_and_no_fallbacks_regression(self):
+        c = stock_contract("AAA")
+        ib_mismatch = self._ib(ticker(999, 100.0))
+        self.assertIsNone(plan_cli.fresh_stock_mid(ib_mismatch, c, NOW))
+        t_alias = SimpleNamespace(conId=10, contract=None, time=QUOTE_TIME,
+                                  bid=D("99.95"), ask=D("100.05"), marketDataType=1)
+        self.assertIsNone(plan_cli.fresh_stock_mid(self._ib(t_alias), c, NOW))
+        self.assertIsNone(plan_cli.fresh_stock_mid(self._ib(ticker(10, 100.0)), SimpleNamespace(conId=True), NOW))
+
+    def test_no_network_and_no_order_calls(self):
+        c = stock_contract("AAA")
+        ib = self._ib(ticker(10, 100.0))
+        self.assertIsNotNone(plan_cli.fresh_stock_mid(ib, c, NOW))
+        ib.reqMktData.assert_not_called()
+        ib.placeOrder.assert_not_called()
+        ib.bracketOrder.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
@@ -1151,14 +1194,16 @@ class PlanCLITests(unittest.TestCase):
         stale_tick = ticker(10, 100.0, time=datetime.now(timezone.utc) - timedelta(seconds=35))
         ib_stale = MagicMock()
         ib_stale.reqTickers.return_value = [stale_tick]
-        self.assertIsNone(plan_cli.fresh_stock_mid(ib_stale, c, now=None))
+        with patch.object(plan_cli, "safe_req_tickers", side_effect=lambda ib_, *cs, **kw: ib_.reqTickers(*cs)):
+            self.assertIsNone(plan_cli.fresh_stock_mid(ib_stale, c, now=None))
 
         # Fresh quote relative to wall clock is accepted and returns rich StockQuote
         fresh_time = datetime.now(timezone.utc) - timedelta(seconds=2)
         fresh_tick = ticker(10, 100.0, time=fresh_time)
         ib_fresh = MagicMock()
         ib_fresh.reqTickers.return_value = [fresh_tick]
-        q = plan_cli.fresh_stock_mid(ib_fresh, c, now=None)
+        with patch.object(plan_cli, "safe_req_tickers", side_effect=lambda ib_, *cs, **kw: ib_.reqTickers(*cs)):
+            q = plan_cli.fresh_stock_mid(ib_fresh, c, now=None)
         self.assertIsNotNone(q)
         self.assertEqual(q, D("100.0"))
         self.assertEqual(q.con_id, 10)

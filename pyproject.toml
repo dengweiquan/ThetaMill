@@ -35,6 +35,7 @@ packages = ["thetamill"]
 [tool.coverage.run]
 # Only the shipped package counts.  Tests are the instrument, not the subject.
 source = ["thetamill"]
+branch = true
 
 [tool.coverage.report]
 # A FLOOR, not a target: raising it as tests are added is fine, lowering it is a

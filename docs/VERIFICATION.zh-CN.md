@@ -1,5 +1,37 @@
 # 验证记录与证据边界
 
+## 最新验证事实与证据分级（2026-11-09）
+
+### 基线与候选分支状态
+- **已验收历史基线（A1–A3 / B1–B3 / C1–C2 / D1）**：在 Python 3.10.20 与 3.13.13 环境下，源码及已安装 wheel 离线测试各 1054 项全绿通过；历史基线 wheel 文件 SHA-256 为 `08fafe9d29e28ac13a46c5b293e411d337ea8b4ab1de8b1609a64f80e59bccaa`，保持为当前已接受基线（accepted baseline）。
+- **最新本地工作区（A4 + D2）**：独立复核发现的预算超时分类、连接清理、审计账户隔离、SQLite 错误净化、状态分列与时区排序问题均已修复；后续空 ID 过滤、精确账户选择及极端时间转换回归亦已修复。修订已机械集成当前分支，未 commit/push/PR/merge。候选与集成工作区在 Python 3.10.20 / 3.13.13 下源码各 **1115 项通过**；语句覆盖率 **85.0%**、分支覆盖率 **78.9%**，全部模块门禁及 ruff E9/F 通过。干净源码副本（**非 fresh git clone**）构建 wheel SHA-256 `23e302fa5e6e618e73f9d87234448c95bfd2fdd40ac36c1b7e38dc8df357a2dc`；全新双版本 venv 缓存离线安装固定依赖，从 checkout 外各 **1115 项通过**，确认 site-packages 导入；各 **20 项 CLI help** 通过，临时 HOME 零新增文件，包内 **22 个 Python 模块**逐字节匹配验证源码。构建有既存 setuptools license 元数据弃用警告，未运行远端 CI。此前 1112 项中的两项失败已消除；1102 项与 wheel `fc4d71eefdb0eed2a8b9ec02562091da2c7882a379e22e5c4c1a1cb0652d54c5` 仅为复核前历史检查点，1054 项及其 wheel 仅为历史基线。
+- **本次产物位置**：`/private/tmp/thetamill-reviewed-wheel.axkp6gix/`，含 wheel、源码清单、构建日志、集成源码双版本日志、checkout 外安装包双版本日志与帮助日志；该临时目录不是长期发布地址。
+- **离线验证命令与约束**：源码模式使用 `python -I /absolute/path/scripts/verify_offline.py --source-root /absolute/path`，安装模式使用 `python -I /absolute/path/scripts/offline_tests.py --require-installed --tests-dir /absolute/path/tests`；依赖安装统一使用 `-c constraints.txt`；`verify_offline.py` 严格仅运行单元测试、生成全新 `coverage.json`（`--fail-under=0`）、`coverage_gate.py` 覆盖率门禁与 `ruff` 代码风格检查；代码变更比对由独立 CI/PM 流程（`check_diff.py`）承担，默认可从 GitHub 事件环境变量（如 `GITHUB_BASE_REF` 等）获取基准，不可断言「无显式命令行参数即完全无法执行」；隔离守卫在目标代码导入、测试发现（test discovery imports）及子进程 spawn bootstrap 之前初始化（非所有标准库 import 之前），该防护设计为防范意外环境污染的回归保护，绝非操作系统级隔离或恶意代码沙箱。
+
+### 证据等级体系（Evidence Tiers）
+
+| 等级 | 层次名称 | 工具与环境 | 验证范围与约束 | 当前状态 |
+|---|---|---|---|---|
+| Tier 1 | 离线测试与覆盖率门禁 | `verify_offline.py` / `offline_tests.py` | 纯离线单元测试、覆盖率门禁、ruff 静态检查；隔离临时环境；依赖安装使用 `-c constraints.txt` | 最新本地工作区源码双版本各 1115 项通过；新 wheel checkout 外双版本各 1115 项、各 20 项 help 通过；语句 85.0% / 分支 78.9%，全部模块门禁及 ruff 通过；已本地集成，未运行远端 CI |
+| Tier 2 | 本地静态与状态诊断 | `doctor` / `check_diff.py` (CI/PM) | 离线只读静态诊断（在 `load_cfg` 前执行，无网络、无写入、不读默认配置；import 计算候选路径，不夸大声称为零文件系统探测；仅在停机后检查只读不可变副本，拒绝 sidecar 伴随文件，非动态锁检测器）；交割证据结构合规校验非交易授权 | 候选已实现；测试与文档事实已核对 |
+| Tier 3 | 真实网关只读观测 | IB Gateway 178 (`127.0.0.1:4002`) | 连接鉴权、账户/头寸/订单只读快照、标的合约及行情状态探测 | 2026-11-09 实测完成；单一纸账户 `DU*` 无持仓无活动挂单；AAPL 链乘数 100 仅为链元数据而非特定期权交割物验证；腾讯 700 `minSize/sizeIncrement=100` 为正股交易手数而非期权乘数，实时行情返回 354（无权限）；严禁回落使用陈旧或延迟行情授权交易 |
+| Tier 4 | 模拟账户完整端到端执行 | 真实 IB Gateway 纸账户（端口 4002） | 正股与期权两阶段提交、买入/卖出、撤单与对账、未决预留释放 | 用户已泛化授权完整端到端执行（含买入与卖出，优先支持腾讯 700），但确切订单数量、限价、撤单与平仓方案仍待确认；今日零委托零撤单零成交 |
+| Tier 5 | 实盘交易与资金清算 | Live Gateway 真实账户 | 真实资本风险与交割义务 | 严格禁止，无任何实盘权限 |
+
+### 真实 IB Gateway 纸账户最新只读观测（2026-11-09）
+- **网关与账户**：本地运行的 IB Gateway 178 服务器版本，监听 `127.0.0.1:4002`；单一纸账户 `DU*`，观测时持仓为空（`positions = 0`），活动挂单为空（`openorders = 0`）。
+- **美股标的 AAPL (`conId=265598`)**：观测时处于休市时段，实时盘口缺失（quote absent）；期权链乘数 `multiplier="100"`，仅为期权链元数据，**绝不构成特定期权合约的交割物验证（NOT specific option verification）**。
+- **港股标的 腾讯控股 Tencent (`conId=152791428`, SEHK, HKD, symbol `700`)**：
+  - 合约元数据返回正股最小交易与递增单位 `minSize = 100`、`sizeIncrement = 100`（此为正股交易手数量，**绝非期权交割乘数**）。
+  - 香港时间 2026-11-09 14:09（港股正常交易时段），订阅实时行情流返回 IB 错误码 `354`（无已订阅的实时行情 bid/ask/time 权限，无法获取实时流）。
+  - **严禁回落使用陈旧或延迟行情授权交易（No fallback stale/delayed prices to authorize trading）**。
+- **授权边界与执行状态**：
+  - 用户已泛化明确授权纸账户股票与期权的**完整端到端执行（包含真实买入与卖出委托，并优先支持腾讯 700）**；
+  - 但确切交易数量、限价、撤单及平仓策略方案仍待确认（concrete transaction pending；exact order qty/limit/cancel/close pending）；
+  - 今日实测中**未下达任何实际订单或撤单，零成交（no true new order/cancel/fill today）**；严禁任何实盘交易权限（no live authority）；
+  - （绝不能声称仅授权只读，亦不能声称从未连接过网关）。
+- **执行清洁度与操作约束**：所有观测探针均在隔离临时 `HOME` 下运行，本地私有 `delivery_evidence.json` 在当前验证会话中未被读取或修改（此为当前会话环境与证据隔离约定，并非运行时的文件名禁止规则），原有历史记录与交割证据保持未变；本次测试无任何 commit、push、PR、merge、发布或远程 CI 操作（no commit/push/PR/merge/remoteCI, no publish/service actions）。
+
 ## 真实 IB Gateway 纸账户验收（2026-11-08）
 
 本轮在**本地运行的 IB Gateway 10.x + 纸账户（端口 4002）**上完成了 A–F 执行链的真实网关验收；与下方纯离线检查点分列，不互相替代。

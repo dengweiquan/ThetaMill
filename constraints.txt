@@ -1,0 +1,7 @@
+# Dependency constraints for reproducible offline test environments.
+# Compatible with Python 3.10 and 3.13. Data only; does not alter pyproject.toml.
+ib_async==2.1.0
+aeventkit==2.1.0
+nest-asyncio==1.6.0
+numpy==2.2.6
+tzdata==2025.3

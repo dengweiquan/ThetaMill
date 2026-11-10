@@ -23,7 +23,7 @@ What this adapter does
 * qualifies each selected option into a real ``broker_state.Instrument`` via
   ``broker_state._instrument`` (full identity, actual multiplier, underlying);
 * loads explicit, per-OPTION-conId stock-only delivery evidence through
-  :func:`thetamill.roll_cli.load_delivery_evidence`.  A candidate WITHOUT
+  :func:`thetamill.delivery_evidence.load_delivery_evidence`.  A candidate WITHOUT
   evidence is still displayed, but can NEVER be marked ``allowed``;
 * adds the local submission ledger's EXISTING aggregate reservations
   (``execution.aggregate_reservations``) and calls
@@ -43,11 +43,9 @@ ever forwarded.  Nothing here places, cancels or modifies orders.
 """
 from __future__ import annotations
 
-import io
 import json
 import math
 import sys
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -58,6 +56,8 @@ from . import broker_state as bs
 from . import planning
 from . import risk
 from . import universe as uni
+from .market_data import validate_ticker
+from .broker_requests import safe_req_tickers
 
 SCHEMA = "thetamill.plan.v1"
 QUOTE_SOURCE = "IB timestamped bid/ask midpoint"
@@ -68,11 +68,7 @@ QUOTE_MAX_AGE = timedelta(seconds=30)
 VALID_FOR = timedelta(hours=24)
 
 
-@contextmanager
-def _private_diagnostics():
-    """Never forward arbitrary broker/library output (may carry raw account IDs)."""
-    with io.StringIO() as sink, redirect_stdout(sink), redirect_stderr(sink):
-        yield
+from .broker_session import private_diagnostics as _private_diagnostics
 
 
 # --------------------------------------------------------------------------- #
@@ -136,45 +132,15 @@ def fresh_stock_mid(ib, contract, now: datetime | None = None) -> StockQuote | N
     if type(con_id) is not int or con_id <= 0:
         return None
     try:
-        ticks = ib.reqTickers(contract)
+        ticks = safe_req_tickers(ib, contract)
         if not isinstance(ticks, (list, tuple)) or len(ticks) != 1:
             return None
-        tick = ticks[0]
-        if getattr(tick, "marketDataType", None) != 1:
-            return None
-        if getattr(getattr(tick, "contract", None), "conId", None) != con_id:
-            return None
-        stamp = getattr(tick, "time", None)
-        if not isinstance(stamp, datetime) or stamp.tzinfo is None \
-                or stamp.utcoffset() is None:
-            return None
-        # Price collection freshness uses current production clock after potentially
-        # slow requests, not frozen start clock; injected deterministic clock allowed.
         moment = now if now is not None else datetime.now(timezone.utc)
-        if not isinstance(moment, datetime) or moment.tzinfo is None \
-                or moment.utcoffset() is None:
+        validated = validate_ticker(ticks[0], con_id, moment, source=QUOTE_SOURCE)
+        if validated is None or validated.midpoint is None:
             return None
-        moment = moment.astimezone(timezone.utc)
-        stamp_utc = stamp.astimezone(timezone.utc)
-        age = moment - stamp_utc
-        if age < -FUTURE_SKEW or age > QUOTE_MAX_AGE:
-            return None
-        bid, ask = tick.bid, tick.ask
-        for value in (bid, ask):
-            if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
-                return None
-            try:
-                if not math.isfinite(float(value)) or float(value) <= 0:
-                    return None
-            except (TypeError, ValueError, OverflowError):
-                return None
-        bid_dec = Decimal(str(bid))
-        ask_dec = Decimal(str(ask))
-        if bid_dec > ask_dec:
-            return None
-        mid = (bid_dec + ask_dec) / 2
-        return StockQuote(mid, time=stamp_utc, con_id=con_id,
-                          bid=bid_dec, ask=ask_dec, source=QUOTE_SOURCE)
+        return StockQuote(validated.midpoint, time=validated.time, con_id=con_id,
+                          bid=validated.bid, ask=validated.ask, source=validated.source)
     except Exception:
         return None
 
@@ -657,7 +623,7 @@ def cmd_plan(cfg, args, now: datetime | None = None) -> int:
 
         # ---- per-OPTION-conId delivery evidence (shared with roll_cli) ------ #
         try:
-            from .roll_cli import load_delivery_evidence
+            from .delivery_evidence import load_delivery_evidence
             confirmed = load_delivery_evidence(
                 getattr(args, "delivery_evidence", None),
                 [m["instrument"] for m in metas], current_now)

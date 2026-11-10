@@ -405,6 +405,115 @@ class RequestTimeoutTests(unittest.TestCase):
         ib.placeOrder.assert_not_called()
         ib.cancelOrder.assert_not_called()
 
+    def test_cmd_status_sets_request_timeout_before_broker_requests(self):
+        seen_on_broker_calls = []
+        created = []
+
+        def make_ib(*args, **kwargs):
+            mock_ib = MagicMock()
+            mock_ib.RequestTimeout = 0
+            mock_ib.managedAccounts.return_value = ["DU1"]
+            mock_ib.accountSummary.return_value = []
+            mock_ib.connect.side_effect = lambda *a, **k: seen_on_broker_calls.append(mock_ib.RequestTimeout)
+            mock_ib.accountSummary.side_effect = lambda *a, **k: seen_on_broker_calls.append(mock_ib.RequestTimeout)
+            created.append(mock_ib)
+            return mock_ib
+
+        with patch.object(cli, "CFG_PATH", Path(__file__)), \
+             patch.object(cli, "IB", side_effect=make_ib), \
+             patch.object(cli, "finish"), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            cli.cmd_status(dict(cli.DEFAULT_CFG, request_timeout=12.5), self.args())
+        self.assertTrue(created)
+        for mock_ib in created:
+            self.assertEqual(mock_ib.RequestTimeout, 12.5)
+        self.assertEqual(len(seen_on_broker_calls), 8)
+        self.assertEqual(set(seen_on_broker_calls), {12.5})
+
+    def test_cmd_status_assignment_failure_makes_no_broker_call(self):
+        class BadIB(MagicMock):
+            @property
+            def RequestTimeout(self):
+                return 0
+
+            @RequestTimeout.setter
+            def RequestTimeout(self, val):
+                raise AttributeError("read-only attribute with account U1234567")
+
+        ib = BadIB()
+        with patch.object(cli, "CFG_PATH", Path(__file__)), \
+             patch.object(cli, "IB", return_value=ib), \
+             patch.object(cli, "finish") as finish, \
+             patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = cli.cmd_status(cli.DEFAULT_CFG, self.args())
+        self.assertEqual(rc, 0)
+        self.assertEqual(finish.call_count, 4)
+        ib.connect.assert_not_called()
+        ib.accountSummary.assert_not_called()
+        self.assertNotIn("U1234567", out.getvalue())
+
+    def test_connect_assignment_failure_makes_no_broker_call_and_disconnects(self):
+        class BadIB(MagicMock):
+            @property
+            def RequestTimeout(self):
+                return 0
+
+            @RequestTimeout.setter
+            def RequestTimeout(self, val):
+                raise AttributeError("read-only attribute with account U1234567")
+
+        ib = BadIB()
+        with patch.object(cli, "IB", return_value=ib):
+            with self.assertRaises(RuntimeError) as ctx:
+                cli.connect(cli.DEFAULT_CFG, 4002, args=self.args())
+        self.assertNotIn("U1234567", str(ctx.exception))
+        self.assertIsNone(ctx.exception.__cause__)
+        ib.disconnect.assert_called_once_with()
+        ib.connect.assert_not_called()
+        ib.reqMarketDataType.assert_not_called()
+        ib.placeOrder.assert_not_called()
+
+    def test_connect_silent_noop_setter_makes_no_broker_call_and_disconnects(self):
+        class SilentNoOpIB(MagicMock):
+            @property
+            def RequestTimeout(self):
+                return 0
+
+            @RequestTimeout.setter
+            def RequestTimeout(self, val):
+                pass
+
+        ib = SilentNoOpIB()
+        with patch.object(cli, "IB", return_value=ib):
+            with self.assertRaises(RuntimeError) as ctx:
+                cli.connect(cli.DEFAULT_CFG, 4002, args=self.args())
+        self.assertIsNone(ctx.exception.__cause__)
+        ib.disconnect.assert_called_once_with()
+        ib.connect.assert_not_called()
+        ib.reqMarketDataType.assert_not_called()
+        ib.placeOrder.assert_not_called()
+
+    def test_cmd_status_silent_noop_setter_makes_no_broker_call(self):
+        class SilentNoOpIB(MagicMock):
+            @property
+            def RequestTimeout(self):
+                return 0
+
+            @RequestTimeout.setter
+            def RequestTimeout(self, val):
+                pass
+
+        ib = SilentNoOpIB()
+        with patch.object(cli, "CFG_PATH", Path(__file__)), \
+             patch.object(cli, "IB", return_value=ib), \
+             patch.object(cli, "finish") as finish, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            rc = cli.cmd_status(cli.DEFAULT_CFG, self.args())
+        self.assertEqual(rc, 0)
+        self.assertEqual(finish.call_count, 4)
+        ib.connect.assert_not_called()
+        ib.accountSummary.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
