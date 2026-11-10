@@ -166,8 +166,12 @@ def never_sent_provable(ledger: Any, reservation_id: str, *, account: str,
 # --------------------------------------------------------------------------- #
 
 def _decimal_or_none(value: Any) -> Optional[Decimal]:
-    if value is None or isinstance(value, bool) or isinstance(value, float):
+    if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, float):
+        if not Decimal.from_float(value).is_finite():
+            return None
+        value = str(value)
     try:
         parsed = Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
@@ -395,13 +399,15 @@ def open_ledger(path: Any, day_timezone: str, *, writable: bool) -> Any:
 def live_observations(ib: Any, *, account: str) -> Observations:
     """Collect a read-only, account-scoped execution observation set.
 
-    Never places, cancels or modifies anything.  ``ib.fills()`` is the execution
-    history ib_async keeps for THIS client; ``ib.executions()`` adds rows seen
-    through ``reqExecutions``.  Rows are merged and de-duplicated by execId.
+    Never places, cancels or modifies anything.  ``ib.reqExecutions()``
+    actively refreshes fills from the gateway when available; ``ib.fills()`` is
+    the execution history ib_async keeps for THIS client; ``ib.executions()``
+    adds rows seen through ``reqExecutions``.  Rows are merged and
+    de-duplicated by execId.
     """
     rows: list[Any] = []
     seen: set[str] = set()
-    for getter in ("fills", "executions"):
+    for getter in ("reqExecutions", "fills", "executions"):
         fn = getattr(ib, getter, None)
         if not callable(fn):
             continue

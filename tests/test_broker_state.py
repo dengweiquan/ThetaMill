@@ -361,6 +361,25 @@ class BrokerStateTests(unittest.TestCase):
         when = datetime(2026, 11, 7, tzinfo=timezone.utc)
         self.assertEqual(self.collect(broker(), now=when).captured_at, when)
 
+    def test_portfolio_contract_empty_exchange_falls_back_to_primary_or_details(self):
+        ib = broker()
+        stk_pf = Stock("700", "", "HKD", primaryExchange="SEHK")
+        stk_pf.conId = 152791428
+        opt_pf = Option("700", "20261113", 410, "P", "", multiplier="100", currency="HKD")
+        opt_pf.conId = 940648356
+        opt_qualified = Option("700", "20261113", 410, "P", "SEHK", multiplier="100", currency="HKD")
+        opt_qualified.conId = 940648356
+        ib.portfolio.return_value = [
+            NS(account="DU1", contract=stk_pf, position=100, marketPrice=418, averageCost=418),
+            NS(account="DU1", contract=opt_pf, position=-1, marketPrice=2, averageCost=200),
+        ]
+        ib.reqContractDetails.side_effect = lambda c: [
+            NS(contract=opt_qualified, underConId=152791428, underSecType="STK")
+        ]
+        s = self.collect(ib)
+        self.assertEqual(s.positions[0].instrument.exchange, "SEHK")
+        self.assertEqual(s.positions[1].instrument.exchange, "SEHK")
+
 
 if __name__ == "__main__":
     unittest.main()

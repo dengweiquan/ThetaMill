@@ -323,7 +323,10 @@ def build_leg_specs(pairs: Sequence[tuple], *, ib: Any, account: str,
                     until = entry.get("valid_until") or entry.get("expires_at")
                     if until:
                         try:
-                            expiry = datetime.fromisoformat(str(until))
+                            text = str(until).strip()
+                            if text.endswith("Z"):
+                                text = text[:-1] + "+00:00"
+                            expiry = datetime.fromisoformat(text)
                             if expiry.tzinfo is None:
                                 expiry = expiry.replace(tzinfo=timezone.utc)
                             if now.astimezone(timezone.utc) >= expiry.astimezone(timezone.utc):

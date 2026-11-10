@@ -482,6 +482,11 @@ def verify_fill_against_approved(*, fill: Any, leg: state.LegView,
         raise ExecutionError("fill execution time must be an aware datetime")
     if leg.submitted_at:
         attempt_dt = datetime.fromisoformat(leg.submitted_at.replace("Z", "+00:00"))
+        # IB execution timestamps have 1-second resolution (truncating subseconds),
+        # so an immediate fill in the same second as a subsecond attempt_dt has
+        # fill.as_of == attempt_dt.replace(microsecond=0).
+        if fill.as_of.microsecond == 0:
+            attempt_dt = attempt_dt.replace(microsecond=0)
         if fill.as_of < attempt_dt:
             raise ExecutionError(
                 "fill execution time predates this attempt; refusing to attribute it")

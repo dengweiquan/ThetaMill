@@ -113,7 +113,7 @@ class LedgerCase(unittest.TestCase):
 
     def seed(self, *, leg_state="unknown", action="SELL", con_id=937548729,
              slots=1, instrument=None, account=ACCOUNT, environment=ENV,
-             order_ref="ref-1"):
+             order_ref="ref-1", attempt_at=ATTEMPT):
         instrument = instrument or opt_instrument(con_id=con_id)
         self.grant_day_budget(account=account, environment=environment)
         self.ledger.set_resource(account=account, environment=environment,
@@ -151,7 +151,7 @@ class LedgerCase(unittest.TestCase):
             intent_id=intent["intent_id"], reservation_id=rid, now=NOW,
             legs=[{"contract_id": str(con_id), "action": action,
                    "quantity": "1", "order_ref": order_ref}])
-        self.ledger.begin_leg_attempt(refs[0], now=ATTEMPT)
+        self.ledger.begin_leg_attempt(refs[0], now=attempt_at)
         if leg_state != "submitting":
             self.ledger.record_leg_result(refs[0], state=leg_state, now=NOW)
         return rid, intent
@@ -209,6 +209,18 @@ class EvidenceTests(LedgerCase):
             account=ACCOUNT, environment=ENV))
         leg = self.ledger.get_leg("ref-1", account=ACCOUNT, environment=ENV)
         self.assertEqual(leg.state, "confirmed")
+
+    def test_same_second_fill_with_subsecond_attempt_releases_the_leg(self):
+        """IB execution time has 1s resolution; same-second fill must not fail subsecond check."""
+        subsecond_attempt = NOW.replace(microsecond=376520)
+        rid, _ = self.seed(leg_state="submitted", order_ref="ref-subsec",
+                           attempt_at=subsecond_attempt)
+        fill = raw_fill(order_ref="ref-subsec")
+        fill.execution.time = NOW.replace(microsecond=0)
+        outcome = resolve_mod.resolve_reservation(
+            self.ledger, rid, executions=fills_provider([fill]),
+            snapshot_provider=lambda: make_snapshot(), now=NOW + timedelta(seconds=1))
+        self.assertEqual(outcome.status, "confirmed")
 
     def test_fill_for_another_account_never_releases(self):
         rid, _ = self.seed(leg_state="unknown")
@@ -532,10 +544,12 @@ class FillRowAdapterTests(unittest.TestCase):
     def test_unusable_value_shapes_become_none(self):
         self.assertIsNone(resolve_mod._decimal_or_none(None))
         self.assertIsNone(resolve_mod._decimal_or_none(True))     # bool, not 1
-        self.assertIsNone(resolve_mod._decimal_or_none(1.5))      # float: lossy
+        self.assertIsNone(resolve_mod._decimal_or_none(float("nan")))
+        self.assertIsNone(resolve_mod._decimal_or_none(float("inf")))
         self.assertIsNone(resolve_mod._decimal_or_none(object()))  # unparseable
         self.assertIsNone(resolve_mod._decimal_or_none("NaN"))
         self.assertIsNone(resolve_mod._decimal_or_none("Infinity"))
+        self.assertEqual(resolve_mod._decimal_or_none(1.5), Decimal("1.5"))
         self.assertEqual(resolve_mod._decimal_or_none("2.5"), Decimal("2.5"))
 
     def test_execution_without_a_usable_exec_id_is_none(self):

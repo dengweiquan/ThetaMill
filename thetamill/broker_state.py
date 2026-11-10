@@ -171,6 +171,8 @@ def _instrument(contract, ib, details_cache: dict) -> Instrument:
     currency, symbol = currency.strip().upper(), symbol.strip()
     underlying_id, multiplier = con_id, Decimal(1)
     strike, right, expiry = Decimal(0), "", ""
+    exchange = (str(getattr(contract, "exchange", "") or "").strip()
+                or str(getattr(contract, "primaryExchange", "") or "").strip())
     if sec == "OPT":
         multiplier = number(getattr(contract, "multiplier", None), "multiplier", positive=True)
         strike = number(getattr(contract, "strike", None), "strike", positive=True)
@@ -205,7 +207,10 @@ def _instrument(contract, ib, details_cache: dict) -> Instrument:
                 raise SnapshotError("Conflicting multiplier in contract details")
             if getattr(detail, "underSecType", "STK") not in {"", "STK"}:
                 raise SnapshotError("Only stock-option underlying assets are supported")
-    return Instrument(con_id, symbol, currency, sec, str(getattr(contract, "exchange", "")),
+            if not exchange:
+                exchange = (str(getattr(qualified, "exchange", "") or "").strip()
+                            or str(getattr(qualified, "primaryExchange", "") or "").strip())
+    return Instrument(con_id, symbol, currency, sec, exchange,
                       underlying_id, multiplier, right, strike, expiry,
                       str(getattr(contract, "tradingClass", "")))
 
