@@ -112,6 +112,7 @@ except ImportError:
 from .universe import (universe_allowed, universe_gate,  # noqa: E402
                        validate)
 from .broker_requests import safe_req_tickers  # noqa: E402
+from .market_data import resolve_ib_profile  # noqa: E402
 
 
 DEFAULT_CFG = {
@@ -121,6 +122,8 @@ DEFAULT_CFG = {
     "paper_port": 4002,
     "client_id": 1,
     "live_enabled": False,
+    "market_data_type": "live",
+    "active_market_profile": "ib_live",
 }
 
 LIVE_PORTS = {4001, 7496}
@@ -261,7 +264,31 @@ def load_cfg(required=True):
         sys.exit(f"缺少配置文件: {CFG_PATH}\n"
                  f"   把 config.example.json 复制到该路径，或用环境变量指定：\n"
                  f"   THETAMILL_CONFIG=/path/to/config.json thetamill status")
-    return json.loads(CFG_PATH.read_text(encoding="utf-8"))
+    loaded = json.loads(CFG_PATH.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        sys.exit("配置文件必须是 JSON 对象")
+    cfg = dict(DEFAULT_CFG)
+    cfg.update(loaded)
+    return cfg
+
+
+def market_profile(cfg, args=None):
+    """Resolve the built-in IB market-data profile. Fail closed on unknown names."""
+    requested = getattr(args, "market_profile", None) if args is not None else None
+    delayed = bool(getattr(args, "delayed", False)) if args is not None else False
+    if not isinstance(cfg, dict):
+        cfg = {}
+    try:
+        explicit = requested if isinstance(requested, str) and requested.strip() else None
+        configured = cfg.get("active_market_profile")
+        # An explicit CLI profile wins over both config and the legacy --delayed flag.
+        return resolve_ib_profile(
+            explicit or (None if delayed else configured),
+            market_data_type=None if explicit or delayed or configured else cfg.get("market_data_type"),
+            delayed=False if explicit else delayed,
+        )
+    except ValueError as exc:
+        sys.exit(f"⛔ 行情 profile 无效：{exc}")
 
 
 def _port_open(host, port, timeout=0.35):
@@ -332,8 +359,11 @@ def connect(cfg, port, readonly=False, force_delayed=False, args=None):
             ib._diag.append((code, _dec(msg)))
 
         ib.errorEvent += _on_err
-        mdt = 3 if (force_delayed or cfg.get("market_data_type") != "live") else 1
-        ib.reqMarketDataType(mdt)
+        profile = market_profile(cfg, args)
+        if force_delayed and profile["market_data_type"] != 3:
+            profile = resolve_ib_profile("ib_delayed")
+        ib._market_profile = profile
+        ib.reqMarketDataType(profile["market_data_type"])
         return ib
     except (Exception, SystemExit):
         # The caller cannot clean up an object connect() has not returned yet.
@@ -775,8 +805,10 @@ def cmd_quote(cfg, args):
     if not _has_num(t.bid, t.ask, t.last) and not getattr(args, "delayed", False):
         _fallback_delayed(ib)
         fell_back = True
+    profile = getattr(ib, "_market_profile", None) or {}
+    delayed_label = fell_back or profile.get("reference_only")
     print(f"{env} | {c.symbol} {c.primaryExchange} | conId={c.conId}"
-          + ("  [延迟数据]" if fell_back else ""))
+          + (f"  [延迟参考价 {profile.get('name', 'ib_delayed')}]" if delayed_label else ""))
     print(f"  买/卖   {fmt(t.bid)} / {fmt(t.ask)}")
     print(f"  最新    {fmt(t.last)}   昨收 {fmt(t.close)}")
     print(f"  日内    {fmt(t.low)} ~ {fmt(t.high)}   量 {fmt(t.volume, 0)}")
@@ -2680,6 +2712,9 @@ def _global_flags(parser, hidden=False):
     parser.add_argument("--paper", action="store_true", help=h or "用纸账户端口", **kw)
     parser.add_argument("--port", type=int, help=h or "手动指定端口（覆盖 --paper）", **kw)
     parser.add_argument("--delayed", action="store_true", help=h or "强制使用延迟行情（未订阅实时行情时更快）", **kw)
+    parser.add_argument("--market-profile", dest="market_profile",
+                        choices=["ib_live", "ib_delayed"],
+                        help=h or "内置 IB 行情 profile：ib_live 或 ib_delayed（覆盖配置）", **kw)
     parser.add_argument("--account", help=h or "明确选择账户；多账户会话必填", **kw)
 
 

@@ -8,6 +8,24 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 DEFAULT_SOURCE = "reqTickers"
+IB_LIVE_SOURCE = "IB live timestamped bid/ask"
+IB_DELAYED_SOURCE = "IB delayed timestamped bid/ask"
+IB_PROFILES = {
+    "ib_live": {
+        "provider": "ib",
+        "market_data_type": 1,
+        "max_age_seconds": 30,
+        "source": IB_LIVE_SOURCE,
+        "reference_only": False,
+    },
+    "ib_delayed": {
+        "provider": "ib",
+        "market_data_type": 3,
+        "max_age_seconds": 1200,
+        "source": IB_DELAYED_SOURCE,
+        "reference_only": True,
+    },
+}
 
 
 def _validate_bound(val: Any, name: str, *, allow_none: bool = False) -> None:
@@ -79,6 +97,7 @@ class QuotePolicy:
     require_both: bool = True
     allow_zero: bool = False
     allow_strings: bool = False
+    market_data_type: int = 1
 
     def __post_init__(self) -> None:
         _validate_bound(self.future_skew_seconds, "future_skew_seconds", allow_none=False)
@@ -86,9 +105,20 @@ class QuotePolicy:
         for name in ("require_both", "allow_zero", "allow_strings"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a bool")
+        mdt = self.market_data_type
+        if isinstance(mdt, bool) or type(mdt) is not int or mdt not in (1, 3):
+            raise ValueError("market_data_type must be 1 (live) or 3 (delayed)")
 
 
 DEFAULT_POLICY = QuotePolicy()
+DELAYED_POLICY = QuotePolicy(
+    max_age_seconds=1200,
+    future_skew_seconds=5,
+    require_both=True,
+    allow_zero=False,
+    allow_strings=False,
+    market_data_type=3,
+)
 ROLL_POLICY = QuotePolicy(
     max_age_seconds=None,
     future_skew_seconds=5,
@@ -96,6 +126,52 @@ ROLL_POLICY = QuotePolicy(
     allow_zero=True,
     allow_strings=True,
 )
+
+
+def resolve_ib_profile(name: str | None = None, *, market_data_type: str | None = None,
+                       delayed: bool = False) -> dict:
+    """Resolve a built-in IB profile. Unknown names fail closed.
+
+    ``delayed`` and the legacy ``market_data_type`` config value can select the
+    delayed profile, but they never invent a third source. Planning callers must
+    keep using the live policy; delayed quotes are reference-only.
+    """
+    if not isinstance(delayed, bool):
+        raise ValueError("delayed must be a bool")
+    selected = name
+    if selected is None and delayed:
+        selected = "ib_delayed"
+    if selected is None and market_data_type is not None:
+        legacy = str(market_data_type).strip().lower()
+        if legacy == "live":
+            selected = "ib_live"
+        elif legacy == "delayed":
+            selected = "ib_delayed"
+        elif legacy:
+            raise ValueError("market_data_type must be 'live' or 'delayed'")
+    if selected is None:
+        selected = "ib_live"
+    if not isinstance(selected, str):
+        raise ValueError("market profile must be a string")
+    key = selected.strip().lower().replace("-", "_")
+    profile = IB_PROFILES.get(key)
+    if profile is None:
+        raise ValueError("market profile must be ib_live or ib_delayed")
+    resolved = dict(profile)
+    resolved["name"] = key
+    return resolved
+
+
+def policy_for_profile(profile: dict) -> QuotePolicy:
+    """Return the quote policy for a resolved built-in IB profile."""
+    if not isinstance(profile, dict) or profile.get("provider") != "ib":
+        raise ValueError("profile must be a built-in IB profile")
+    mdt = profile.get("market_data_type")
+    if mdt == 1:
+        return DEFAULT_POLICY
+    if mdt == 3:
+        return DELAYED_POLICY
+    raise ValueError("IB profile market_data_type must be 1 or 3")
 
 
 @dataclass(frozen=True)
@@ -163,7 +239,7 @@ def validate_ticker(
             return None
 
         mdt = getattr(ticker, "marketDataType", None)
-        if type(mdt) is not int or mdt != 1:
+        if type(mdt) is not int or mdt != policy.market_data_type:
             return None
 
         stamp = getattr(ticker, "time", None)
@@ -210,8 +286,14 @@ def validate_ticker(
 __all__ = [
     "DEFAULT_POLICY",
     "DEFAULT_SOURCE",
+    "DELAYED_POLICY",
+    "IB_DELAYED_SOURCE",
+    "IB_LIVE_SOURCE",
+    "IB_PROFILES",
     "ROLL_POLICY",
     "QuotePolicy",
     "ValidatedQuote",
+    "policy_for_profile",
+    "resolve_ib_profile",
     "validate_ticker",
 ]

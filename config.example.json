@@ -4,6 +4,7 @@
   "paper_port": 4002,
   "client_id": 11,
   "market_data_type": "delayed",
+  "active_market_profile": "ib_delayed",
   "default_exchange": "SMART",
   "default_currency": "USD",
   "connect_timeout": 4,

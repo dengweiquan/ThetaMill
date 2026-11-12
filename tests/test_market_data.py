@@ -7,9 +7,14 @@ from types import SimpleNamespace
 
 from thetamill.market_data import (
     DEFAULT_SOURCE,
+    DELAYED_POLICY,
+    IB_DELAYED_SOURCE,
+    IB_LIVE_SOURCE,
     ROLL_POLICY,
     QuotePolicy,
     ValidatedQuote,
+    policy_for_profile,
+    resolve_ib_profile,
     validate_ticker,
 )
 
@@ -140,6 +145,40 @@ class ValidateTickerTests(unittest.TestCase):
         self.assertIsNone(validate_ticker(_ticker(market_data_type=False), 10, NOW))
         for mdt in (2, 3, 4, None, 0, 1.0, "1"):
             self.assertIsNone(validate_ticker(_ticker(market_data_type=mdt), 10, NOW))
+
+    def test_ib_profiles_keep_live_and_delayed_separate(self):
+        live = resolve_ib_profile("ib_live", delayed=True)
+        delayed = resolve_ib_profile(market_data_type="delayed")
+        self.assertEqual(live["market_data_type"], 1)
+        self.assertFalse(live["reference_only"])
+        self.assertEqual(live["source"], IB_LIVE_SOURCE)
+        self.assertEqual(delayed["name"], "ib_delayed")
+        self.assertEqual(delayed["market_data_type"], 3)
+        self.assertTrue(delayed["reference_only"])
+        self.assertEqual(delayed["max_age_seconds"], 1200)
+        self.assertEqual(policy_for_profile(delayed), DELAYED_POLICY)
+        with self.assertRaises(ValueError):
+            resolve_ib_profile("futu_live")
+        with self.assertRaises(ValueError):
+            resolve_ib_profile(market_data_type="frozen")
+
+        stale_for_live = NOW - timedelta(seconds=31)
+        fresh_for_delayed = NOW - timedelta(seconds=900)
+        too_old_for_delayed = NOW - timedelta(seconds=1201)
+        delayed_tick = _ticker(market_data_type=3, time=fresh_for_delayed)
+        self.assertIsNone(validate_ticker(delayed_tick, 10, NOW))
+        accepted = validate_ticker(
+            delayed_tick, 10, NOW, policy=DELAYED_POLICY, source=IB_DELAYED_SOURCE)
+        self.assertEqual(accepted.source, IB_DELAYED_SOURCE)
+        self.assertEqual(accepted.midpoint, Decimal("10.05"))
+        self.assertIsNone(validate_ticker(
+            _ticker(market_data_type=3, time=stale_for_live), 10, NOW))
+        self.assertIsNone(validate_ticker(
+            _ticker(market_data_type=3, time=too_old_for_delayed), 10, NOW,
+            policy=DELAYED_POLICY))
+        self.assertIsNone(validate_ticker(
+            _ticker(market_data_type=1, time=fresh_for_delayed), 10, NOW,
+            policy=DELAYED_POLICY))
 
     def test_identity_and_no_fallbacks(self):
         self.assertIsNone(validate_ticker(_ticker(con_id=999), 10, NOW))
